@@ -1507,4 +1507,323 @@ mod integration_tests {
             gpui_destroy_element(div);
         }
     }
+
+    // ===================================================================
+    // G2-G: Event dispatch tests
+    // ===================================================================
+
+    /// Multiple listeners on the same event all fire, and fire the correct
+    /// number of times across repeated dispatches.
+    #[test]
+    #[serial]
+    fn test_dispatch_multiple_listeners_same_event() {
+        unsafe {
+            gpui_reset_tree();
+
+            static CALL_A: AtomicU32 = AtomicU32::new(0);
+            static CALL_B: AtomicU32 = AtomicU32::new(0);
+            static CALL_C: AtomicU32 = AtomicU32::new(0);
+
+            extern "C" fn handler_a() {
+                CALL_A.fetch_add(1, Ordering::SeqCst);
+            }
+            extern "C" fn handler_b() {
+                CALL_B.fetch_add(1, Ordering::SeqCst);
+            }
+            extern "C" fn handler_c() {
+                CALL_C.fetch_add(1, Ordering::SeqCst);
+            }
+
+            CALL_A.store(0, Ordering::SeqCst);
+            CALL_B.store(0, Ordering::SeqCst);
+            CALL_C.store(0, Ordering::SeqCst);
+
+            let tag = c("button");
+            let click = c("click");
+            let node = gpui_create_element(tag.as_ptr());
+
+            gpui_add_event_listener(node, click.as_ptr(), handler_a);
+            gpui_add_event_listener(node, click.as_ptr(), handler_b);
+            gpui_add_event_listener(node, click.as_ptr(), handler_c);
+
+            // First dispatch: all three handlers fire once
+            gpui_dispatch_event(node, click.as_ptr());
+            assert_eq!(CALL_A.load(Ordering::SeqCst), 1);
+            assert_eq!(CALL_B.load(Ordering::SeqCst), 1);
+            assert_eq!(CALL_C.load(Ordering::SeqCst), 1);
+
+            // Second dispatch: counts increment to 2
+            gpui_dispatch_event(node, click.as_ptr());
+            assert_eq!(CALL_A.load(Ordering::SeqCst), 2);
+            assert_eq!(CALL_B.load(Ordering::SeqCst), 2);
+            assert_eq!(CALL_C.load(Ordering::SeqCst), 2);
+
+            gpui_destroy_element(node);
+        }
+    }
+
+    /// Dispatching "click" only fires click handlers; dispatching "input"
+    /// only fires input handlers. Events on different nodes are isolated.
+    #[test]
+    #[serial]
+    fn test_dispatch_isolation_click_vs_input_different_nodes() {
+        unsafe {
+            gpui_reset_tree();
+
+            static CLICK_COUNT: AtomicU32 = AtomicU32::new(0);
+            static INPUT_COUNT: AtomicU32 = AtomicU32::new(0);
+
+            extern "C" fn on_click() {
+                CLICK_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+            extern "C" fn on_input() {
+                INPUT_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+
+            CLICK_COUNT.store(0, Ordering::SeqCst);
+            INPUT_COUNT.store(0, Ordering::SeqCst);
+
+            let root = gpui_create_element(c("div").as_ptr());
+            let btn = gpui_create_element(c("button").as_ptr());
+            let inp = gpui_create_element(c("div").as_ptr());
+
+            gpui_add_event_listener(btn, c("click").as_ptr(), on_click);
+            gpui_add_event_listener(inp, c("input").as_ptr(), on_input);
+
+            gpui_append_child(root, btn);
+            gpui_append_child(root, inp);
+
+            // Dispatch click on button — only click fires
+            gpui_dispatch_event(btn, c("click").as_ptr());
+            assert_eq!(CLICK_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(INPUT_COUNT.load(Ordering::SeqCst), 0);
+
+            // Dispatch input on input node — only input fires
+            gpui_dispatch_event(inp, c("input").as_ptr());
+            assert_eq!(CLICK_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(INPUT_COUNT.load(Ordering::SeqCst), 1);
+
+            // Dispatch click on input node — nothing fires (no click listener)
+            gpui_dispatch_event(inp, c("click").as_ptr());
+            assert_eq!(CLICK_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(INPUT_COUNT.load(Ordering::SeqCst), 1);
+
+            // Dispatch input on button — nothing fires (no input listener)
+            gpui_dispatch_event(btn, c("input").as_ptr());
+            assert_eq!(CLICK_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(INPUT_COUNT.load(Ordering::SeqCst), 1);
+
+            gpui_destroy_element(root);
+            gpui_destroy_element(btn);
+            gpui_destroy_element(inp);
+        }
+    }
+
+    /// Dispatching events on a null handle does not crash.
+    #[test]
+    #[serial]
+    fn test_dispatch_null_node_safety() {
+        unsafe {
+            let event = c("click");
+            // Should not crash or panic
+            gpui_dispatch_event(std::ptr::null_mut(), event.as_ptr());
+        }
+    }
+
+    /// Dispatching a non-existent event name on a node with handlers
+    /// does not crash and does not fire any handler.
+    #[test]
+    #[serial]
+    fn test_dispatch_nonexistent_event_name() {
+        unsafe {
+            gpui_reset_tree();
+
+            static CALL: AtomicU32 = AtomicU32::new(0);
+            extern "C" fn handler() {
+                CALL.fetch_add(1, Ordering::SeqCst);
+            }
+            CALL.store(0, Ordering::SeqCst);
+
+            let node = gpui_create_element(c("div").as_ptr());
+            gpui_add_event_listener(node, c("click").as_ptr(), handler);
+
+            // Dispatch an event that has no listeners
+            gpui_dispatch_event(node, c("mouseover").as_ptr());
+            assert_eq!(CALL.load(Ordering::SeqCst), 0);
+
+            gpui_destroy_element(node);
+        }
+    }
+
+    /// The tree lock is released before event callbacks are invoked.
+    /// A callback that accesses the tree should not deadlock.
+    #[test]
+    #[serial]
+    fn test_lock_release_before_callback_no_deadlock() {
+        unsafe {
+            gpui_reset_tree();
+
+            static SUCCESS: AtomicU32 = AtomicU32::new(0);
+
+            extern "C" fn tree_accessing_handler() {
+                // If the lock were still held, this would deadlock.
+                let count = crate::gpui_tree_node_count();
+                if count > 0 {
+                    SUCCESS.store(1, Ordering::SeqCst);
+                }
+            }
+
+            SUCCESS.store(0, Ordering::SeqCst);
+
+            let node = gpui_create_element(c("div").as_ptr());
+            gpui_add_event_listener(node, c("click").as_ptr(), tree_accessing_handler);
+
+            gpui_dispatch_event(node, c("click").as_ptr());
+            assert_eq!(
+                SUCCESS.load(Ordering::SeqCst),
+                1,
+                "callback should have accessed tree without deadlock"
+            );
+
+            gpui_destroy_element(node);
+        }
+    }
+
+    /// Also verify dispatch_shadow_event (the render-sync path) releases
+    /// the lock before callbacks, just like gpui_dispatch_event.
+    #[test]
+    #[serial]
+    fn test_dispatch_shadow_event_lock_release() {
+        gpui_reset_tree();
+
+        static SUCCESS: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn tree_reader() {
+            // Access the tree to verify lock is released
+            let count = crate::gpui_tree_node_count();
+            if count > 0 {
+                SUCCESS.store(1, Ordering::SeqCst);
+            }
+        }
+
+        SUCCESS.store(0, Ordering::SeqCst);
+
+        let node_id = {
+            let mut tree = lock_tree();
+            let mut node = Node::new_element("button");
+            node.event_listeners
+                .entry("click".into())
+                .or_default()
+                .push(crate::tree::EventListener {
+                    callback: tree_reader,
+                });
+            tree.insert(node)
+        };
+
+        // Use the render-sync dispatch path (same code path GPUI uses)
+        #[cfg(feature = "gpui-backend")]
+        {
+            crate::render_sync::gpui_render::dispatch_shadow_event(node_id, "click");
+            assert_eq!(SUCCESS.load(Ordering::SeqCst), 1);
+        }
+
+        // Without gpui-backend, verify via the FFI dispatch
+        #[cfg(not(feature = "gpui-backend"))]
+        {
+            let handle = crate::node_id_to_handle(node_id);
+            unsafe {
+                gpui_dispatch_event(handle, c("click").as_ptr());
+            }
+            assert_eq!(
+                SUCCESS.load(Ordering::SeqCst),
+                1,
+                "dispatch_shadow_event should release lock before callback"
+            );
+            unsafe {
+                crate::gpui_destroy_element(handle);
+            }
+        }
+    }
+
+    /// End-to-end: populate tree via gpui_launch, then dispatch events.
+    /// Without `gpui-backend`, gpui_launch builds the tree and returns
+    /// immediately (no event loop), so we can verify the tree and dispatch.
+    #[test]
+    #[serial]
+    fn test_window_integration_with_launch() {
+        use crate::{
+            gpui_first_child, gpui_launch, gpui_reset_windows, gpui_tree_node_count,
+            node_id_to_handle, GpuiElement, ROOT_NODE_ID,
+        };
+
+        gpui_reset_tree();
+        gpui_reset_windows();
+
+        static CLICK_FIRED: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn on_click() {
+            CLICK_FIRED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        extern "C" fn builder(root: *mut GpuiElement) {
+            unsafe {
+                let tag = CString::new("button").unwrap();
+                let click = CString::new("click").unwrap();
+                let btn = gpui_create_element(tag.as_ptr());
+                gpui_add_event_listener(btn, click.as_ptr(), on_click);
+                gpui_append_child(root, btn);
+
+                // Add a second child (span with text) to verify tree structure
+                let span_tag = CString::new("span").unwrap();
+                let span = gpui_create_element(span_tag.as_ptr());
+                let text = crate::gpui_create_text_node(
+                    CString::new("hello").unwrap().as_ptr(),
+                );
+                crate::gpui_append_child(span, text);
+                gpui_append_child(root, span);
+
+                gpui_destroy_element(btn);
+                gpui_destroy_element(span);
+                gpui_destroy_element(text);
+            }
+        }
+
+        CLICK_FIRED.store(0, Ordering::SeqCst);
+
+        let title = c("Test Window");
+        gpui_launch(title.as_ptr(), 800.0, 600.0, builder);
+
+        // Root + button + span + text = 4 nodes
+        assert_eq!(gpui_tree_node_count(), 4);
+
+        // Get the root handle and verify structure
+        let root_id = {
+            let root = ROOT_NODE_ID.lock().unwrap();
+            *root
+        };
+        let root_handle = node_id_to_handle(root_id);
+
+        // Verify render plan
+        let plan = get_plan_direct(root_handle);
+        assert_eq!(plan.children.len(), 2);
+        assert!(plan.children[0].has_click_handler); // button
+        assert_eq!(plan.children[1].kind, GpuiElementKind::TextContainer); // span
+
+        // Find the button (first child of root) and dispatch a click
+        let btn_handle = unsafe { gpui_first_child(root_handle) };
+        assert!(!btn_handle.is_null());
+
+        let click = c("click");
+        gpui_dispatch_event(btn_handle, click.as_ptr());
+        assert_eq!(CLICK_FIRED.load(Ordering::SeqCst), 1);
+
+        // Dispatch again
+        gpui_dispatch_event(btn_handle, click.as_ptr());
+        assert_eq!(CLICK_FIRED.load(Ordering::SeqCst), 2);
+
+        unsafe {
+            gpui_destroy_element(root_handle);
+            gpui_destroy_element(btn_handle);
+        }
+    }
 }

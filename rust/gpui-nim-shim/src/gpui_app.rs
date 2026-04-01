@@ -56,12 +56,47 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     }
 
     // NimRootView: reads the shadow tree and produces GPUI elements.
-    struct NimRootView;
+    struct NimRootView {
+        /// Whether the repaint polling timer has been started.
+        poll_started: bool,
+    }
+
+    impl NimRootView {
+        fn new() -> Self {
+            NimRootView {
+                poll_started: false,
+            }
+        }
+    }
 
     impl Render for NimRootView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             // Check and clear the repaint flag (so we know the frame is current).
             let _ = window::take_repaint_request();
+
+            // Start a background polling timer that checks REPAINT_REQUESTED
+            // and calls cx.notify() to trigger re-renders. We only start this
+            // once; the spawned task runs for the lifetime of the view.
+            if !self.poll_started {
+                self.poll_started = true;
+                cx.spawn(async move |weak_entity: WeakEntity<NimRootView>, cx: &mut AsyncApp| {
+                    loop {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(16))
+                            .await;
+                        if window::REPAINT_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+                            if let Some(entity) = weak_entity.upgrade() {
+                                let _ = cx.update_entity(&entity, |_view: &mut NimRootView, cx: &mut Context<NimRootView>| {
+                                    cx.notify();
+                                });
+                            } else {
+                                break; // entity was dropped
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
 
             let tree = crate::lock_tree();
             let root_id = *crate::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
@@ -286,7 +321,7 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
                 )),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| NimRootView),
+            |_, cx| cx.new(|_| NimRootView::new()),
         )
         .expect("Failed to open GPUI window");
     });
