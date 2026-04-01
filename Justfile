@@ -75,6 +75,24 @@ test-structural:
 # Run all tests (Rust + Nim + cross-renderer + demo + integration)
 test-all: rust-test test test-cross test-demo test-integration test-structural
 
+# Run GUI tests under Xvfb (X11 headless)
+test-gui-x11 *ARGS:
+    cd rust && cargo build --features gpui-backend
+    ./scripts/xvfb-run-test.sh {{ARGS}} just _run-gui-tests
+
+# Run GUI tests under Wayland headless (Sway)
+test-gui-wayland *ARGS:
+    cd rust && cargo build --features gpui-backend
+    ./scripts/wayland-run-test.sh {{ARGS}} just _run-gui-tests
+
+# Run GUI tests with video recording (X11)
+test-gui-record:
+    just test-gui-x11 --record
+
+# Internal: actual GUI test commands (run inside headless display)
+_run-gui-tests:
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui -d:gpuiBackend --path:../isonim/src tests/test_gui.nim
+
 # Clean build artifacts
 clean:
     rm -rf nimcache tests/test_basic tests/test_bindings tests/test_cross_renderer tests/test_demo_app tests/test_performance tests/test_render_integration demos/task-manager/src/main

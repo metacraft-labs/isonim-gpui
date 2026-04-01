@@ -71,6 +71,18 @@
               pkgs.curl
               pkgs.libgit2
               pkgs.alsa-lib
+
+              # Headless GUI testing
+              pkgs.xorg.xorgserver
+              pkgs.xorg.xdpyinfo
+              pkgs.mesa
+              pkgs.libglvnd
+              pkgs.sway
+              pkgs.weston
+              pkgs.wayland-utils
+              pkgs.wf-recorder
+              pkgs.ffmpeg-full
+              pkgs.mpv
             ];
 
           # Ensure the linker can find native libs at build time
@@ -92,6 +104,8 @@
               pkgs.curl
               pkgs.libgit2
               pkgs.alsa-lib
+              pkgs.mesa
+              pkgs.libglvnd
             ]
           );
 

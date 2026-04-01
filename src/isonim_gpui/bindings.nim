@@ -11,7 +11,12 @@ type
     ## Opaque handle to a GPUI element managed by the Rust shim.
     ## The actual layout is a Rust struct; Nim only holds a pointer to it.
 
-const shimLib = "libgpui_nim_shim.so"  # TODO: platform-specific (.dylib on macOS)
+when defined(macosx):
+  const shimLib = "libgpui_nim_shim.dylib"
+elif defined(windows):
+  const shimLib = "gpui_nim_shim.dll"
+else:
+  const shimLib = "libgpui_nim_shim.so"
 
 # --- Callback types ---
 

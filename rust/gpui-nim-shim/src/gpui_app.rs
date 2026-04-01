@@ -125,14 +125,42 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
                 text.into_any_element()
             }
             GpuiElementKind::Img => {
-                // TODO: load actual image from src attribute
-                let el = div();
-                apply_styles_to_div(el, &plan.styles).into_any_element()
+                // Placeholder: render a colored rect with alt text label.
+                // Full image loading requires async fetching + GPUI's img() API.
+                let label = plan.text.clone().unwrap_or_else(|| "[img]".to_string());
+                let mut el = div();
+                el = apply_styles_to_div(el, &plan.styles);
+                // Give it a visible placeholder appearance if no explicit styles
+                if plan.styles.bg.is_none() {
+                    el = el.bg(rgb(0xdddddd));
+                }
+                if plan.styles.w.is_none() {
+                    el = el.w(px(64.0));
+                }
+                if plan.styles.h.is_none() {
+                    el = el.h(px(64.0));
+                }
+                el = el.items_center().justify_center();
+                el.child(label).into_any_element()
             }
             GpuiElementKind::Svg => {
-                // TODO: load actual SVG from attribute
-                let el = div();
-                apply_styles_to_div(el, &plan.styles).into_any_element()
+                // Placeholder: render a colored rect with a label.
+                // Full SVG rendering requires GPUI's svg() API with path data.
+                let label = plan.text.clone().unwrap_or_else(|| "[svg]".to_string());
+                let mut el = div();
+                el = apply_styles_to_div(el, &plan.styles);
+                // Give it a visible placeholder appearance if no explicit styles
+                if plan.styles.bg.is_none() {
+                    el = el.bg(rgb(0xccccee));
+                }
+                if plan.styles.w.is_none() {
+                    el = el.w(px(64.0));
+                }
+                if plan.styles.h.is_none() {
+                    el = el.h(px(64.0));
+                }
+                el = el.items_center().justify_center();
+                el.child(label).into_any_element()
             }
             GpuiElementKind::Div | GpuiElementKind::TextContainer => {
                 let mut el = div();

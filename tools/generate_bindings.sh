@@ -64,7 +64,12 @@ type
   GpuiElement* = ptr GpuiElementObj
     ## Opaque handle to a GPUI element managed by the Rust shim.
 
-const shimLib = "libgpui_nim_shim.so" # TODO: platform-specific (.dylib on macOS)
+when defined(macosx):
+  const shimLib = "libgpui_nim_shim.dylib"
+elif defined(windows):
+  const shimLib = "gpui_nim_shim.dll"
+else:
+  const shimLib = "libgpui_nim_shim.so"
 
 HEADER
 
