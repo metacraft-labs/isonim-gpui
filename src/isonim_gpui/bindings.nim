@@ -168,4 +168,20 @@ proc gpui_notify_focus*(window_id: uint32; focused: uint8)
 proc gpui_reset_windows*()
   {.importc: "gpui_reset_windows".}
 
+# ===========================================================================
+# Render plan inspection
+# ===========================================================================
+
+proc gpui_render_plan_json*(root: GpuiElement): pointer
+  {.importc: "gpui_render_plan_json".}
+
+proc gpui_free_string*(p: pointer)
+  {.importc: "gpui_free_string".}
+
+proc gpui_render_plan_element_count*(root: GpuiElement): uint32
+  {.importc: "gpui_render_plan_element_count".}
+
+proc gpui_verify_render_plan*(root: GpuiElement): uint8
+  {.importc: "gpui_verify_render_plan".}
+
 {.pop.}

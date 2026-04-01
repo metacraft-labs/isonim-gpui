@@ -52,6 +52,10 @@ test-cross:
 test-demo:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --path:demos/task-manager/src --nimcache:nimcache/test_demo_app tests/test_demo_app.nim
 
+# Run render-plan integration tests (requires Rust shim + isonim)
+test-integration:
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --nimcache:nimcache/test_render_integration tests/test_render_integration.nim
+
 # Run performance benchmarks (requires Rust shim)
 test-perf:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r -d:release --path:../isonim/src --nimcache:nimcache/test_performance tests/test_performance.nim
@@ -64,10 +68,10 @@ demo-build:
 demo-run:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --nimcache:nimcache/demo demos/task-manager/src/main.nim
 
-# Run all tests (Rust + Nim + cross-renderer + demo)
-test-all: rust-test test test-cross test-demo
+# Run all tests (Rust + Nim + cross-renderer + demo + integration)
+test-all: rust-test test test-cross test-demo test-integration
 
 # Clean build artifacts
 clean:
-    rm -rf nimcache tests/test_basic tests/test_bindings tests/test_cross_renderer tests/test_demo_app tests/test_performance demos/task-manager/src/main
+    rm -rf nimcache tests/test_basic tests/test_bindings tests/test_cross_renderer tests/test_demo_app tests/test_performance tests/test_render_integration demos/task-manager/src/main
     cd rust && cargo clean

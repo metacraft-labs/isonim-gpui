@@ -51,21 +51,21 @@ const tagMap = {
   "summary": "div",
   "fieldset": "div",
 
-  # Text elements -> text
-  "span": "text",
-  "p": "text",
-  "h1": "text",
-  "h2": "text",
-  "h3": "text",
-  "h4": "text",
-  "h5": "text",
-  "h6": "text",
-  "label": "text",
-  "strong": "text",
-  "em": "text",
-  "small": "text",
-  "code": "text",
-  "pre": "text",
+  # Text elements -> pass through original HTML tag so Rust classifies as TextContainer
+  "span": "span",
+  "p": "p",
+  "h1": "h1",
+  "h2": "h2",
+  "h3": "h3",
+  "h4": "h4",
+  "h5": "h5",
+  "h6": "h6",
+  "label": "label",
+  "strong": "strong",
+  "em": "em",
+  "small": "small",
+  "code": "code",
+  "pre": "pre",
 
   # Interactive -> div (with event handling)
   "button": "div",
@@ -363,6 +363,29 @@ proc nthChild*(node: GpuiElement; index: int): GpuiElement =
 
 proc fireEvent*(node: GpuiElement; event: string) =
   gpui_dispatch_event(node, event.cstring)
+
+# ===========================================================================
+# Render plan inspection (G3-G — integration testing)
+# ===========================================================================
+
+proc renderPlanJson*(r: GpuiRenderer; root: GpuiElement): string =
+  ## Build a render plan from the shadow tree rooted at `root` and return
+  ## it as a JSON string. Returns "" if the node is nil or missing.
+  let raw = gpui_render_plan_json(root)
+  if raw == nil:
+    return ""
+  let cstr = cast[cstring](raw)
+  result = $cstr
+  gpui_free_string(raw)
+
+proc renderPlanElementCount*(r: GpuiRenderer; root: GpuiElement): int =
+  ## Return the total number of elements in the render plan rooted at `root`.
+  int(gpui_render_plan_element_count(root))
+
+proc verifyRenderPlan*(r: GpuiRenderer; root: GpuiElement): bool =
+  ## Return true if a valid render plan can be built from the shadow tree
+  ## rooted at `root`.
+  gpui_verify_render_plan(root) == 1
 
 # ===========================================================================
 # Compile-time concept check
