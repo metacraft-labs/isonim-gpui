@@ -6,3 +6,5 @@ result
 *.dylib
 *.dll
 tests/test_basic
+tests/test_bindings
+tests/test_renderer
