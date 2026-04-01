@@ -43,6 +43,9 @@
 mod tree;
 #[allow(dead_code)]
 mod window;
+mod render_sync;
+#[cfg(feature = "gpui-backend")]
+mod gpui_app;
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -55,6 +58,11 @@ use window::{CloseCallback, FocusCallback, ResizeCallback};
 /// All extern "C" functions lock this to perform tree operations.
 static TREE: std::sync::LazyLock<Mutex<Tree>> =
     std::sync::LazyLock::new(|| Mutex::new(Tree::new()));
+
+/// Global root node ID for the render-sync bridge.
+/// Set by `gpui_launch()` so the GPUI view knows which node is the root.
+static ROOT_NODE_ID: std::sync::LazyLock<Mutex<NodeId>> =
+    std::sync::LazyLock::new(|| Mutex::new(NodeId::NULL));
 
 /// Lock the global tree, recovering from poison if needed.
 /// Since the tree is always in a valid (if inconsistent) state after a panic,
@@ -382,15 +390,14 @@ pub extern "C" fn gpui_parent_node(node: *mut GpuiElement) -> *mut GpuiElement {
 pub type RootBuilderCallback = extern "C" fn(root: *mut GpuiElement);
 
 #[no_mangle]
+#[allow(unused_variables)]
 pub extern "C" fn gpui_launch(
     title: *const c_char,
     width: f64,
     height: f64,
     root_builder: RootBuilderCallback,
 ) {
-    let _title_str = unsafe { cstr_to_str(title) };
-    let _width = width;
-    let _height = height;
+    let title_str = unsafe { cstr_to_str(title) };
 
     // Create a root element in the shadow tree
     let root_node = Node::new_element("root");
@@ -398,15 +405,32 @@ pub extern "C" fn gpui_launch(
         let mut tree = lock_tree();
         tree.insert(root_node)
     };
+
+    // Store the root ID globally so the GPUI view can find it
+    {
+        let mut root = ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
+        *root = root_id;
+    }
+
     let root_handle = node_id_to_handle(root_id);
 
     // Call back to Nim so it can build the initial tree
     root_builder(root_handle);
 
-    // M4+: Here we would:
-    // 1. Application::new().run(|cx| { ... })
-    // 2. cx.open_window(WindowOptions { title, size, ... }, |_, cx| { ... })
-    // 3. NimRootView implementing Render to do render-sync from shadow tree
+    // When the gpui-backend feature is enabled, launch the actual GPUI
+    // window with the shadow tree renderer as the root view.
+    #[cfg(feature = "gpui-backend")]
+    {
+        let win_id = window::create_window(title_str, width, height);
+        gpui_app::launch_gpui_app(title_str, width, height, win_id);
+    }
+
+    // Without the feature, the function returns after building the shadow tree.
+    // This is the existing behavior used for testing and headless operation.
+    #[cfg(not(feature = "gpui-backend"))]
+    {
+        let _ = title_str;
+    }
 }
 
 /// Trigger all event listeners for the given event on the given node.
@@ -494,6 +518,8 @@ pub extern "C" fn gpui_destroy_tree(handle: *mut GpuiElement) {
 pub extern "C" fn gpui_reset_tree() {
     let mut tree = lock_tree();
     *tree = Tree::new();
+    let mut root = ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
+    *root = NodeId::NULL;
 }
 
 /// Get the number of nodes in the global tree (useful for debugging/testing).
@@ -806,6 +832,161 @@ pub extern "C" fn gpui_notify_focus(window_id: u32, focused: u8) {
 #[no_mangle]
 pub extern "C" fn gpui_reset_windows() {
     window::reset_windows();
+}
+
+// ---------------------------------------------------------------------------
+// Render plan inspection FFI (G1-G)
+// ---------------------------------------------------------------------------
+
+/// Build a render plan from the shadow tree rooted at `root` and return it as
+/// a JSON string. The caller must free the returned string with `gpui_free_string`.
+///
+/// Returns null if the handle is null or the node doesn't exist.
+///
+/// JSON format:
+/// ```json
+/// {
+///   "kind": "Div",
+///   "tag": "div",
+///   "text": null,
+///   "has_click_handler": false,
+///   "has_input_handler": false,
+///   "event_names": [],
+///   "styles": { "w": "100%", ... },
+///   "children": [ ... ]
+/// }
+/// ```
+#[no_mangle]
+pub extern "C" fn gpui_render_plan_json(root: *mut GpuiElement) -> *mut c_char {
+    let node_id = unsafe { handle_to_node_id(root) };
+    if node_id.is_null() {
+        return std::ptr::null_mut();
+    }
+    let tree = lock_tree();
+    let plan = match render_sync::build_render_plan(&tree, node_id) {
+        Some(p) => p,
+        None => return std::ptr::null_mut(),
+    };
+    drop(tree);
+
+    let json = render_plan_to_json(&plan);
+    match std::ffi::CString::new(json) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Free a string returned by `gpui_render_plan_json`.
+#[no_mangle]
+pub extern "C" fn gpui_free_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        unsafe {
+            drop(std::ffi::CString::from_raw(ptr));
+        }
+    }
+}
+
+/// Return the total element count in the render plan rooted at `root`.
+/// Returns 0 if the handle is null or the node doesn't exist.
+#[no_mangle]
+pub extern "C" fn gpui_render_plan_element_count(root: *mut GpuiElement) -> u32 {
+    let node_id = unsafe { handle_to_node_id(root) };
+    if node_id.is_null() {
+        return 0;
+    }
+    let tree = lock_tree();
+    match render_sync::build_render_plan(&tree, node_id) {
+        Some(plan) => render_sync::count_render_nodes(&plan) as u32,
+        None => 0,
+    }
+}
+
+/// Verify that a render plan can be built from the shadow tree rooted at `root`.
+/// Returns 1 if valid, 0 if there are issues (null handle, missing node, etc.).
+#[no_mangle]
+pub extern "C" fn gpui_verify_render_plan(root: *mut GpuiElement) -> u8 {
+    let node_id = unsafe { handle_to_node_id(root) };
+    if node_id.is_null() {
+        return 0;
+    }
+    let tree = lock_tree();
+    match render_sync::build_render_plan(&tree, node_id) {
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+/// Internal helper: serialize a RenderNode to a JSON string.
+fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
+    fn node_to_string(plan: &render_sync::RenderNode) -> String {
+        let kind = format!("{:?}", plan.kind);
+        let tag = &plan.tag;
+        let text = match &plan.text {
+            Some(t) => format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")),
+            None => "null".to_string(),
+        };
+
+        let mut style_entries = Vec::new();
+        let s = &plan.styles;
+        macro_rules! push_style {
+            ($field:ident, $name:expr) => {
+                if let Some(ref v) = s.$field {
+                    style_entries.push(format!("\"{}\":\"{}\"", $name, v.replace('"', "\\\"")));
+                }
+            };
+        }
+        push_style!(bg, "bg");
+        push_style!(w, "w");
+        push_style!(h, "h");
+        push_style!(min_w, "min_w");
+        push_style!(min_h, "min_h");
+        push_style!(max_w, "max_w");
+        push_style!(max_h, "max_h");
+        push_style!(p, "p");
+        push_style!(m, "m");
+        push_style!(flex_direction, "flex_direction");
+        push_style!(gap, "gap");
+        push_style!(text_size, "text_size");
+        push_style!(text_color, "text_color");
+        push_style!(rounded, "rounded");
+        push_style!(items, "items");
+        push_style!(justify, "justify");
+        push_style!(border_width, "border_width");
+        push_style!(border_color, "border_color");
+        push_style!(shadow, "shadow");
+        push_style!(opacity, "opacity");
+        push_style!(overflow, "overflow");
+        push_style!(font_family, "font_family");
+        push_style!(font_weight, "font_weight");
+        push_style!(font_style, "font_style");
+        push_style!(line_height, "line_height");
+        push_style!(letter_spacing, "letter_spacing");
+        push_style!(cursor, "cursor");
+        push_style!(display, "display");
+        push_style!(position, "position");
+        let styles_json = format!("{{{}}}", style_entries.join(","));
+
+        let event_names: Vec<String> = plan
+            .event_names
+            .iter()
+            .map(|e| format!("\"{}\"", e))
+            .collect();
+
+        let children: Vec<String> = plan.children.iter().map(node_to_string).collect();
+
+        format!(
+            "{{\"kind\":\"{}\",\"tag\":\"{}\",\"text\":{},\"has_click_handler\":{},\"has_input_handler\":{},\"event_names\":[{}],\"styles\":{},\"children\":[{}]}}",
+            kind,
+            tag.replace('"', "\\\""),
+            text,
+            plan.has_click_handler,
+            plan.has_input_handler,
+            event_names.join(","),
+            styles_json,
+            children.join(","),
+        )
+    }
+    node_to_string(plan)
 }
 
 // ===========================================================================

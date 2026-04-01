@@ -2132,6 +2132,7 @@ name = "gpui-nim-shim"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "serde_json",
  "serial_test",
 ]
 
