@@ -68,8 +68,12 @@ demo-build:
 demo-run:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --nimcache:nimcache/demo demos/task-manager/src/main.nim
 
+# Run structural comparison tests (G4 — requires Rust shim and isonim)
+test-structural:
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --nimcache:nimcache/test_structural_comparison tests/test_structural_comparison.nim
+
 # Run all tests (Rust + Nim + cross-renderer + demo + integration)
-test-all: rust-test test test-cross test-demo test-integration
+test-all: rust-test test test-cross test-demo test-integration test-structural
 
 # Clean build artifacts
 clean:
