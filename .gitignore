@@ -1,0 +1,8 @@
+.direnv/
+nimcache/
+target/
+result
+*.so
+*.dylib
+*.dll
+tests/test_basic

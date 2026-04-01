@@ -1,0 +1,21 @@
+[package]
+name = "gpui-nim-shim"
+version = "0.1.0"
+edition = "2021"
+description = "C FFI shim exposing GPUI operations for IsoNim's RendererBackend"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# Enable actual GPUI rendering (requires GPU system deps).
+# Without this feature, the shim provides the shadow tree and extern "C" API
+# but the launch function does not start a real GPUI window.
+gpui-backend = ["gpui"]
+
+[dependencies]
+gpui = { version = "0.2", optional = true }
+
+[dev-dependencies]
+serial_test = "3"
