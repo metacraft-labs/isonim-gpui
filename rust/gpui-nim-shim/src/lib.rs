@@ -8,10 +8,10 @@
 //! GPUI is a hybrid immediate/retained mode GPU-accelerated UI framework. IsoNim
 //! needs imperative tree manipulation. We bridge this by:
 //!
-//! 1. Maintaining a **shadow tree** of `Node` structs in Rust.
+//! 1. Maintaining a **shadow tree** of `Node` structs in Rust (`tree` module).
 //! 2. Exposing the 13 RendererBackend operations as `extern "C"` functions that
 //!    manipulate this tree imperatively.
-//! 3. A separate render-sync step (M2+) will translate the shadow tree into
+//! 3. A separate render-sync step (M4+) will translate the shadow tree into
 //!    GPUI's element model (div, text, img) for actual rendering.
 //!
 //! Element handles (`*mut GpuiElement`) are thin wrappers around `NodeId` values.
@@ -38,93 +38,27 @@
 //! shadow tree is essential: IsoNim mutates it imperatively, and the render-sync
 //! step translates it to GPUI's declarative builders each frame.
 
+// Some items are pub in submodules for future milestones (render-sync, etc.)
+#[allow(dead_code)]
+mod tree;
+#[allow(dead_code)]
+mod window;
+
 use std::ffi::CStr;
 use std::os::raw::c_char;
-
-// ---------------------------------------------------------------------------
-// Shadow tree types
-// ---------------------------------------------------------------------------
-
-/// Unique identifier for a node in the shadow tree.
-type NodeId = u64;
-
-/// Opaque element handle exposed to Nim.
-#[repr(C)]
-pub struct GpuiElement {
-    id: NodeId,
-}
-
-/// Event listener stored in the shadow tree.
-struct EventListener {
-    _event: String,
-    _callback: extern "C" fn(),
-}
-
-/// A single node in the shadow tree.
-struct Node {
-    _id: NodeId,
-    _tag: String,
-    text: String,
-    attributes: Vec<(String, String)>,
-    styles: Vec<(String, String)>,
-    events: Vec<EventListener>,
-    children: Vec<NodeId>,
-    parent: Option<NodeId>,
-}
-
-/// The global shadow tree.
-struct Tree {
-    nodes: Vec<Node>,
-    next_id: NodeId,
-}
-
-impl Tree {
-    fn new() -> Self {
-        Tree {
-            nodes: Vec::new(),
-            next_id: 1,
-        }
-    }
-
-    fn alloc_id(&mut self) -> NodeId {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    fn add_node(&mut self, tag: String) -> NodeId {
-        let id = self.alloc_id();
-        self.nodes.push(Node {
-            _id: id,
-            _tag: tag,
-            text: String::new(),
-            attributes: Vec::new(),
-            styles: Vec::new(),
-            events: Vec::new(),
-            children: Vec::new(),
-            parent: None,
-        });
-        id
-    }
-
-    fn find(&self, id: NodeId) -> Option<usize> {
-        self.nodes.iter().position(|n| n._id == id)
-    }
-
-    fn find_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        self.nodes.iter_mut().find(|n| n._id == id)
-    }
-
-    fn node_count(&self) -> usize {
-        self.nodes.len()
-    }
-}
-
 use std::sync::Mutex;
 
+use tree::{EventListener, Node, NodeId, Tree};
+use window::{CloseCallback, FocusCallback, ResizeCallback};
+
+/// Global shadow tree protected by a mutex.
+/// All extern "C" functions lock this to perform tree operations.
 static TREE: std::sync::LazyLock<Mutex<Tree>> =
     std::sync::LazyLock::new(|| Mutex::new(Tree::new()));
 
+/// Lock the global tree, recovering from poison if needed.
+/// Since the tree is always in a valid (if inconsistent) state after a panic,
+/// we simply clear the poison and continue.
 fn lock_tree() -> std::sync::MutexGuard<'static, Tree> {
     match TREE.lock() {
         Ok(guard) => guard,
@@ -132,538 +66,496 @@ fn lock_tree() -> std::sync::MutexGuard<'static, Tree> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helper: box a handle for FFI
-// ---------------------------------------------------------------------------
-
-fn box_handle(id: NodeId) -> *mut GpuiElement {
-    Box::into_raw(Box::new(GpuiElement { id }))
+/// Opaque handle to a GPUI element. Wraps a NodeId.
+/// Allocated on the heap via Box so Nim holds a stable pointer.
+#[repr(C)]
+pub struct GpuiElement {
+    node_id: u64,
 }
 
-fn unbox_id(ptr: *mut GpuiElement) -> Option<NodeId> {
+/// Helper: convert a raw C string pointer to a Rust &str.
+/// Returns "" if the pointer is null or not valid UTF-8.
+unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
     if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { &*ptr }.id)
+        return "";
+    }
+    match CStr::from_ptr(ptr).to_str() {
+        Ok(s) => s,
+        Err(_) => "",
     }
 }
 
-fn c_str_to_string(s: *const c_char) -> String {
-    if s.is_null() {
-        return String::new();
+/// Helper: allocate a GpuiElement handle on the heap for the given NodeId.
+/// Returns null if the id is NULL.
+fn node_id_to_handle(id: NodeId) -> *mut GpuiElement {
+    if id.is_null() {
+        return std::ptr::null_mut();
     }
-    unsafe { CStr::from_ptr(s) }
-        .to_string_lossy()
-        .into_owned()
+    Box::into_raw(Box::new(GpuiElement { node_id: id.0 }))
+}
+
+/// Helper: extract NodeId from a handle pointer. Returns NodeId::NULL if null.
+unsafe fn handle_to_node_id(handle: *mut GpuiElement) -> NodeId {
+    if handle.is_null() {
+        NodeId::NULL
+    } else {
+        NodeId((*handle).node_id)
+    }
 }
 
 // ===========================================================================
 // 13 RendererBackend extern "C" functions
 // ===========================================================================
 
-/// RendererBackend proc #1: createElement(tag) -> Element
+// ---------------------------------------------------------------------------
+// 1. createElement
+// ---------------------------------------------------------------------------
+
+/// Create a new element with the given tag name.
 ///
-/// **GPUI mapping:** During render-sync (M2+), the tag determines which GPUI
-/// builder is used:
-/// - "div" (and most container tags) -> `gpui::div()` (Div element)
-/// - "img" -> `gpui::img()` (Img element with .uri() for source)
-/// - "svg" -> `gpui::svg()` (Svg element with .path() for source)
-/// - "text" tags -> `gpui::div()` with text child (GPUI has no standalone text element)
+/// Returns a heap-allocated handle that the caller (Nim) must hold.
+/// The element is added to the global shadow tree but not attached to any parent.
 ///
-/// The Nim-side `renderer.nim` maps HTML tags to these GPUI names before
-/// calling this function (e.g., "section" -> "div", "span" -> "text").
-///
-/// **Current behavior:** Allocates a Node in the shadow tree with the given tag.
-/// No GPUI element is created yet -- that happens during render-sync.
+/// **GPUI mapping:** During render-sync, the tag determines which GPUI builder
+/// is used (div, img, svg, or text container). See `tree::tag_to_gpui_kind`.
 #[no_mangle]
 pub extern "C" fn gpui_create_element(tag: *const c_char) -> *mut GpuiElement {
-    let tag = c_str_to_string(tag);
+    let tag_str = unsafe { cstr_to_str(tag) };
+    let node = Node::new_element(tag_str);
     let mut tree = lock_tree();
-    let id = tree.add_node(tag);
-    box_handle(id)
+    let id = tree.insert(node);
+    node_id_to_handle(id)
 }
 
-/// RendererBackend proc #2: createTextNode(text) -> Element
-///
-/// **GPUI mapping:** GPUI does not have standalone text elements. Text is added
-/// as a child of a Div via `.child("string")` -- strings implement `IntoElement`.
-/// For styled text, GPUI provides `StyledText` with `TextRun`s for rich formatting.
-///
-/// During render-sync, `#text` nodes are converted to string children of their
-/// parent div rather than becoming independent GPUI elements.
-///
-/// **Current behavior:** Allocates a Node with tag="#text" and the given text content.
+// ---------------------------------------------------------------------------
+// 2. createTextNode
+// ---------------------------------------------------------------------------
+
+/// Create a text node with the given content.
 #[no_mangle]
 pub extern "C" fn gpui_create_text_node(text: *const c_char) -> *mut GpuiElement {
-    let text_str = c_str_to_string(text);
+    let text_str = unsafe { cstr_to_str(text) };
+    let node = Node::new_text(text_str);
     let mut tree = lock_tree();
-    let id = tree.add_node("#text".to_string());
-    if let Some(node) = tree.find_mut(id) {
-        node.text = text_str;
-    }
-    box_handle(id)
+    let id = tree.insert(node);
+    node_id_to_handle(id)
 }
 
-/// RendererBackend proc #3: appendChild(parent, child)
-///
-/// **GPUI mapping:** GPUI uses `.child(elem)` on the ParentElement trait to add
-/// children during element construction. There is no runtime appendChild -- the
-/// element tree is rebuilt each frame from `Render::render()`.
-///
-/// During render-sync, the shadow tree's children list determines the order of
-/// `.child()` calls in the GPUI builder chain. This function just maintains the
-/// shadow tree's parent-child relationships.
-///
-/// **Challenge:** GPUI children are added declaratively in a single builder chain.
-/// The render-sync must iterate shadow tree children in order and emit
-/// `.child(render_node(child))` for each.
+// ---------------------------------------------------------------------------
+// 3. appendChild
+// ---------------------------------------------------------------------------
+
+/// Append `child` as the last child of `parent`.
 #[no_mangle]
 pub extern "C" fn gpui_append_child(parent: *mut GpuiElement, child: *mut GpuiElement) {
-    let (Some(pid), Some(cid)) = (unbox_id(parent), unbox_id(child)) else {
+    let parent_id = unsafe { handle_to_node_id(parent) };
+    let child_id = unsafe { handle_to_node_id(child) };
+    if parent_id.is_null() || child_id.is_null() {
         return;
-    };
+    }
     let mut tree = lock_tree();
-    // Remove from old parent if any
-    if let Some(old_parent_id) = tree.find_mut(cid).and_then(|n| n.parent) {
-        if let Some(old_parent) = tree.find_mut(old_parent_id) {
-            old_parent.children.retain(|&id| id != cid);
-        }
-    }
-    if let Some(parent_node) = tree.find_mut(pid) {
-        parent_node.children.push(cid);
-    }
-    if let Some(child_node) = tree.find_mut(cid) {
-        child_node.parent = Some(pid);
-    }
+    tree.append_child(parent_id, child_id);
+    window::request_repaint();
 }
 
-/// RendererBackend proc #4: insertBefore(parent, child, reference)
-///
-/// **GPUI mapping:** Same as appendChild -- GPUI has no insertBefore. Child order
-/// in the shadow tree determines the `.child()` call order during render-sync.
-/// Inserting before a reference node just means the shadow tree children list
-/// has the new child at the correct position.
-///
-/// **Current behavior:** Inserts child into parent.children before the reference
-/// node (or appends if reference is null/not found).
+// ---------------------------------------------------------------------------
+// 4. insertBefore
+// ---------------------------------------------------------------------------
+
+/// Insert `child` before `reference` within `parent`.
+/// If `reference` is null, appends child instead.
 #[no_mangle]
 pub extern "C" fn gpui_insert_before(
     parent: *mut GpuiElement,
     child: *mut GpuiElement,
     reference: *mut GpuiElement,
 ) {
-    let (Some(pid), Some(cid)) = (unbox_id(parent), unbox_id(child)) else {
+    let parent_id = unsafe { handle_to_node_id(parent) };
+    let child_id = unsafe { handle_to_node_id(child) };
+    let ref_id = unsafe { handle_to_node_id(reference) };
+    if parent_id.is_null() || child_id.is_null() {
         return;
-    };
-    let ref_id = unbox_id(reference);
+    }
     let mut tree = lock_tree();
-    // Remove from old parent
-    if let Some(old_parent_id) = tree.find_mut(cid).and_then(|n| n.parent) {
-        if let Some(old_parent) = tree.find_mut(old_parent_id) {
-            old_parent.children.retain(|&id| id != cid);
-        }
-    }
-    if let Some(parent_node) = tree.find_mut(pid) {
-        if let Some(rid) = ref_id {
-            if let Some(pos) = parent_node.children.iter().position(|&id| id == rid) {
-                parent_node.children.insert(pos, cid);
-            } else {
-                parent_node.children.push(cid);
-            }
-        } else {
-            parent_node.children.push(cid);
-        }
-    }
-    if let Some(child_node) = tree.find_mut(cid) {
-        child_node.parent = Some(pid);
-    }
+    tree.insert_before(parent_id, child_id, ref_id);
+    window::request_repaint();
 }
 
-/// RendererBackend proc #5: removeChild(parent, child)
-///
-/// **GPUI mapping:** GPUI has no removeChild. Removing a child from the shadow tree
-/// means it will not appear in the `.child()` chain during the next render-sync.
-/// The GPUI element simply ceases to exist in the next frame's element tree.
-///
-/// **Current behavior:** Removes child from parent.children and clears child.parent.
-/// The shadow tree node is NOT deallocated (it may be re-parented later).
+// ---------------------------------------------------------------------------
+// 5. removeChild
+// ---------------------------------------------------------------------------
+
+/// Remove `child` from `parent`.
 #[no_mangle]
 pub extern "C" fn gpui_remove_child(parent: *mut GpuiElement, child: *mut GpuiElement) {
-    let (Some(pid), Some(cid)) = (unbox_id(parent), unbox_id(child)) else {
+    let parent_id = unsafe { handle_to_node_id(parent) };
+    let child_id = unsafe { handle_to_node_id(child) };
+    if parent_id.is_null() || child_id.is_null() {
         return;
-    };
+    }
     let mut tree = lock_tree();
-    if let Some(parent_node) = tree.find_mut(pid) {
-        parent_node.children.retain(|&id| id != cid);
-    }
-    if let Some(child_node) = tree.find_mut(cid) {
-        child_node.parent = None;
-    }
+    tree.remove_child(parent_id, child_id);
+    window::request_repaint();
 }
 
-/// RendererBackend proc #6: setAttribute(node, name, value)
-///
-/// **GPUI mapping:** GPUI elements don't have a generic setAttribute API.
-/// Attributes map to specific builder methods during render-sync:
-/// - "id" -> `.id(ElementId::from(value))` (for cross-frame identity tracking)
-/// - "src" -> `.uri(value)` on Img elements
-/// - "class" -> ignored (styling is inline via Styled trait methods)
-/// - "placeholder", "value" -> stored as metadata for input-like elements
-/// - "disabled" -> negated to "enabled" by the Nim-side mapper
-///
-/// Most HTML attributes have no direct GPUI equivalent. They are stored in the
-/// shadow tree for potential use by the render-sync or for testing/inspection.
+// ---------------------------------------------------------------------------
+// 6. setAttribute
+// ---------------------------------------------------------------------------
+
+/// Set attribute `name` to `value` on `node`.
 #[no_mangle]
 pub extern "C" fn gpui_set_attribute(
     node: *mut GpuiElement,
     name: *const c_char,
     value: *const c_char,
 ) {
-    let Some(nid) = unbox_id(node) else { return };
-    let name = c_str_to_string(name);
-    let value = c_str_to_string(value);
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return;
+    }
+    let name_str = unsafe { cstr_to_str(name) };
+    let value_str = unsafe { cstr_to_str(value) };
     let mut tree = lock_tree();
-    if let Some(n) = tree.find_mut(nid) {
-        if let Some(attr) = n.attributes.iter_mut().find(|(k, _)| k == &name) {
-            attr.1 = value;
-        } else {
-            n.attributes.push((name, value));
-        }
+    if let Some(n) = tree.get_mut(node_id) {
+        n.attributes
+            .insert(name_str.to_string(), value_str.to_string());
+        window::request_repaint();
     }
 }
 
-/// RendererBackend proc #7: removeAttribute(node, name)
-///
-/// **GPUI mapping:** Removing an attribute from the shadow tree means the
-/// corresponding GPUI builder method will not be called during the next
-/// render-sync. For example, removing "id" means `.id()` won't be called.
+// ---------------------------------------------------------------------------
+// 7. removeAttribute
+// ---------------------------------------------------------------------------
+
+/// Remove attribute `name` from `node`.
 #[no_mangle]
 pub extern "C" fn gpui_remove_attribute(node: *mut GpuiElement, name: *const c_char) {
-    let Some(nid) = unbox_id(node) else { return };
-    let name = c_str_to_string(name);
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return;
+    }
+    let name_str = unsafe { cstr_to_str(name) };
     let mut tree = lock_tree();
-    if let Some(n) = tree.find_mut(nid) {
-        n.attributes.retain(|(k, _)| k != &name);
+    if let Some(n) = tree.get_mut(node_id) {
+        n.attributes.remove(name_str);
+        window::request_repaint();
     }
 }
 
-/// RendererBackend proc #8: setTextContent(node, text)
-///
-/// **GPUI mapping:** Text content is rendered by passing a string to `.child()`:
-/// `div().child("Hello world")`. For text-tagged shadow nodes, the render-sync
-/// produces the text string as a child element. For container nodes with direct
-/// text, it is appended as an additional `.child()`.
-///
-/// GPUI's `StyledText` with `TextRun`s can be used for rich text (multiple
-/// styles within one text block), but that requires M3+ implementation.
+// ---------------------------------------------------------------------------
+// 8. setTextContent
+// ---------------------------------------------------------------------------
+
+/// Set the text content of `node`.
 #[no_mangle]
 pub extern "C" fn gpui_set_text_content(node: *mut GpuiElement, text: *const c_char) {
-    let Some(nid) = unbox_id(node) else { return };
-    let text = c_str_to_string(text);
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return;
+    }
+    let text_str = unsafe { cstr_to_str(text) };
     let mut tree = lock_tree();
-    if let Some(n) = tree.find_mut(nid) {
-        n.text = text;
+    if let Some(n) = tree.get_mut(node_id) {
+        n.set_text_content(text_str);
+        window::request_repaint();
     }
 }
 
-/// RendererBackend proc #9: setStyle(node, prop, value)
-///
-/// **GPUI mapping:** GPUI uses the `Styled` trait with Tailwind-inspired builder
-/// methods. The render-sync parses prop/value strings and calls the matching method:
-///
-/// - "width"/"height" -> `.w(px(...))` / `.h(px(...))`
-/// - "bg"/"background-color" -> `.bg(rgb(...))`
-/// - "text_color"/"color" -> `.text_color(rgb(...))`
-/// - "padding"/"margin" -> `.p(px(...))` / `.m(px(...))`
-/// - "flex_direction: row" -> `.flex_row()`
-/// - "flex_direction: col" -> `.flex_col()`
-/// - "align_items: center" -> `.items_center()`
-/// - "justify_content: center" -> `.justify_center()`
-/// - "gap" -> `.gap(px(...))`
-/// - "corner_radius" -> `.rounded(px(...))`
-/// - "border_color" -> `.border_color(rgb(...))`
-/// - "shadow" -> `.shadow_lg()`
-/// - "cursor: pointer" -> `.cursor_pointer()`
-///
-/// **Challenge:** GPUI expects typed values (Pixels, Hsla, enums), not CSS strings.
-/// The render-sync needs parsers for dimensions ("16px" -> px(16.0)),
-/// colors ("#ff0000" -> rgb(0xff0000)), and enum values.
-///
-/// The Nim-side `renderer.nim` pre-maps CSS property names to GPUI-friendly names
-/// (e.g., "background-color" -> "bg") to simplify the Rust-side parsing.
+// ---------------------------------------------------------------------------
+// 9. setStyle
+// ---------------------------------------------------------------------------
+
+/// Set a style property on `node`.
 #[no_mangle]
 pub extern "C" fn gpui_set_style(
     node: *mut GpuiElement,
     prop: *const c_char,
     value: *const c_char,
 ) {
-    let Some(nid) = unbox_id(node) else { return };
-    let prop = c_str_to_string(prop);
-    let value = c_str_to_string(value);
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return;
+    }
+    let prop_str = unsafe { cstr_to_str(prop) };
+    let value_str = unsafe { cstr_to_str(value) };
     let mut tree = lock_tree();
-    if let Some(n) = tree.find_mut(nid) {
-        if let Some(style) = n.styles.iter_mut().find(|(k, _)| k == &prop) {
-            style.1 = value;
-        } else {
-            n.styles.push((prop, value));
-        }
+    if let Some(n) = tree.get_mut(node_id) {
+        n.styles
+            .insert(prop_str.to_string(), value_str.to_string());
+        window::request_repaint();
     }
 }
 
-/// RendererBackend proc #10: addEventListener(node, event, handler)
-///
-/// **GPUI mapping:** GPUI elements handle events via InteractiveElement trait methods:
-/// - "click"/"mouseup" -> `.on_mouse_up(MouseButton::Left, cx.listener(...))`
-/// - "mousedown" -> `.on_mouse_down(MouseButton::Left, cx.listener(...))`
-/// - "mousemove" -> `.on_mouse_move(cx.listener(...))`
-/// - "keydown" -> `.on_key_down(cx.listener(...))`
-/// - "keyup" -> `.on_key_up(cx.listener(...))`
-/// - "scroll" -> `.on_scroll_wheel(cx.listener(...))`
-///
-/// During render-sync, the shadow tree's event listeners are translated into
-/// GPUI event handler registrations. The GPUI handler calls the stored
-/// `extern "C" fn()` callback, which trampolines into Nim.
-///
-/// **Challenge:** The current callback type is `extern "C" fn()` with no event data.
-/// For full event support (M3+), we need to pass mouse position, key codes, etc.
-/// via a `*const EventData` parameter.
-///
-/// **Challenge:** GPUI event handlers require `cx.listener()` which captures the
-/// view's Entity. The render-sync must have access to the view context to create
-/// proper listener closures.
+// ---------------------------------------------------------------------------
+// 10. addEventListener
+// ---------------------------------------------------------------------------
+
+/// C function pointer type for event callbacks from Nim.
+pub type EventCallback = extern "C" fn();
+
+/// Register a callback for `event` on `node`.
+/// The `handler` is a C function pointer that Nim will pass in.
 #[no_mangle]
 pub extern "C" fn gpui_add_event_listener(
     node: *mut GpuiElement,
     event: *const c_char,
-    handler: extern "C" fn(),
+    handler: EventCallback,
 ) {
-    let Some(nid) = unbox_id(node) else { return };
-    let event = c_str_to_string(event);
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return;
+    }
+    let event_str = unsafe { cstr_to_str(event) };
     let mut tree = lock_tree();
-    if let Some(n) = tree.find_mut(nid) {
-        n.events.push(EventListener {
-            _event: event,
-            _callback: handler,
-        });
+    if let Some(n) = tree.get_mut(node_id) {
+        let listener = EventListener { callback: handler };
+        n.event_listeners
+            .entry(event_str.to_string())
+            .or_default()
+            .push(listener);
     }
 }
 
-/// RendererBackend proc #11: firstChild(node) -> Element
-///
-/// **GPUI mapping:** None. GPUI's declarative model has no tree traversal API.
-/// This is purely a shadow tree operation used by IsoNim's VDOM diffing algorithm
-/// to walk the existing tree and compare it against the new virtual tree.
-///
-/// Returns a new handle to the first child node, or null if no children exist.
+// ---------------------------------------------------------------------------
+// 11. firstChild
+// ---------------------------------------------------------------------------
+
+/// Return the first child of `node`, or null if it has no children.
 #[no_mangle]
 pub extern "C" fn gpui_first_child(node: *mut GpuiElement) -> *mut GpuiElement {
-    let Some(nid) = unbox_id(node) else {
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
         return std::ptr::null_mut();
-    };
-    let tree = lock_tree();
-    let idx = tree.find(nid);
-    match idx {
-        Some(i) => {
-            if let Some(&first) = tree.nodes[i].children.first() {
-                box_handle(first)
-            } else {
-                std::ptr::null_mut()
-            }
-        }
-        None => std::ptr::null_mut(),
     }
+    let tree = lock_tree();
+    let child_id = tree.first_child(node_id);
+    node_id_to_handle(child_id)
 }
 
-/// RendererBackend proc #12: nextSibling(node) -> Element
-///
-/// **GPUI mapping:** None. Purely a shadow tree traversal operation for IsoNim's
-/// VDOM diffing. Finds the node in its parent's children list and returns the
-/// next sibling, or null if it is the last child.
+// ---------------------------------------------------------------------------
+// 12. nextSibling
+// ---------------------------------------------------------------------------
+
+/// Return the next sibling of `node`, or null.
 #[no_mangle]
 pub extern "C" fn gpui_next_sibling(node: *mut GpuiElement) -> *mut GpuiElement {
-    let Some(nid) = unbox_id(node) else {
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
         return std::ptr::null_mut();
-    };
-    let tree = lock_tree();
-    let parent_id = match tree.find(nid) {
-        Some(i) => tree.nodes[i].parent,
-        None => return std::ptr::null_mut(),
-    };
-    let Some(pid) = parent_id else {
-        return std::ptr::null_mut();
-    };
-    let parent_idx = match tree.find(pid) {
-        Some(i) => i,
-        None => return std::ptr::null_mut(),
-    };
-    let children = &tree.nodes[parent_idx].children;
-    if let Some(pos) = children.iter().position(|&id| id == nid) {
-        if pos + 1 < children.len() {
-            return box_handle(children[pos + 1]);
-        }
     }
-    std::ptr::null_mut()
+    let tree = lock_tree();
+    let sibling_id = tree.next_sibling(node_id);
+    node_id_to_handle(sibling_id)
 }
 
-/// RendererBackend proc #13: parentNode(node) -> Element
-///
-/// **GPUI mapping:** None. Purely a shadow tree traversal operation for IsoNim's
-/// VDOM diffing. Returns the parent node handle, or null if the node is a root.
+// ---------------------------------------------------------------------------
+// 13. parentNode
+// ---------------------------------------------------------------------------
+
+/// Return the parent of `node`, or null.
 #[no_mangle]
 pub extern "C" fn gpui_parent_node(node: *mut GpuiElement) -> *mut GpuiElement {
-    let Some(nid) = unbox_id(node) else {
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
         return std::ptr::null_mut();
-    };
-    let tree = lock_tree();
-    match tree.find(nid) {
-        Some(i) => match tree.nodes[i].parent {
-            Some(pid) => box_handle(pid),
-            None => std::ptr::null_mut(),
-        },
-        None => std::ptr::null_mut(),
     }
+    let tree = lock_tree();
+    let parent_id = tree.parent_node(node_id);
+    node_id_to_handle(parent_id)
 }
 
 // ===========================================================================
 // Window / event loop management
 // ===========================================================================
 
-type RootBuilderCallback = extern "C" fn(*mut GpuiElement);
+/// Launch a GPUI window.
+///
+/// This creates a root element in the shadow tree and starts the GPUI event loop.
+/// The `title` parameter sets the window title.
+/// The `width` and `height` parameters set the initial window size.
+/// The `root_builder` callback is called with the root element handle so the
+/// Nim side can build the initial tree before the event loop starts.
+///
+/// **Note:** Without the `gpui-backend` feature this is a placeholder that creates
+/// the root element and calls the builder callback but does NOT start an actual
+/// GPUI window. The actual GPUI integration will be completed in M4+.
+pub type RootBuilderCallback = extern "C" fn(root: *mut GpuiElement);
 
-/// Launch the GPUI application with a window.
-///
-/// **GPUI mapping (M2+):** This will become:
-/// ```ignore
-/// Application::new().run(|cx: &mut App| {
-///     let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-///     cx.open_window(WindowOptions {
-///         window_bounds: Some(WindowBounds::Windowed(bounds)),
-///         ..Default::default()
-///     }, |_, cx| {
-///         // Call root_builder to let Nim build the shadow tree
-///         root_builder(root_handle);
-///         // Create a NimRootView that renders from the shadow tree
-///         cx.new(|_| NimRootView)
-///     });
-/// });
-/// ```
-///
-/// `Application::new()` creates the GPUI app; `.run()` starts the event loop
-/// (takes over the main thread). `cx.open_window()` creates a platform window
-/// with the given options. The root view implements `Render` and translates
-/// the shadow tree to GPUI elements each frame.
-///
-/// **Current behavior (stub):** Creates a root div node and calls the builder
-/// callback without starting an actual GPUI event loop.
 #[no_mangle]
 pub extern "C" fn gpui_launch(
-    _title: *const c_char,
-    _width: f64,
-    _height: f64,
-    _root_builder: RootBuilderCallback,
+    title: *const c_char,
+    width: f64,
+    height: f64,
+    root_builder: RootBuilderCallback,
 ) {
-    // Stub: in gpui-backend mode this would create a GPUI Application and Window.
-    // For now, create a root element and call the builder.
-    let root = gpui_create_element(b"div\0".as_ptr() as *const c_char);
-    _root_builder(root);
+    let _title_str = unsafe { cstr_to_str(title) };
+    let _width = width;
+    let _height = height;
+
+    // Create a root element in the shadow tree
+    let root_node = Node::new_element("root");
+    let root_id = {
+        let mut tree = lock_tree();
+        tree.insert(root_node)
+    };
+    let root_handle = node_id_to_handle(root_id);
+
+    // Call back to Nim so it can build the initial tree
+    root_builder(root_handle);
+
+    // M4+: Here we would:
+    // 1. Application::new().run(|cx| { ... })
+    // 2. cx.open_window(WindowOptions { title, size, ... }, |_, cx| { ... })
+    // 3. NimRootView implementing Render to do render-sync from shadow tree
 }
 
-/// Dispatch a named event on a shadow tree node (for testing).
-///
-/// **GPUI mapping:** In a real GPUI app, events are dispatched by the platform
-/// (mouse clicks, key presses) and routed through GPUI's hit-testing system to
-/// the appropriate element's event handler. This function simulates that for
-/// testing: it finds all EventListeners on the node matching the event name
-/// and calls their callbacks.
-///
-/// **Note:** The tree lock is dropped before calling callbacks to avoid deadlock
-/// if a callback modifies the tree (which is the normal case -- Nim event
-/// handlers typically update UI state).
+/// Trigger all event listeners for the given event on the given node.
+/// This is called by the GPUI event loop (M4+) when an event occurs,
+/// or can be called directly for testing.
 #[no_mangle]
 pub extern "C" fn gpui_dispatch_event(node: *mut GpuiElement, event: *const c_char) {
-    let Some(nid) = unbox_id(node) else { return };
-    let event_name = c_str_to_string(event);
-    let tree = lock_tree();
-    if let Some(idx) = tree.find(nid) {
-        let callbacks: Vec<extern "C" fn()> = tree.nodes[idx]
-            .events
-            .iter()
-            .filter(|e| e._event == event_name)
-            .map(|e| e._callback)
-            .collect();
-        drop(tree);
-        for cb in callbacks {
-            cb();
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return;
+    }
+    let event_str = unsafe { cstr_to_str(event) };
+
+    // Collect callbacks while holding the lock, then call them after releasing.
+    // This avoids deadlock when callbacks modify the tree.
+    let callbacks: Vec<extern "C" fn()> = {
+        let tree = lock_tree();
+        if let Some(n) = tree.get(node_id) {
+            n.event_listeners
+                .get(event_str)
+                .map(|listeners| listeners.iter().map(|l| l.callback).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         }
+    };
+
+    for cb in callbacks {
+        cb();
     }
 }
 
-// ===========================================================================
-// Memory management
-// ===========================================================================
-
+/// Free a GpuiElement handle.
+/// This deallocates the handle pointer but does NOT remove the node from the tree.
+/// Call gpui_remove_child first to detach the node, then gpui_destroy_element
+/// to free the handle memory.
 #[no_mangle]
 pub extern "C" fn gpui_destroy_element(handle: *mut GpuiElement) {
     if !handle.is_null() {
         unsafe {
-            let _ = Box::from_raw(handle);
+            drop(Box::from_raw(handle));
         }
     }
 }
 
-// ===========================================================================
-// Debugging / testing
-// ===========================================================================
+/// Remove a node and all its descendants from the shadow tree entirely.
+/// This is for cleanup — it removes the node from the tree store (not just
+/// from its parent's children list). The handle is also freed.
+#[no_mangle]
+pub extern "C" fn gpui_destroy_tree(handle: *mut GpuiElement) {
+    if handle.is_null() {
+        return;
+    }
+    let node_id = unsafe { handle_to_node_id(handle) };
 
+    // Collect all descendant IDs via BFS
+    let ids_to_remove = {
+        let tree = lock_tree();
+        let mut to_visit = vec![node_id];
+        let mut to_remove = Vec::new();
+        while let Some(id) = to_visit.pop() {
+            to_remove.push(id);
+            if let Some(n) = tree.get(id) {
+                to_visit.extend_from_slice(&n.children);
+            }
+        }
+        to_remove
+    };
+
+    {
+        let mut tree = lock_tree();
+        for id in &ids_to_remove {
+            tree.remove(*id);
+        }
+    }
+
+    // Free the handle
+    unsafe {
+        drop(Box::from_raw(handle));
+    }
+}
+
+/// Reset the global tree (useful for testing).
 #[no_mangle]
 pub extern "C" fn gpui_reset_tree() {
     let mut tree = lock_tree();
     *tree = Tree::new();
 }
 
+/// Get the number of nodes in the global tree (useful for debugging/testing).
 #[no_mangle]
 pub extern "C" fn gpui_tree_node_count() -> u64 {
     let tree = lock_tree();
-    tree.node_count() as u64
+    tree.len() as u64
 }
 
-// ===========================================================================
-// Tree inspection (for cross-renderer testing)
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// Tree inspection functions (for cross-renderer testing)
+// ---------------------------------------------------------------------------
 
+/// Get the number of children of a node.
+/// Returns 0 if the node is null or not found.
 #[no_mangle]
 pub extern "C" fn gpui_child_count(node: *mut GpuiElement) -> u64 {
-    let Some(nid) = unbox_id(node) else { return 0 };
-    let tree = lock_tree();
-    match tree.find(nid) {
-        Some(i) => tree.nodes[i].children.len() as u64,
-        None => 0,
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return 0;
     }
+    let tree = lock_tree();
+    tree.get(node_id)
+        .map(|n| n.children.len() as u64)
+        .unwrap_or(0)
 }
 
+/// Get the text content of a node and all its descendants (recursive).
+/// For text nodes, returns the text. For element nodes, concatenates
+/// all descendant text. The result is written into the provided buffer.
+/// Returns the number of bytes needed (excluding null terminator),
+/// or 0 if the node is not found.
 #[no_mangle]
 pub extern "C" fn gpui_get_text_content(
     node: *mut GpuiElement,
     buf: *mut u8,
     buf_len: u64,
 ) -> u64 {
-    let Some(nid) = unbox_id(node) else { return 0 };
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return 0;
+    }
     let tree = lock_tree();
-    let text = match tree.find(nid) {
-        Some(i) => tree.nodes[i].text.clone(),
-        None => return 0,
-    };
-    let needed = text.len() as u64;
-    if !buf.is_null() && buf_len > 0 {
-        let copy_len = std::cmp::min(needed, buf_len - 1) as usize;
-        unsafe {
-            std::ptr::copy_nonoverlapping(text.as_ptr(), buf, copy_len);
-            *buf.add(copy_len) = 0;
-        }
+    let text = tree.collect_text(node_id);
+    let bytes = text.as_bytes();
+    let needed = bytes.len() as u64;
+
+    if buf.is_null() || buf_len == 0 {
+        return needed;
+    }
+
+    let to_copy = std::cmp::min(bytes.len(), (buf_len - 1) as usize);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
+        *buf.add(to_copy) = 0; // null terminator
     }
     needed
 }
 
+/// Get an attribute value from a node.
+/// Returns the number of bytes in the attribute value (excluding null),
+/// or 0 if the attribute is not found. Writes into `buf` if provided.
 #[no_mangle]
 pub extern "C" fn gpui_get_attribute(
     node: *mut GpuiElement,
@@ -671,93 +563,1126 @@ pub extern "C" fn gpui_get_attribute(
     buf: *mut u8,
     buf_len: u64,
 ) -> u64 {
-    let Some(nid) = unbox_id(node) else { return 0 };
-    let attr_name = c_str_to_string(name);
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return 0;
+    }
+    let name_str = unsafe { cstr_to_str(name) };
     let tree = lock_tree();
-    let value = match tree.find(nid) {
-        Some(i) => {
-            match tree.nodes[i]
-                .attributes
-                .iter()
-                .find(|(k, _)| k == &attr_name)
-            {
-                Some((_, v)) => v.clone(),
-                None => return 0,
-            }
-        }
+    let value = match tree.get(node_id) {
+        Some(n) => match n.attributes.get(name_str) {
+            Some(v) => v.clone(),
+            None => return 0,
+        },
         None => return 0,
     };
-    let needed = value.len() as u64;
-    if !buf.is_null() && buf_len > 0 {
-        let copy_len = std::cmp::min(needed, buf_len - 1) as usize;
-        unsafe {
-            std::ptr::copy_nonoverlapping(value.as_ptr(), buf, copy_len);
-            *buf.add(copy_len) = 0;
-        }
+
+    let bytes = value.as_bytes();
+    let needed = bytes.len() as u64;
+
+    if buf.is_null() || buf_len == 0 {
+        return needed;
+    }
+
+    let to_copy = std::cmp::min(bytes.len(), (buf_len - 1) as usize);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
+        *buf.add(to_copy) = 0;
     }
     needed
 }
 
+/// Get the Nth child of a node (0-indexed).
+/// Returns null if out of bounds or node not found.
 #[no_mangle]
 pub extern "C" fn gpui_nth_child(node: *mut GpuiElement, index: u64) -> *mut GpuiElement {
-    let Some(nid) = unbox_id(node) else {
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
         return std::ptr::null_mut();
-    };
+    }
     let tree = lock_tree();
-    match tree.find(nid) {
-        Some(i) => {
-            let children = &tree.nodes[i].children;
-            if (index as usize) < children.len() {
-                box_handle(children[index as usize])
-            } else {
-                std::ptr::null_mut()
-            }
+    if let Some(n) = tree.get(node_id) {
+        if (index as usize) < n.children.len() {
+            return node_id_to_handle(n.children[index as usize]);
         }
-        None => std::ptr::null_mut(),
+    }
+    std::ptr::null_mut()
+}
+
+/// Get the tag name of a node. Returns 0 for text nodes.
+/// Writes into `buf` if provided, returns the number of bytes needed.
+#[no_mangle]
+pub extern "C" fn gpui_get_tag(
+    node: *mut GpuiElement,
+    buf: *mut u8,
+    buf_len: u64,
+) -> u64 {
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return 0;
+    }
+    let tree = lock_tree();
+    let tag = match tree.get(node_id) {
+        Some(n) => match n.tag() {
+            Some(t) => t.to_string(),
+            None => return 0,
+        },
+        None => return 0,
+    };
+
+    let bytes = tag.as_bytes();
+    let needed = bytes.len() as u64;
+
+    if buf.is_null() || buf_len == 0 {
+        return needed;
+    }
+
+    let to_copy = std::cmp::min(bytes.len(), (buf_len - 1) as usize);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
+        *buf.add(to_copy) = 0;
+    }
+    needed
+}
+
+/// Get the GPUI element kind for a node.
+/// Returns: 0 = not found, 1 = Div, 2 = TextContainer, 3 = Img, 4 = Svg, 5 = TextNode.
+#[no_mangle]
+pub extern "C" fn gpui_get_element_kind(node: *mut GpuiElement) -> u8 {
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return 0;
+    }
+    let tree = lock_tree();
+    match tree.get(node_id) {
+        Some(n) => match n.gpui_kind {
+            tree::GpuiElementKind::Div => 1,
+            tree::GpuiElementKind::TextContainer => 2,
+            tree::GpuiElementKind::Img => 3,
+            tree::GpuiElementKind::Svg => 4,
+            tree::GpuiElementKind::TextNode => 5,
+        },
+        None => 0,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Window management
+// ---------------------------------------------------------------------------
+
+/// Create a new window with the given title and initial size.
+/// Returns a window ID (> 0) on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn gpui_create_window(
+    title: *const c_char,
+    width: f64,
+    height: f64,
+) -> u32 {
+    let title_str = unsafe { cstr_to_str(title) };
+    window::create_window(title_str, width, height)
+}
+
+/// Show a window (transition from Created to Visible state).
+///
+/// Without the `gpui-backend` feature this just updates the internal state.
+/// With the feature enabled, this starts the GPUI event loop for the window.
+///
+/// Returns 1 on success, 0 if the window was not in Created state or not found.
+#[no_mangle]
+pub extern "C" fn gpui_show_window(window_id: u32) -> u8 {
+    if window::show_window(window_id) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Request that a window be closed. If an on_close callback is registered
+/// and returns 0, the close is denied.
+/// Returns 1 if the window was closed, 0 if denied or not found.
+#[no_mangle]
+pub extern "C" fn gpui_close_window(window_id: u32) -> u8 {
+    if window::close_window(window_id) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Destroy a window and remove it from the registry.
+#[no_mangle]
+pub extern "C" fn gpui_destroy_window(window_id: u32) {
+    window::destroy_window(window_id);
+}
+
+/// Get the current state of a window.
+/// Returns: 0 = not found, 1 = Created, 2 = Visible, 3 = CloseRequested, 4 = Closed.
+#[no_mangle]
+pub extern "C" fn gpui_window_state(window_id: u32) -> u8 {
+    match window::window_state(window_id) {
+        None => 0,
+        Some(window::WindowState::Created) => 1,
+        Some(window::WindowState::Visible) => 2,
+        Some(window::WindowState::CloseRequested) => 3,
+        Some(window::WindowState::Closed) => 4,
+    }
+}
+
+/// Get the current width of a window. Returns 0.0 if not found.
+#[no_mangle]
+pub extern "C" fn gpui_window_width(window_id: u32) -> f64 {
+    window::window_size(window_id)
+        .map(|(w, _)| w)
+        .unwrap_or(0.0)
+}
+
+/// Get the current height of a window. Returns 0.0 if not found.
+#[no_mangle]
+pub extern "C" fn gpui_window_height(window_id: u32) -> f64 {
+    window::window_size(window_id)
+        .map(|(_, h)| h)
+        .unwrap_or(0.0)
+}
+
+/// Request a repaint of the window. This signals that the shadow tree has
+/// changed and the window should re-render on the next frame.
+#[no_mangle]
+pub extern "C" fn gpui_request_repaint() {
+    window::request_repaint();
+}
+
+/// Check if a repaint has been requested (and clear the flag).
+/// Returns 1 if a repaint was pending, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn gpui_take_repaint_request() -> u8 {
+    if window::take_repaint_request() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Register a callback for window resize events.
+/// The callback receives (width: f64, height: f64).
+#[no_mangle]
+pub extern "C" fn gpui_on_resize(window_id: u32, callback: ResizeCallback) {
+    window::with_window_mut(window_id, |w| {
+        w.on_resize = Some(callback);
+    });
+}
+
+/// Register a callback for window focus events.
+/// The callback receives (focused: u8) where 1 = focused, 0 = unfocused.
+#[no_mangle]
+pub extern "C" fn gpui_on_focus(window_id: u32, callback: FocusCallback) {
+    window::with_window_mut(window_id, |w| {
+        w.on_focus = Some(callback);
+    });
+}
+
+/// Register a callback for window close requests.
+/// The callback should return 1 to allow close, 0 to prevent it.
+#[no_mangle]
+pub extern "C" fn gpui_on_close(window_id: u32, callback: CloseCallback) {
+    window::with_window_mut(window_id, |w| {
+        w.on_close = Some(callback);
+    });
+}
+
+/// Simulate a resize event on a window (for testing / event bridging).
+#[no_mangle]
+pub extern "C" fn gpui_notify_resize(window_id: u32, width: f64, height: f64) {
+    window::notify_resize(window_id, width, height);
+}
+
+/// Simulate a focus event on a window (for testing / event bridging).
+/// `focused`: 1 = gained focus, 0 = lost focus.
+#[no_mangle]
+pub extern "C" fn gpui_notify_focus(window_id: u32, focused: u8) {
+    window::notify_focus(window_id, focused != 0);
+}
+
+/// Reset all windows (for testing).
+#[no_mangle]
+pub extern "C" fn gpui_reset_windows() {
+    window::reset_windows();
+}
+
 // ===========================================================================
-// Tests
+// Rust-side tests
 // ===========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::ffi::CString;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    fn reset() {
+    /// Helper to create a CString and return it.
+    fn c(s: &str) -> CString {
+        CString::new(s).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Element creation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_create_element_returns_non_null() {
         gpui_reset_tree();
+        let tag = c("div");
+        let handle = gpui_create_element(tag.as_ptr());
+        assert!(!handle.is_null());
+        gpui_destroy_element(handle);
     }
 
     #[test]
-    fn test_create_element() {
-        reset();
-        let el = gpui_create_element(b"div\0".as_ptr() as *const c_char);
-        assert!(!el.is_null());
+    #[serial]
+    fn test_create_text_node_returns_non_null() {
+        gpui_reset_tree();
+        let text = c("hello");
+        let handle = gpui_create_text_node(text.as_ptr());
+        assert!(!handle.is_null());
+        gpui_destroy_element(handle);
+    }
+
+    #[test]
+    #[serial]
+    fn test_tree_node_count() {
+        gpui_reset_tree();
+        assert_eq!(gpui_tree_node_count(), 0);
+
+        let tag = c("div");
+        let n1 = gpui_create_element(tag.as_ptr());
         assert_eq!(gpui_tree_node_count(), 1);
-        gpui_destroy_element(el);
+
+        let n2 = gpui_create_element(tag.as_ptr());
+        assert_eq!(gpui_tree_node_count(), 2);
+
+        gpui_destroy_element(n1);
+        gpui_destroy_element(n2);
     }
 
+    // -----------------------------------------------------------------------
+    // appendChild, insertBefore, removeChild
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_append_child() {
-        reset();
-        let parent = gpui_create_element(b"div\0".as_ptr() as *const c_char);
-        let child = gpui_create_element(b"span\0".as_ptr() as *const c_char);
-        gpui_append_child(parent, child);
-        assert_eq!(gpui_child_count(parent), 1);
-        gpui_destroy_element(child);
+    #[serial]
+    fn test_append_and_traverse() {
+        gpui_reset_tree();
+        let tag_div = c("div");
+        let tag_span = c("span");
+
+        let parent = gpui_create_element(tag_div.as_ptr());
+        let child1 = gpui_create_element(tag_span.as_ptr());
+        let child2 = gpui_create_element(tag_span.as_ptr());
+
+        gpui_append_child(parent, child1);
+        gpui_append_child(parent, child2);
+
+        // first_child of parent should be child1
+        let fc = gpui_first_child(parent);
+        assert!(!fc.is_null());
+        assert_eq!(unsafe { (*fc).node_id }, unsafe { (*child1).node_id });
+        gpui_destroy_element(fc);
+
+        // next_sibling of child1 should be child2
+        let ns = gpui_next_sibling(child1);
+        assert!(!ns.is_null());
+        assert_eq!(unsafe { (*ns).node_id }, unsafe { (*child2).node_id });
+        gpui_destroy_element(ns);
+
+        // parent_node of child1 should be parent
+        let pn = gpui_parent_node(child1);
+        assert!(!pn.is_null());
+        assert_eq!(unsafe { (*pn).node_id }, unsafe { (*parent).node_id });
+        gpui_destroy_element(pn);
+
         gpui_destroy_element(parent);
+        gpui_destroy_element(child1);
+        gpui_destroy_element(child2);
     }
 
     #[test]
+    #[serial]
+    fn test_insert_before() {
+        gpui_reset_tree();
+        let tag = c("div");
+
+        let parent = gpui_create_element(tag.as_ptr());
+        let c1 = gpui_create_element(tag.as_ptr());
+        let c2 = gpui_create_element(tag.as_ptr());
+        let c3 = gpui_create_element(tag.as_ptr());
+
+        gpui_append_child(parent, c1);
+        gpui_append_child(parent, c2);
+        gpui_insert_before(parent, c3, c2); // c3 before c2
+
+        // Order should be: c1, c3, c2
+        let fc = gpui_first_child(parent);
+        assert_eq!(unsafe { (*fc).node_id }, unsafe { (*c1).node_id });
+
+        let ns1 = gpui_next_sibling(c1);
+        assert_eq!(unsafe { (*ns1).node_id }, unsafe { (*c3).node_id });
+
+        let ns2 = gpui_next_sibling(c3);
+        assert_eq!(unsafe { (*ns2).node_id }, unsafe { (*c2).node_id });
+
+        gpui_destroy_element(fc);
+        gpui_destroy_element(ns1);
+        gpui_destroy_element(ns2);
+        gpui_destroy_element(parent);
+        gpui_destroy_element(c1);
+        gpui_destroy_element(c2);
+        gpui_destroy_element(c3);
+    }
+
+    #[test]
+    #[serial]
+    fn test_insert_before_null_appends() {
+        gpui_reset_tree();
+        let tag = c("div");
+
+        let parent = gpui_create_element(tag.as_ptr());
+        let c1 = gpui_create_element(tag.as_ptr());
+        let c2 = gpui_create_element(tag.as_ptr());
+
+        gpui_append_child(parent, c1);
+        gpui_insert_before(parent, c2, std::ptr::null_mut());
+
+        assert_eq!(gpui_child_count(parent), 2);
+        let nth0 = gpui_nth_child(parent, 0);
+        let nth1 = gpui_nth_child(parent, 1);
+        assert_eq!(unsafe { (*nth0).node_id }, unsafe { (*c1).node_id });
+        assert_eq!(unsafe { (*nth1).node_id }, unsafe { (*c2).node_id });
+
+        gpui_destroy_element(nth0);
+        gpui_destroy_element(nth1);
+        gpui_destroy_element(parent);
+        gpui_destroy_element(c1);
+        gpui_destroy_element(c2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_child() {
+        gpui_reset_tree();
+        let tag = c("div");
+
+        let parent = gpui_create_element(tag.as_ptr());
+        let child = gpui_create_element(tag.as_ptr());
+
+        gpui_append_child(parent, child);
+        gpui_remove_child(parent, child);
+
+        let fc = gpui_first_child(parent);
+        assert!(fc.is_null());
+
+        let pn = gpui_parent_node(child);
+        assert!(pn.is_null());
+
+        gpui_destroy_element(parent);
+        gpui_destroy_element(child);
+    }
+
+    #[test]
+    #[serial]
+    fn test_reparent_via_append() {
+        gpui_reset_tree();
+        let tag = c("div");
+
+        let p1 = gpui_create_element(tag.as_ptr());
+        let p2 = gpui_create_element(tag.as_ptr());
+        let child = gpui_create_element(tag.as_ptr());
+
+        gpui_append_child(p1, child);
+        assert_eq!(gpui_child_count(p1), 1);
+
+        // Reparent to p2 (should auto-detach from p1)
+        gpui_append_child(p2, child);
+        assert_eq!(gpui_child_count(p1), 0);
+        assert_eq!(gpui_child_count(p2), 1);
+
+        let pn = gpui_parent_node(child);
+        assert_eq!(unsafe { (*pn).node_id }, unsafe { (*p2).node_id });
+
+        gpui_destroy_element(pn);
+        gpui_destroy_element(p1);
+        gpui_destroy_element(p2);
+        gpui_destroy_element(child);
+    }
+
+    // -----------------------------------------------------------------------
+    // Attributes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_set_and_remove_attribute() {
+        gpui_reset_tree();
+        let tag = c("div");
+        let name = c("width");
+        let value = c("100%");
+
+        let node = gpui_create_element(tag.as_ptr());
+        gpui_set_attribute(node, name.as_ptr(), value.as_ptr());
+
+        // Read it back
+        let mut buf = vec![0u8; 64];
+        let len = gpui_get_attribute(node, name.as_ptr(), buf.as_mut_ptr(), 64);
+        assert_eq!(len, 4); // "100%"
+        let result = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) };
+        assert_eq!(result.to_str().unwrap(), "100%");
+
+        gpui_remove_attribute(node, name.as_ptr());
+
+        let len = gpui_get_attribute(node, name.as_ptr(), buf.as_mut_ptr(), 64);
+        assert_eq!(len, 0);
+
+        gpui_destroy_element(node);
+    }
+
+    #[test]
+    #[serial]
+    fn test_attribute_overwrite() {
+        gpui_reset_tree();
+        let tag = c("div");
+        let name = c("class");
+        let val1 = c("old");
+        let val2 = c("new");
+
+        let node = gpui_create_element(tag.as_ptr());
+        gpui_set_attribute(node, name.as_ptr(), val1.as_ptr());
+        gpui_set_attribute(node, name.as_ptr(), val2.as_ptr());
+
+        let mut buf = vec![0u8; 64];
+        let len = gpui_get_attribute(node, name.as_ptr(), buf.as_mut_ptr(), 64);
+        assert_eq!(len, 3);
+        let result = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) };
+        assert_eq!(result.to_str().unwrap(), "new");
+
+        gpui_destroy_element(node);
+    }
+
+    // -----------------------------------------------------------------------
+    // Text content
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
     fn test_set_text_content() {
-        reset();
-        let el = gpui_create_text_node(b"hello\0".as_ptr() as *const c_char);
-        let mut buf = [0u8; 64];
-        let len = gpui_get_text_content(el, buf.as_mut_ptr(), 64);
+        gpui_reset_tree();
+        let text1 = c("hello");
+        let text2 = c("world");
+
+        let node = gpui_create_text_node(text1.as_ptr());
+        gpui_set_text_content(node, text2.as_ptr());
+
+        let mut buf = vec![0u8; 64];
+        let len = gpui_get_text_content(node, buf.as_mut_ptr(), 64);
         assert_eq!(len, 5);
-        let s = std::str::from_utf8(&buf[..5]).unwrap();
-        assert_eq!(s, "hello");
-        gpui_destroy_element(el);
+        let result = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) };
+        assert_eq!(result.to_str().unwrap(), "world");
+
+        gpui_destroy_element(node);
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_text_content_recursive() {
+        gpui_reset_tree();
+        let tag = c("div");
+        let parent = gpui_create_element(tag.as_ptr());
+        let t1 = c("hello ");
+        let t2 = c("world");
+        let child1 = gpui_create_text_node(t1.as_ptr());
+        let child2 = gpui_create_text_node(t2.as_ptr());
+        gpui_append_child(parent, child1);
+        gpui_append_child(parent, child2);
+
+        let mut buf = vec![0u8; 64];
+        let len = gpui_get_text_content(parent, buf.as_mut_ptr(), 64);
+        assert_eq!(len, 11);
+        let result = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) };
+        assert_eq!(result.to_str().unwrap(), "hello world");
+
+        gpui_destroy_element(parent);
+        gpui_destroy_element(child1);
+        gpui_destroy_element(child2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_text_content_query_size() {
+        gpui_reset_tree();
+        let text = c("hello world");
+        let node = gpui_create_text_node(text.as_ptr());
+
+        // Query size without buffer
+        let needed = gpui_get_text_content(node, std::ptr::null_mut(), 0);
+        assert_eq!(needed, 11);
+
+        gpui_destroy_element(node);
+    }
+
+    // -----------------------------------------------------------------------
+    // Styles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_set_style() {
+        gpui_reset_tree();
+        let tag = c("div");
+        let prop = c("background");
+        let value = c("rgb(255, 0, 0)");
+
+        let node = gpui_create_element(tag.as_ptr());
+        gpui_set_style(node, prop.as_ptr(), value.as_ptr());
+
+        {
+            let tree = lock_tree();
+            let nid = NodeId(unsafe { (*node).node_id });
+            let n = tree.get(nid).unwrap();
+            assert_eq!(
+                n.styles.get("background").map(|s| s.as_str()),
+                Some("rgb(255, 0, 0)")
+            );
+        }
+
+        gpui_destroy_element(node);
+    }
+
+    #[test]
+    #[serial]
+    fn test_style_overwrite() {
+        gpui_reset_tree();
+        let tag = c("div");
+        let prop = c("width");
+        let val1 = c("100px");
+        let val2 = c("200px");
+
+        let node = gpui_create_element(tag.as_ptr());
+        gpui_set_style(node, prop.as_ptr(), val1.as_ptr());
+        gpui_set_style(node, prop.as_ptr(), val2.as_ptr());
+
+        {
+            let tree = lock_tree();
+            let nid = NodeId(unsafe { (*node).node_id });
+            let n = tree.get(nid).unwrap();
+            assert_eq!(n.styles.get("width").map(|s| s.as_str()), Some("200px"));
+        }
+
+        gpui_destroy_element(node);
+    }
+
+    // -----------------------------------------------------------------------
+    // Events
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_add_event_listener_and_dispatch() {
+        gpui_reset_tree();
+        let tag = c("div");
+        let event = c("click");
+
+        static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn test_handler() {
+            CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+
+        CALL_COUNT.store(0, Ordering::SeqCst);
+
+        let node = gpui_create_element(tag.as_ptr());
+        gpui_add_event_listener(node, event.as_ptr(), test_handler);
+
+        assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 0);
+
+        gpui_dispatch_event(node, event.as_ptr());
+        assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 1);
+
+        gpui_dispatch_event(node, event.as_ptr());
+        assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 2);
+
+        gpui_destroy_element(node);
+    }
+
+    #[test]
+    #[serial]
+    fn test_dispatch_nonexistent_event() {
+        gpui_reset_tree();
+        let tag = c("div");
+        let click = c("click");
+        let hover = c("hover");
+
+        static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn handler() {
+            CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+
+        CALL_COUNT.store(0, Ordering::SeqCst);
+
+        let node = gpui_create_element(tag.as_ptr());
+        gpui_add_event_listener(node, click.as_ptr(), handler);
+
+        // Dispatch a different event
+        gpui_dispatch_event(node, hover.as_ptr());
+        assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 0);
+
+        gpui_destroy_element(node);
+    }
+
+    #[test]
+    #[serial]
+    fn test_multiple_event_listeners() {
+        gpui_reset_tree();
+        let tag = c("div");
+        let event = c("click");
+
+        static COUNT_A: AtomicU32 = AtomicU32::new(0);
+        static COUNT_B: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn handler_a() {
+            COUNT_A.fetch_add(1, Ordering::SeqCst);
+        }
+        extern "C" fn handler_b() {
+            COUNT_B.fetch_add(1, Ordering::SeqCst);
+        }
+
+        COUNT_A.store(0, Ordering::SeqCst);
+        COUNT_B.store(0, Ordering::SeqCst);
+
+        let node = gpui_create_element(tag.as_ptr());
+        gpui_add_event_listener(node, event.as_ptr(), handler_a);
+        gpui_add_event_listener(node, event.as_ptr(), handler_b);
+
+        gpui_dispatch_event(node, event.as_ptr());
+        assert_eq!(COUNT_A.load(Ordering::SeqCst), 1);
+        assert_eq!(COUNT_B.load(Ordering::SeqCst), 1);
+
+        gpui_destroy_element(node);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tree inspection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_child_count() {
+        gpui_reset_tree();
+        let tag = c("div");
+        let parent = gpui_create_element(tag.as_ptr());
+        assert_eq!(gpui_child_count(parent), 0);
+
+        let c1 = gpui_create_element(tag.as_ptr());
+        let c2 = gpui_create_element(tag.as_ptr());
+        gpui_append_child(parent, c1);
+        assert_eq!(gpui_child_count(parent), 1);
+        gpui_append_child(parent, c2);
+        assert_eq!(gpui_child_count(parent), 2);
+
+        gpui_remove_child(parent, c1);
+        assert_eq!(gpui_child_count(parent), 1);
+
+        gpui_destroy_element(parent);
+        gpui_destroy_element(c1);
+        gpui_destroy_element(c2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_nth_child() {
+        gpui_reset_tree();
+        let tag = c("div");
+        let parent = gpui_create_element(tag.as_ptr());
+        let c1 = gpui_create_element(tag.as_ptr());
+        let c2 = gpui_create_element(tag.as_ptr());
+        gpui_append_child(parent, c1);
+        gpui_append_child(parent, c2);
+
+        let nth0 = gpui_nth_child(parent, 0);
+        assert!(!nth0.is_null());
+        assert_eq!(unsafe { (*nth0).node_id }, unsafe { (*c1).node_id });
+
+        let nth1 = gpui_nth_child(parent, 1);
+        assert!(!nth1.is_null());
+        assert_eq!(unsafe { (*nth1).node_id }, unsafe { (*c2).node_id });
+
+        let nth2 = gpui_nth_child(parent, 2);
+        assert!(nth2.is_null());
+
+        gpui_destroy_element(nth0);
+        gpui_destroy_element(nth1);
+        gpui_destroy_element(parent);
+        gpui_destroy_element(c1);
+        gpui_destroy_element(c2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_tag() {
+        gpui_reset_tree();
+        let tag = c("button");
+        let node = gpui_create_element(tag.as_ptr());
+
+        let mut buf = vec![0u8; 64];
+        let len = gpui_get_tag(node, buf.as_mut_ptr(), 64);
+        assert_eq!(len, 6); // "button"
+        let result = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) };
+        assert_eq!(result.to_str().unwrap(), "button");
+
+        gpui_destroy_element(node);
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_tag_text_node_returns_zero() {
+        gpui_reset_tree();
+        let text = c("hello");
+        let node = gpui_create_text_node(text.as_ptr());
+
+        let len = gpui_get_tag(node, std::ptr::null_mut(), 0);
+        assert_eq!(len, 0);
+
+        gpui_destroy_element(node);
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_element_kind() {
+        gpui_reset_tree();
+
+        let div = gpui_create_element(c("div").as_ptr());
+        assert_eq!(gpui_get_element_kind(div), 1); // Div
+
+        let span = gpui_create_element(c("span").as_ptr());
+        assert_eq!(gpui_get_element_kind(span), 2); // TextContainer
+
+        let img = gpui_create_element(c("img").as_ptr());
+        assert_eq!(gpui_get_element_kind(img), 3); // Img
+
+        let svg = gpui_create_element(c("svg").as_ptr());
+        assert_eq!(gpui_get_element_kind(svg), 4); // Svg
+
+        let text = gpui_create_text_node(c("hello").as_ptr());
+        assert_eq!(gpui_get_element_kind(text), 5); // TextNode
+
+        assert_eq!(gpui_get_element_kind(std::ptr::null_mut()), 0); // Not found
+
+        gpui_destroy_element(div);
+        gpui_destroy_element(span);
+        gpui_destroy_element(img);
+        gpui_destroy_element(svg);
+        gpui_destroy_element(text);
+    }
+
+    // -----------------------------------------------------------------------
+    // Null safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_null_safety() {
+        let tag = c("div");
+        let name = c("width");
+        let value = c("100");
+
+        gpui_append_child(std::ptr::null_mut(), std::ptr::null_mut());
+        gpui_insert_before(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+        gpui_remove_child(std::ptr::null_mut(), std::ptr::null_mut());
+        gpui_set_attribute(std::ptr::null_mut(), name.as_ptr(), value.as_ptr());
+        gpui_remove_attribute(std::ptr::null_mut(), name.as_ptr());
+        gpui_set_text_content(std::ptr::null_mut(), tag.as_ptr());
+        gpui_set_style(std::ptr::null_mut(), name.as_ptr(), value.as_ptr());
+
+        extern "C" fn noop() {}
+        gpui_add_event_listener(std::ptr::null_mut(), name.as_ptr(), noop);
+
+        let fc = gpui_first_child(std::ptr::null_mut());
+        assert!(fc.is_null());
+        let ns = gpui_next_sibling(std::ptr::null_mut());
+        assert!(ns.is_null());
+        let pn = gpui_parent_node(std::ptr::null_mut());
+        assert!(pn.is_null());
+
+        assert_eq!(gpui_child_count(std::ptr::null_mut()), 0);
+        assert_eq!(gpui_get_text_content(std::ptr::null_mut(), std::ptr::null_mut(), 0), 0);
+        assert_eq!(gpui_get_attribute(std::ptr::null_mut(), name.as_ptr(), std::ptr::null_mut(), 0), 0);
+        assert_eq!(gpui_get_tag(std::ptr::null_mut(), std::ptr::null_mut(), 0), 0);
+        assert_eq!(gpui_get_element_kind(std::ptr::null_mut()), 0);
+        let nth = gpui_nth_child(std::ptr::null_mut(), 0);
+        assert!(nth.is_null());
+
+        gpui_destroy_element(std::ptr::null_mut());
+        gpui_destroy_tree(std::ptr::null_mut());
+
+        gpui_dispatch_event(std::ptr::null_mut(), name.as_ptr());
+    }
+
+    // -----------------------------------------------------------------------
+    // Destroy tree
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_destroy_tree() {
+        gpui_reset_tree();
+        let tag = c("div");
+
+        let root = gpui_create_element(tag.as_ptr());
+        let c1 = gpui_create_element(tag.as_ptr());
+        let c2 = gpui_create_element(tag.as_ptr());
+        let gc = gpui_create_element(tag.as_ptr());
+
+        gpui_append_child(root, c1);
+        gpui_append_child(root, c2);
+        gpui_append_child(c1, gc);
+
+        assert_eq!(gpui_tree_node_count(), 4);
+
+        // destroy_tree on root should remove all 4 nodes
+        gpui_destroy_tree(root);
+        assert_eq!(gpui_tree_node_count(), 0);
+
+        // The handles c1, c2, gc are now dangling but we should NOT double-free root
+        // (it was already freed by destroy_tree). We can still free the others
+        // since destroy_element only frees the Box, not the tree node.
+        gpui_destroy_element(c1);
+        gpui_destroy_element(c2);
+        gpui_destroy_element(gc);
+    }
+
+    // -----------------------------------------------------------------------
+    // Window management
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_create_window() {
+        gpui_reset_windows();
+        let title = c("My Window");
+        let id = gpui_create_window(title.as_ptr(), 800.0, 600.0);
+        assert!(id > 0);
+        assert_eq!(gpui_window_state(id), 1); // Created
+        assert_eq!(gpui_window_width(id), 800.0);
+        assert_eq!(gpui_window_height(id), 600.0);
+        gpui_destroy_window(id);
+    }
+
+    #[test]
+    #[serial]
+    fn test_show_and_close_window() {
+        gpui_reset_windows();
+        let title = c("Test Window");
+        let id = gpui_create_window(title.as_ptr(), 640.0, 480.0);
+        assert_eq!(gpui_show_window(id), 1);
+        assert_eq!(gpui_window_state(id), 2); // Visible
+        // Cannot show again
+        assert_eq!(gpui_show_window(id), 0);
+        // Close
+        assert_eq!(gpui_close_window(id), 1);
+        assert_eq!(gpui_window_state(id), 4); // Closed
+        gpui_destroy_window(id);
+    }
+
+    #[test]
+    #[serial]
+    fn test_window_lifecycle_callbacks() {
+        gpui_reset_windows();
+        let title = c("Callback Test");
+        let id = gpui_create_window(title.as_ptr(), 800.0, 600.0);
+
+        static RESIZE_CALLED: AtomicU32 = AtomicU32::new(0);
+        static FOCUS_CALLED: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn on_resize(_w: f64, _h: f64) {
+            RESIZE_CALLED.fetch_add(1, Ordering::SeqCst);
+        }
+        extern "C" fn on_focus(_f: u8) {
+            FOCUS_CALLED.fetch_add(1, Ordering::SeqCst);
+        }
+        extern "C" fn deny_close() -> u8 {
+            0
+        }
+
+        RESIZE_CALLED.store(0, Ordering::SeqCst);
+        FOCUS_CALLED.store(0, Ordering::SeqCst);
+
+        gpui_on_resize(id, on_resize);
+        gpui_on_focus(id, on_focus);
+        gpui_on_close(id, deny_close);
+
+        gpui_show_window(id);
+
+        // Trigger events
+        gpui_notify_resize(id, 1024.0, 768.0);
+        assert_eq!(RESIZE_CALLED.load(Ordering::SeqCst), 1);
+        assert_eq!(gpui_window_width(id), 1024.0);
+        assert_eq!(gpui_window_height(id), 768.0);
+
+        gpui_notify_focus(id, 1);
+        assert_eq!(FOCUS_CALLED.load(Ordering::SeqCst), 1);
+
+        // Close should be denied
+        assert_eq!(gpui_close_window(id), 0);
+        assert_eq!(gpui_window_state(id), 2); // Still Visible
+
+        gpui_destroy_window(id);
+    }
+
+    #[test]
+    #[serial]
+    fn test_repaint_on_tree_mutation() {
+        gpui_reset_tree();
+        gpui_reset_windows();
+        // Clear any pending repaint
+        gpui_take_repaint_request();
+
+        let tag = c("div");
+        let parent = gpui_create_element(tag.as_ptr());
+        let child = gpui_create_element(tag.as_ptr());
+        gpui_take_repaint_request(); // clear
+
+        gpui_append_child(parent, child);
+        assert_eq!(gpui_take_repaint_request(), 1);
+
+        let name = c("width");
+        let value = c("100");
+        gpui_set_attribute(parent, name.as_ptr(), value.as_ptr());
+        assert_eq!(gpui_take_repaint_request(), 1);
+
+        let prop = c("background");
+        let val = c("red");
+        gpui_set_style(parent, prop.as_ptr(), val.as_ptr());
+        assert_eq!(gpui_take_repaint_request(), 1);
+
+        let text = c("hello");
+        gpui_set_text_content(parent, text.as_ptr());
+        assert_eq!(gpui_take_repaint_request(), 1);
+
+        gpui_remove_child(parent, child);
+        assert_eq!(gpui_take_repaint_request(), 1);
+
+        // No more pending
+        assert_eq!(gpui_take_repaint_request(), 0);
+
+        gpui_destroy_element(parent);
+        gpui_destroy_element(child);
+    }
+
+    #[test]
+    #[serial]
+    fn test_window_not_found() {
+        gpui_reset_windows();
+        assert_eq!(gpui_window_state(999), 0);
+        assert_eq!(gpui_window_width(999), 0.0);
+        assert_eq!(gpui_window_height(999), 0.0);
+        assert_eq!(gpui_show_window(999), 0);
+        assert_eq!(gpui_close_window(999), 0);
+        // These should not crash
+        gpui_destroy_window(999);
+        gpui_on_resize(999, {
+            extern "C" fn noop(_: f64, _: f64) {}
+            noop
+        });
+        gpui_on_focus(999, {
+            extern "C" fn noop(_: u8) {}
+            noop
+        });
+        gpui_on_close(999, {
+            extern "C" fn noop() -> u8 {
+                1
+            }
+            noop
+        });
+        gpui_notify_resize(999, 100.0, 100.0);
+        gpui_notify_focus(999, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_launch_callback() {
+        gpui_reset_tree();
+
+        static BUILDER_CALLED: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn test_builder(root: *mut GpuiElement) {
+            assert!(!root.is_null());
+            BUILDER_CALLED.fetch_add(1, Ordering::SeqCst);
+
+            // Build a small tree inside the callback
+            let tag = CString::new("span").unwrap();
+            let child = gpui_create_element(tag.as_ptr());
+            gpui_append_child(root, child);
+            gpui_destroy_element(child);
+        }
+
+        BUILDER_CALLED.store(0, Ordering::SeqCst);
+
+        let title = c("Test Window");
+        gpui_launch(title.as_ptr(), 800.0, 600.0, test_builder);
+
+        assert_eq!(BUILDER_CALLED.load(Ordering::SeqCst), 1);
+        // Root + span child = 2 nodes
+        assert_eq!(gpui_tree_node_count(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tag-to-GPUI-kind mapping (via FFI)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_element_kind_mapping_via_ffi() {
+        gpui_reset_tree();
+
+        // Container tags -> Div (1)
+        for tag_name in &["div", "section", "article", "nav", "header", "footer", "button", "ul", "li"] {
+            let tag = c(tag_name);
+            let node = gpui_create_element(tag.as_ptr());
+            assert_eq!(gpui_get_element_kind(node), 1, "Expected Div for tag '{}'", tag_name);
+            gpui_destroy_element(node);
+        }
+
+        // Text tags -> TextContainer (2)
+        for tag_name in &["span", "p", "h1", "h2", "h3", "label", "strong", "em"] {
+            let tag = c(tag_name);
+            let node = gpui_create_element(tag.as_ptr());
+            assert_eq!(gpui_get_element_kind(node), 2, "Expected TextContainer for tag '{}'", tag_name);
+            gpui_destroy_element(node);
+        }
+
+        // Img -> 3
+        let img = gpui_create_element(c("img").as_ptr());
+        assert_eq!(gpui_get_element_kind(img), 3);
+        gpui_destroy_element(img);
+
+        // Svg -> 4
+        let svg = gpui_create_element(c("svg").as_ptr());
+        assert_eq!(gpui_get_element_kind(svg), 4);
+        gpui_destroy_element(svg);
+    }
+
+    // -----------------------------------------------------------------------
+    // Repaint flag
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_repaint_request_explicit() {
+        gpui_reset_windows();
+        gpui_take_repaint_request(); // clear
+
+        assert_eq!(gpui_take_repaint_request(), 0);
+        gpui_request_repaint();
+        assert_eq!(gpui_take_repaint_request(), 1);
+        assert_eq!(gpui_take_repaint_request(), 0); // cleared
     }
 }
