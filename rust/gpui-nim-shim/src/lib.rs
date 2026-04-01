@@ -16,6 +16,27 @@
 //!
 //! Element handles (`*mut GpuiElement`) are thin wrappers around `NodeId` values.
 //! They are heap-allocated so the Nim side can hold them as opaque pointers.
+//!
+//! ## GPUI API Background
+//!
+//! GPUI's element model is declarative. Elements are created via builder functions:
+//! - `div()` -> `Div` (general-purpose flexbox container, the workhorse)
+//! - `img()` -> `Img` (image rendering with caching)
+//! - `svg()` -> `Svg` (SVG rendering)
+//! - `canvas()` -> `Canvas` (custom painting)
+//! - Strings implement `IntoElement` for text content
+//!
+//! Children are added via `.child(elem)` / `.children(iter)` (ParentElement trait).
+//! Styling uses Tailwind-inspired builder methods: `.bg()`, `.flex()`, `.w()`, etc.
+//! Events use `.on_mouse_up()`, `.on_key_down()`, `.on_action()`, etc.
+//!
+//! State is managed through `Entity<T>` handles owned by the `App` context.
+//! Views implement `Render` (stateful, `&mut self`) or `RenderOnce` (stateless,
+//! consumes `self`). Re-renders are triggered by `cx.notify()`.
+//!
+//! Since GPUI has NO imperative DOM API (no appendChild, no removeChild), the
+//! shadow tree is essential: IsoNim mutates it imperatively, and the render-sync
+//! step translates it to GPUI's declarative builders each frame.
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -140,6 +161,20 @@ fn c_str_to_string(s: *const c_char) -> String {
 // 13 RendererBackend extern "C" functions
 // ===========================================================================
 
+/// RendererBackend proc #1: createElement(tag) -> Element
+///
+/// **GPUI mapping:** During render-sync (M2+), the tag determines which GPUI
+/// builder is used:
+/// - "div" (and most container tags) -> `gpui::div()` (Div element)
+/// - "img" -> `gpui::img()` (Img element with .uri() for source)
+/// - "svg" -> `gpui::svg()` (Svg element with .path() for source)
+/// - "text" tags -> `gpui::div()` with text child (GPUI has no standalone text element)
+///
+/// The Nim-side `renderer.nim` maps HTML tags to these GPUI names before
+/// calling this function (e.g., "section" -> "div", "span" -> "text").
+///
+/// **Current behavior:** Allocates a Node in the shadow tree with the given tag.
+/// No GPUI element is created yet -- that happens during render-sync.
 #[no_mangle]
 pub extern "C" fn gpui_create_element(tag: *const c_char) -> *mut GpuiElement {
     let tag = c_str_to_string(tag);
@@ -148,6 +183,16 @@ pub extern "C" fn gpui_create_element(tag: *const c_char) -> *mut GpuiElement {
     box_handle(id)
 }
 
+/// RendererBackend proc #2: createTextNode(text) -> Element
+///
+/// **GPUI mapping:** GPUI does not have standalone text elements. Text is added
+/// as a child of a Div via `.child("string")` -- strings implement `IntoElement`.
+/// For styled text, GPUI provides `StyledText` with `TextRun`s for rich formatting.
+///
+/// During render-sync, `#text` nodes are converted to string children of their
+/// parent div rather than becoming independent GPUI elements.
+///
+/// **Current behavior:** Allocates a Node with tag="#text" and the given text content.
 #[no_mangle]
 pub extern "C" fn gpui_create_text_node(text: *const c_char) -> *mut GpuiElement {
     let text_str = c_str_to_string(text);
@@ -159,6 +204,19 @@ pub extern "C" fn gpui_create_text_node(text: *const c_char) -> *mut GpuiElement
     box_handle(id)
 }
 
+/// RendererBackend proc #3: appendChild(parent, child)
+///
+/// **GPUI mapping:** GPUI uses `.child(elem)` on the ParentElement trait to add
+/// children during element construction. There is no runtime appendChild -- the
+/// element tree is rebuilt each frame from `Render::render()`.
+///
+/// During render-sync, the shadow tree's children list determines the order of
+/// `.child()` calls in the GPUI builder chain. This function just maintains the
+/// shadow tree's parent-child relationships.
+///
+/// **Challenge:** GPUI children are added declaratively in a single builder chain.
+/// The render-sync must iterate shadow tree children in order and emit
+/// `.child(render_node(child))` for each.
 #[no_mangle]
 pub extern "C" fn gpui_append_child(parent: *mut GpuiElement, child: *mut GpuiElement) {
     let (Some(pid), Some(cid)) = (unbox_id(parent), unbox_id(child)) else {
@@ -179,6 +237,15 @@ pub extern "C" fn gpui_append_child(parent: *mut GpuiElement, child: *mut GpuiEl
     }
 }
 
+/// RendererBackend proc #4: insertBefore(parent, child, reference)
+///
+/// **GPUI mapping:** Same as appendChild -- GPUI has no insertBefore. Child order
+/// in the shadow tree determines the `.child()` call order during render-sync.
+/// Inserting before a reference node just means the shadow tree children list
+/// has the new child at the correct position.
+///
+/// **Current behavior:** Inserts child into parent.children before the reference
+/// node (or appends if reference is null/not found).
 #[no_mangle]
 pub extern "C" fn gpui_insert_before(
     parent: *mut GpuiElement,
@@ -212,6 +279,14 @@ pub extern "C" fn gpui_insert_before(
     }
 }
 
+/// RendererBackend proc #5: removeChild(parent, child)
+///
+/// **GPUI mapping:** GPUI has no removeChild. Removing a child from the shadow tree
+/// means it will not appear in the `.child()` chain during the next render-sync.
+/// The GPUI element simply ceases to exist in the next frame's element tree.
+///
+/// **Current behavior:** Removes child from parent.children and clears child.parent.
+/// The shadow tree node is NOT deallocated (it may be re-parented later).
 #[no_mangle]
 pub extern "C" fn gpui_remove_child(parent: *mut GpuiElement, child: *mut GpuiElement) {
     let (Some(pid), Some(cid)) = (unbox_id(parent), unbox_id(child)) else {
@@ -226,6 +301,18 @@ pub extern "C" fn gpui_remove_child(parent: *mut GpuiElement, child: *mut GpuiEl
     }
 }
 
+/// RendererBackend proc #6: setAttribute(node, name, value)
+///
+/// **GPUI mapping:** GPUI elements don't have a generic setAttribute API.
+/// Attributes map to specific builder methods during render-sync:
+/// - "id" -> `.id(ElementId::from(value))` (for cross-frame identity tracking)
+/// - "src" -> `.uri(value)` on Img elements
+/// - "class" -> ignored (styling is inline via Styled trait methods)
+/// - "placeholder", "value" -> stored as metadata for input-like elements
+/// - "disabled" -> negated to "enabled" by the Nim-side mapper
+///
+/// Most HTML attributes have no direct GPUI equivalent. They are stored in the
+/// shadow tree for potential use by the render-sync or for testing/inspection.
 #[no_mangle]
 pub extern "C" fn gpui_set_attribute(
     node: *mut GpuiElement,
@@ -245,6 +332,11 @@ pub extern "C" fn gpui_set_attribute(
     }
 }
 
+/// RendererBackend proc #7: removeAttribute(node, name)
+///
+/// **GPUI mapping:** Removing an attribute from the shadow tree means the
+/// corresponding GPUI builder method will not be called during the next
+/// render-sync. For example, removing "id" means `.id()` won't be called.
 #[no_mangle]
 pub extern "C" fn gpui_remove_attribute(node: *mut GpuiElement, name: *const c_char) {
     let Some(nid) = unbox_id(node) else { return };
@@ -255,6 +347,15 @@ pub extern "C" fn gpui_remove_attribute(node: *mut GpuiElement, name: *const c_c
     }
 }
 
+/// RendererBackend proc #8: setTextContent(node, text)
+///
+/// **GPUI mapping:** Text content is rendered by passing a string to `.child()`:
+/// `div().child("Hello world")`. For text-tagged shadow nodes, the render-sync
+/// produces the text string as a child element. For container nodes with direct
+/// text, it is appended as an additional `.child()`.
+///
+/// GPUI's `StyledText` with `TextRun`s can be used for rich text (multiple
+/// styles within one text block), but that requires M3+ implementation.
 #[no_mangle]
 pub extern "C" fn gpui_set_text_content(node: *mut GpuiElement, text: *const c_char) {
     let Some(nid) = unbox_id(node) else { return };
@@ -265,6 +366,31 @@ pub extern "C" fn gpui_set_text_content(node: *mut GpuiElement, text: *const c_c
     }
 }
 
+/// RendererBackend proc #9: setStyle(node, prop, value)
+///
+/// **GPUI mapping:** GPUI uses the `Styled` trait with Tailwind-inspired builder
+/// methods. The render-sync parses prop/value strings and calls the matching method:
+///
+/// - "width"/"height" -> `.w(px(...))` / `.h(px(...))`
+/// - "bg"/"background-color" -> `.bg(rgb(...))`
+/// - "text_color"/"color" -> `.text_color(rgb(...))`
+/// - "padding"/"margin" -> `.p(px(...))` / `.m(px(...))`
+/// - "flex_direction: row" -> `.flex_row()`
+/// - "flex_direction: col" -> `.flex_col()`
+/// - "align_items: center" -> `.items_center()`
+/// - "justify_content: center" -> `.justify_center()`
+/// - "gap" -> `.gap(px(...))`
+/// - "corner_radius" -> `.rounded(px(...))`
+/// - "border_color" -> `.border_color(rgb(...))`
+/// - "shadow" -> `.shadow_lg()`
+/// - "cursor: pointer" -> `.cursor_pointer()`
+///
+/// **Challenge:** GPUI expects typed values (Pixels, Hsla, enums), not CSS strings.
+/// The render-sync needs parsers for dimensions ("16px" -> px(16.0)),
+/// colors ("#ff0000" -> rgb(0xff0000)), and enum values.
+///
+/// The Nim-side `renderer.nim` pre-maps CSS property names to GPUI-friendly names
+/// (e.g., "background-color" -> "bg") to simplify the Rust-side parsing.
 #[no_mangle]
 pub extern "C" fn gpui_set_style(
     node: *mut GpuiElement,
@@ -284,6 +410,27 @@ pub extern "C" fn gpui_set_style(
     }
 }
 
+/// RendererBackend proc #10: addEventListener(node, event, handler)
+///
+/// **GPUI mapping:** GPUI elements handle events via InteractiveElement trait methods:
+/// - "click"/"mouseup" -> `.on_mouse_up(MouseButton::Left, cx.listener(...))`
+/// - "mousedown" -> `.on_mouse_down(MouseButton::Left, cx.listener(...))`
+/// - "mousemove" -> `.on_mouse_move(cx.listener(...))`
+/// - "keydown" -> `.on_key_down(cx.listener(...))`
+/// - "keyup" -> `.on_key_up(cx.listener(...))`
+/// - "scroll" -> `.on_scroll_wheel(cx.listener(...))`
+///
+/// During render-sync, the shadow tree's event listeners are translated into
+/// GPUI event handler registrations. The GPUI handler calls the stored
+/// `extern "C" fn()` callback, which trampolines into Nim.
+///
+/// **Challenge:** The current callback type is `extern "C" fn()` with no event data.
+/// For full event support (M3+), we need to pass mouse position, key codes, etc.
+/// via a `*const EventData` parameter.
+///
+/// **Challenge:** GPUI event handlers require `cx.listener()` which captures the
+/// view's Entity. The render-sync must have access to the view context to create
+/// proper listener closures.
 #[no_mangle]
 pub extern "C" fn gpui_add_event_listener(
     node: *mut GpuiElement,
@@ -301,6 +448,13 @@ pub extern "C" fn gpui_add_event_listener(
     }
 }
 
+/// RendererBackend proc #11: firstChild(node) -> Element
+///
+/// **GPUI mapping:** None. GPUI's declarative model has no tree traversal API.
+/// This is purely a shadow tree operation used by IsoNim's VDOM diffing algorithm
+/// to walk the existing tree and compare it against the new virtual tree.
+///
+/// Returns a new handle to the first child node, or null if no children exist.
 #[no_mangle]
 pub extern "C" fn gpui_first_child(node: *mut GpuiElement) -> *mut GpuiElement {
     let Some(nid) = unbox_id(node) else {
@@ -320,6 +474,11 @@ pub extern "C" fn gpui_first_child(node: *mut GpuiElement) -> *mut GpuiElement {
     }
 }
 
+/// RendererBackend proc #12: nextSibling(node) -> Element
+///
+/// **GPUI mapping:** None. Purely a shadow tree traversal operation for IsoNim's
+/// VDOM diffing. Finds the node in its parent's children list and returns the
+/// next sibling, or null if it is the last child.
 #[no_mangle]
 pub extern "C" fn gpui_next_sibling(node: *mut GpuiElement) -> *mut GpuiElement {
     let Some(nid) = unbox_id(node) else {
@@ -346,6 +505,10 @@ pub extern "C" fn gpui_next_sibling(node: *mut GpuiElement) -> *mut GpuiElement 
     std::ptr::null_mut()
 }
 
+/// RendererBackend proc #13: parentNode(node) -> Element
+///
+/// **GPUI mapping:** None. Purely a shadow tree traversal operation for IsoNim's
+/// VDOM diffing. Returns the parent node handle, or null if the node is a root.
 #[no_mangle]
 pub extern "C" fn gpui_parent_node(node: *mut GpuiElement) -> *mut GpuiElement {
     let Some(nid) = unbox_id(node) else {
@@ -367,6 +530,31 @@ pub extern "C" fn gpui_parent_node(node: *mut GpuiElement) -> *mut GpuiElement {
 
 type RootBuilderCallback = extern "C" fn(*mut GpuiElement);
 
+/// Launch the GPUI application with a window.
+///
+/// **GPUI mapping (M2+):** This will become:
+/// ```ignore
+/// Application::new().run(|cx: &mut App| {
+///     let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+///     cx.open_window(WindowOptions {
+///         window_bounds: Some(WindowBounds::Windowed(bounds)),
+///         ..Default::default()
+///     }, |_, cx| {
+///         // Call root_builder to let Nim build the shadow tree
+///         root_builder(root_handle);
+///         // Create a NimRootView that renders from the shadow tree
+///         cx.new(|_| NimRootView)
+///     });
+/// });
+/// ```
+///
+/// `Application::new()` creates the GPUI app; `.run()` starts the event loop
+/// (takes over the main thread). `cx.open_window()` creates a platform window
+/// with the given options. The root view implements `Render` and translates
+/// the shadow tree to GPUI elements each frame.
+///
+/// **Current behavior (stub):** Creates a root div node and calls the builder
+/// callback without starting an actual GPUI event loop.
 #[no_mangle]
 pub extern "C" fn gpui_launch(
     _title: *const c_char,
@@ -380,6 +568,17 @@ pub extern "C" fn gpui_launch(
     _root_builder(root);
 }
 
+/// Dispatch a named event on a shadow tree node (for testing).
+///
+/// **GPUI mapping:** In a real GPUI app, events are dispatched by the platform
+/// (mouse clicks, key presses) and routed through GPUI's hit-testing system to
+/// the appropriate element's event handler. This function simulates that for
+/// testing: it finds all EventListeners on the node matching the event name
+/// and calls their callbacks.
+///
+/// **Note:** The tree lock is dropped before calling callbacks to avoid deadlock
+/// if a callback modifies the tree (which is the normal case -- Nim event
+/// handlers typically update UI state).
 #[no_mangle]
 pub extern "C" fn gpui_dispatch_event(node: *mut GpuiElement, event: *const c_char) {
     let Some(nid) = unbox_id(node) else { return };
