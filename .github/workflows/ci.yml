@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust-tests:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: cargo check
+        run: nix develop -c bash -c "cd rust && cargo check"
+
+      - name: cargo test
+        run: nix develop -c bash -c "cd rust && cargo test"
+
+      - name: cargo check (gpui-backend)
+        run: nix develop -c bash -c "cd rust && cargo check --features gpui-backend"
+
+  nim-tests:
+    name: Nim tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/isonim
+          path: ../isonim
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build Rust shim
+        run: nix develop -c bash -c "cd rust && cargo build"
+
+      - name: nim check (basic)
+        run: nix develop -c bash -c "nim check tests/test_basic.nim"
+
+      - name: nim check (renderer)
+        run: nix develop -c bash -c "nim check src/isonim_gpui/renderer.nim"
+
+      - name: Run basic tests
+        run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r tests/test_basic.nim"
+
+      - name: Run renderer tests
+        run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r tests/test_renderer.nim"
+
+      - name: Run bindings tests
+        run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r tests/test_bindings.nim"
+
+      - name: Run cross-renderer tests
+        run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r --path:../isonim/src tests/test_cross_renderer.nim"
+
+      - name: Run render integration tests
+        run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r --path:../isonim/src tests/test_render_integration.nim"
+
+      - name: Run structural comparison tests
+        run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r --path:../isonim/src tests/test_structural_comparison.nim"
+
+      - name: Run demo app tests
+        run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r --path:../isonim/src --path:demos/task-manager/src tests/test_demo_app.nim"
+
+      - name: Run performance benchmarks
+        run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r --path:../isonim/src tests/test_performance.nim"
