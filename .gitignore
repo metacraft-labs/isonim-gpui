@@ -8,3 +8,7 @@ result
 tests/test_basic
 tests/test_bindings
 tests/test_renderer
+tests/test_cross_renderer
+tests/test_demo_app
+tests/test_performance
+demos/task-manager/src/main

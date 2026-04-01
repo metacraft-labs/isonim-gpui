@@ -44,10 +44,30 @@ generate-bindings:
 check-bindings:
     ./tools/check_bindings.sh
 
-# Run all tests (Rust + Nim)
-test-all: rust-test test
+# Run cross-renderer tests (requires Rust shim + isonim)
+test-cross:
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --nimcache:nimcache/test_cross_renderer tests/test_cross_renderer.nim
+
+# Run demo app tests (requires Rust shim + isonim)
+test-demo:
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --path:demos/task-manager/src --nimcache:nimcache/test_demo_app tests/test_demo_app.nim
+
+# Run performance benchmarks (requires Rust shim)
+test-perf:
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r -d:release --path:../isonim/src --nimcache:nimcache/test_performance tests/test_performance.nim
+
+# Build the demo app
+demo-build:
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c --path:../isonim/src --nimcache:nimcache/demo demos/task-manager/src/main.nim
+
+# Run the demo app (headless mode)
+demo-run:
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --nimcache:nimcache/demo demos/task-manager/src/main.nim
+
+# Run all tests (Rust + Nim + cross-renderer + demo)
+test-all: rust-test test test-cross test-demo
 
 # Clean build artifacts
 clean:
-    rm -rf nimcache tests/test_basic tests/test_bindings
+    rm -rf nimcache tests/test_basic tests/test_bindings tests/test_cross_renderer tests/test_demo_app tests/test_performance demos/task-manager/src/main
     cd rust && cargo clean
