@@ -61,6 +61,9 @@ jobs:
       - name: Run bindings tests
         run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r tests/test_bindings.nim"
 
+      - name: Validate Rust/Nim binding consistency
+        run: nix develop -c bash -c "./tools/check_bindings.sh"
+
       - name: Run cross-renderer tests
         run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r --path:../isonim/src tests/test_cross_renderer.nim"
 
