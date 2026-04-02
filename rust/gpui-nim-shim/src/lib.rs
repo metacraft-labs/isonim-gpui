@@ -38,14 +38,15 @@
 //! shadow tree is essential: IsoNim mutates it imperatively, and the render-sync
 //! step translates it to GPUI's declarative builders each frame.
 
-// Some items are pub in submodules for future milestones (render-sync, etc.)
+// Modules are pub so integration tests can access the shadow tree, render plan,
+// and window state.
 #[allow(dead_code)]
-mod tree;
+pub mod tree;
 #[allow(dead_code)]
-mod window;
-mod render_sync;
+pub mod window;
+pub mod render_sync;
 #[cfg(feature = "gpui-backend")]
-mod gpui_app;
+pub mod gpui_app;
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -56,18 +57,18 @@ use window::{CloseCallback, FocusCallback, ResizeCallback};
 
 /// Global shadow tree protected by a mutex.
 /// All extern "C" functions lock this to perform tree operations.
-static TREE: std::sync::LazyLock<Mutex<Tree>> =
+pub static TREE: std::sync::LazyLock<Mutex<Tree>> =
     std::sync::LazyLock::new(|| Mutex::new(Tree::new()));
 
 /// Global root node ID for the render-sync bridge.
 /// Set by `gpui_launch()` so the GPUI view knows which node is the root.
-static ROOT_NODE_ID: std::sync::LazyLock<Mutex<NodeId>> =
+pub static ROOT_NODE_ID: std::sync::LazyLock<Mutex<NodeId>> =
     std::sync::LazyLock::new(|| Mutex::new(NodeId::NULL));
 
 /// Lock the global tree, recovering from poison if needed.
 /// Since the tree is always in a valid (if inconsistent) state after a panic,
 /// we simply clear the poison and continue.
-fn lock_tree() -> std::sync::MutexGuard<'static, Tree> {
+pub fn lock_tree() -> std::sync::MutexGuard<'static, Tree> {
     match TREE.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1789,6 +1790,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(not(feature = "gpui-backend"))]
     fn test_launch_callback() {
         gpui_reset_tree();
 

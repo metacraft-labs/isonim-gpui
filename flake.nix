@@ -106,6 +106,7 @@
               pkgs.alsa-lib
               pkgs.mesa
               pkgs.libglvnd
+              pkgs.stdenv.cc.cc.lib
             ]
           );
 

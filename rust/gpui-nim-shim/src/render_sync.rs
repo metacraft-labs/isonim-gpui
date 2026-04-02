@@ -1750,6 +1750,7 @@ mod integration_tests {
     /// immediately (no event loop), so we can verify the tree and dispatch.
     #[test]
     #[serial]
+    #[cfg(not(feature = "gpui-backend"))]
     fn test_window_integration_with_launch() {
         use crate::{
             gpui_first_child, gpui_launch, gpui_reset_windows, gpui_tree_node_count,
