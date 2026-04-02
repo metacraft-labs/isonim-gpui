@@ -295,21 +295,37 @@ pub mod gpui_render {
     ///
     /// The lock is released before calling callbacks to avoid deadlocks
     /// (callbacks may mutate the tree via FFI).
+    ///
+    /// Supports both legacy function pointer listeners (callback_id == 0)
+    /// and dispatcher-based listeners (callback_id > 0).
     pub fn dispatch_shadow_event(node_id: NodeId, event_name: &str) {
-        let callbacks: Vec<extern "C" fn()> = {
+        let listeners: Vec<(extern "C" fn(), i32)> = {
             let tree = crate::lock_tree();
             if let Some(node) = tree.get(node_id) {
                 node.event_listeners
                     .get(event_name)
-                    .map(|listeners| listeners.iter().map(|l| l.callback).collect())
+                    .map(|ls| ls.iter().map(|l| (l.callback, l.callback_id)).collect())
                     .unwrap_or_default()
             } else {
                 Vec::new()
             }
         };
-        // Call callbacks outside the lock to avoid deadlocks
-        for cb in callbacks {
-            cb();
+
+        let dispatcher = {
+            crate::EVENT_DISPATCHER
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        };
+
+        for (cb, id) in listeners {
+            if id > 0 {
+                if let Some(dispatch) = dispatcher {
+                    dispatch(id);
+                }
+            } else {
+                cb();
+            }
         }
     }
 }
@@ -533,7 +549,7 @@ mod tests {
         node.event_listeners
             .entry("click".into())
             .or_default()
-            .push(EventListener { callback: noop });
+            .push(EventListener { callback: noop, callback_id: 0 });
         let id = tree.insert(node);
 
         let plan = build_render_plan(&tree, id).unwrap();
@@ -644,7 +660,7 @@ mod tests {
         node.event_listeners
             .entry("input".into())
             .or_default()
-            .push(EventListener { callback: noop });
+            .push(EventListener { callback: noop, callback_id: 0 });
         let id = tree.insert(node);
 
         let plan = build_render_plan(&tree, id).unwrap();
@@ -661,15 +677,15 @@ mod tests {
         node.event_listeners
             .entry("click".into())
             .or_default()
-            .push(EventListener { callback: noop });
+            .push(EventListener { callback: noop, callback_id: 0 });
         node.event_listeners
             .entry("input".into())
             .or_default()
-            .push(EventListener { callback: noop });
+            .push(EventListener { callback: noop, callback_id: 0 });
         node.event_listeners
             .entry("hover".into())
             .or_default()
-            .push(EventListener { callback: noop });
+            .push(EventListener { callback: noop, callback_id: 0 });
         let id = tree.insert(node);
 
         let plan = build_render_plan(&tree, id).unwrap();
@@ -705,7 +721,7 @@ mod tests {
         btn.event_listeners
             .entry("click".into())
             .or_default()
-            .push(EventListener { callback: noop });
+            .push(EventListener { callback: noop, callback_id: 0 });
         let btn_id = tree.insert(btn);
 
         let mut input = Node::new_element("div");
@@ -713,7 +729,7 @@ mod tests {
             .event_listeners
             .entry("input".into())
             .or_default()
-            .push(EventListener { callback: noop });
+            .push(EventListener { callback: noop, callback_id: 0 });
         let input_id = tree.insert(input);
 
         tree.append_child(root_id, btn_id);
@@ -1716,6 +1732,7 @@ mod integration_tests {
                 .or_default()
                 .push(crate::tree::EventListener {
                     callback: tree_reader,
+                    callback_id: 0,
                 });
             tree.insert(node)
         };

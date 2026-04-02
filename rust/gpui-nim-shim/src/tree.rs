@@ -101,10 +101,17 @@ pub struct Node {
 }
 
 /// An event listener stored in the shadow tree.
-/// The callback is a C function pointer provided by the Nim side.
+///
+/// Supports two dispatch modes:
+/// - **Legacy (function pointer):** `callback` is set, `callback_id` is 0.
+///   The function pointer is called directly.
+/// - **Dispatcher (callback ID):** `callback_id` > 0, dispatched via the
+///   global event dispatcher registered by `gpui_set_event_dispatcher`.
+///   `callback` is set to a dummy no-op in this mode.
 #[derive(Debug, Clone, Copy)]
 pub struct EventListener {
     pub callback: extern "C" fn(),
+    pub callback_id: i32,
 }
 
 impl Node {
@@ -658,18 +665,21 @@ mod tests {
             .or_default()
             .push(EventListener {
                 callback: handler1,
+                callback_id: 0,
             });
         node.event_listeners
             .entry("click".to_string())
             .or_default()
             .push(EventListener {
                 callback: handler2,
+                callback_id: 0,
             });
         node.event_listeners
             .entry("mousedown".to_string())
             .or_default()
             .push(EventListener {
                 callback: handler1,
+                callback_id: 0,
             });
 
         assert_eq!(node.event_listeners.get("click").unwrap().len(), 2);

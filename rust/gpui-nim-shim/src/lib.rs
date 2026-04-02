@@ -65,6 +65,15 @@ pub static TREE: std::sync::LazyLock<Mutex<Tree>> =
 pub static ROOT_NODE_ID: std::sync::LazyLock<Mutex<NodeId>> =
     std::sync::LazyLock::new(|| Mutex::new(NodeId::NULL));
 
+/// Global event dispatcher function pointer, registered by Nim via
+/// `gpui_set_event_dispatcher`. When set, event listeners that have a
+/// `callback_id > 0` are dispatched through this function instead of
+/// calling a C function pointer directly.
+pub type EventDispatcher = extern "C" fn(callback_id: i32);
+
+static EVENT_DISPATCHER: std::sync::LazyLock<Mutex<Option<EventDispatcher>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
 /// Lock the global tree, recovering from poison if needed.
 /// Since the tree is always in a valid (if inconsistent) state after a panic,
 /// we simply clear the poison and continue.
@@ -304,6 +313,7 @@ pub type EventCallback = extern "C" fn();
 
 /// Register a callback for `event` on `node`.
 /// The `handler` is a C function pointer that Nim will pass in.
+/// Legacy API — uses direct function pointer dispatch (callback_id = 0).
 #[no_mangle]
 pub extern "C" fn gpui_add_event_listener(
     node: *mut GpuiElement,
@@ -317,12 +327,54 @@ pub extern "C" fn gpui_add_event_listener(
     let event_str = unsafe { cstr_to_str(event) };
     let mut tree = lock_tree();
     if let Some(n) = tree.get_mut(node_id) {
-        let listener = EventListener { callback: handler };
+        let listener = EventListener {
+            callback: handler,
+            callback_id: 0,
+        };
         n.event_listeners
             .entry(event_str.to_string())
             .or_default()
             .push(listener);
     }
+}
+
+/// No-op function pointer used as placeholder for dispatcher-based listeners.
+extern "C" fn _noop_callback() {}
+
+/// Register a callback ID for `event` on `node`.
+/// The `callback_id` is dispatched via the global event dispatcher registered
+/// by `gpui_set_event_dispatcher`.
+#[no_mangle]
+pub extern "C" fn gpui_add_event_listener_id(
+    node: *mut GpuiElement,
+    event: *const c_char,
+    callback_id: i32,
+) {
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return;
+    }
+    let event_str = unsafe { cstr_to_str(event) };
+    let mut tree = lock_tree();
+    if let Some(n) = tree.get_mut(node_id) {
+        let listener = EventListener {
+            callback: _noop_callback,
+            callback_id,
+        };
+        n.event_listeners
+            .entry(event_str.to_string())
+            .or_default()
+            .push(listener);
+    }
+}
+
+/// Register the global event dispatcher function.
+/// When set, event listeners with `callback_id > 0` are dispatched through
+/// this function instead of calling their C function pointer directly.
+#[no_mangle]
+pub extern "C" fn gpui_set_event_dispatcher(dispatcher: EventDispatcher) {
+    let mut guard = EVENT_DISPATCHER.lock().unwrap_or_else(|p| p.into_inner());
+    *guard = Some(dispatcher);
 }
 
 // ---------------------------------------------------------------------------
@@ -445,22 +497,36 @@ pub extern "C" fn gpui_dispatch_event(node: *mut GpuiElement, event: *const c_ch
     }
     let event_str = unsafe { cstr_to_str(event) };
 
-    // Collect callbacks while holding the lock, then call them after releasing.
+    // Collect listeners while holding the tree lock, then dispatch after releasing.
     // This avoids deadlock when callbacks modify the tree.
-    let callbacks: Vec<extern "C" fn()> = {
+    let listeners: Vec<(extern "C" fn(), i32)> = {
         let tree = lock_tree();
         if let Some(n) = tree.get(node_id) {
             n.event_listeners
                 .get(event_str)
-                .map(|listeners| listeners.iter().map(|l| l.callback).collect())
+                .map(|ls| ls.iter().map(|l| (l.callback, l.callback_id)).collect())
                 .unwrap_or_default()
         } else {
             Vec::new()
         }
     };
 
-    for cb in callbacks {
-        cb();
+    // Read the dispatcher once (outside the tree lock)
+    let dispatcher = {
+        EVENT_DISPATCHER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    };
+
+    for (cb, id) in listeners {
+        if id > 0 {
+            if let Some(dispatch) = dispatcher {
+                dispatch(id);
+            }
+        } else {
+            cb();
+        }
     }
 }
 

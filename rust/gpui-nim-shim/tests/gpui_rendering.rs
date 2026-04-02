@@ -674,7 +674,7 @@ fn test_button_with_click_handler_renders() {
                 .event_listeners
                 .entry("click".to_string())
                 .or_default()
-                .push(EventListener { callback: noop });
+                .push(EventListener { callback: noop, callback_id: 0 });
 
             root.children.push(button_id);
 

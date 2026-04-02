@@ -62,6 +62,14 @@ proc gpui_set_style*(node: GpuiElement; prop, value: cstring)
 proc gpui_add_event_listener*(node: GpuiElement; event: cstring; handler: EventCallback)
   {.importc: "gpui_add_event_listener".}
 
+proc gpui_add_event_listener_id*(node: GpuiElement; event: cstring; callbackId: int32)
+  {.importc: "gpui_add_event_listener_id".}
+
+type EventDispatcherCallback* = proc(callbackId: int32) {.cdecl.}
+
+proc gpui_set_event_dispatcher*(dispatcher: EventDispatcherCallback)
+  {.importc: "gpui_set_event_dispatcher".}
+
 proc gpui_first_child*(node: GpuiElement): GpuiElement
   {.importc: "gpui_first_child".}
 

@@ -161,61 +161,97 @@ static:
 echo "test_renderer: event callback bridge compile check passed"
 
 # ===========================================================================
-# 6. Callback registry unit tests (no FFI needed for trampoline calls)
+# 6. Callback registry unit tests (via dispatcher round-trip through Rust shim)
 # ===========================================================================
 
 block callbackRegistryTest:
+  gpui_reset_tree()
   resetCallbacks()
 
+  var r: GpuiRenderer
+  let btn = r.createElement("button")
+
   var counter = 0
-  let cb = registerCallback(proc() = counter += 1)
+  r.addEventListener(btn, "click", proc() = counter += 1)
 
-  # The returned callback is a cdecl proc
-  assert cb != nil
-
-  # Calling the trampoline should invoke our closure
-  cb()
+  # Dispatching the event should invoke our closure via the dispatcher
+  fireEvent(btn, "click")
   assert counter == 1, "callback should have been called once"
 
-  cb()
+  fireEvent(btn, "click")
   assert counter == 2, "callback should have been called twice"
 
-  # Register another callback
+  # Register another callback on a different element
+  let btn2 = r.createElement("button")
   var other = 0
-  let cb2 = registerCallback(proc() = other += 10)
-  cb2()
+  r.addEventListener(btn2, "click", proc() = other += 10)
+  fireEvent(btn2, "click")
   assert other == 10, "second callback should work independently"
 
   # First callback still works
-  cb()
+  fireEvent(btn, "click")
   assert counter == 3
 
+  gpui_reset_tree()
   resetCallbacks()
   echo "test_renderer: callback registry unit test passed"
 
 # ===========================================================================
-# 7. Trampoline pool exhaustion test
+# 7. Dynamic callback registry — scalability and ID monotonicity
 # ===========================================================================
 
-block trampolinePoolTest:
+block dynamicCallbackScaleTest:
+  gpui_reset_tree()
   resetCallbacks()
 
-  # Register all available trampolines
-  for i in 0 ..< trampolineCount:
-    let cb = registerCallback(proc() = discard)
-    assert cb != nil
+  var r: GpuiRenderer
+  let parent = r.createElement("div")
 
-  # Next registration should fail
-  var failed = false
-  try:
-    discard registerCallback(proc() = discard)
-  except AssertionDefect:
-    failed = true
+  # Register 100+ callbacks and verify they all fire correctly
+  type Counters = ref object
+    data: array[150, int]
+  let counters = Counters()
+  var buttons: seq[GpuiElement]
 
-  assert failed, "should have raised AssertionDefect when pool exhausted"
+  proc makeHandler(c: Counters; idx: int): proc() =
+    result = proc() = c.data[idx] += 1
+
+  for i in 0 ..< 150:
+    let btn = r.createElement("button")
+    r.appendChild(parent, btn)
+    buttons.add btn
+    r.addEventListener(btn, "click", makeHandler(counters, i))
+
+  # Fire all events
+  for i in 0 ..< 150:
+    fireEvent(buttons[i], "click")
+
+  # Verify all callbacks fired exactly once
+  for i in 0 ..< 150:
+    assert counters.data[i] == 1, "callback " & $i & " should have fired once, got: " & $counters.data[i]
+
+  gpui_reset_tree()
+  resetCallbacks()
+  echo "test_renderer: dynamic callback scalability test passed (150 callbacks)"
+
+block callbackIdMonotonicityTest:
+  resetCallbacks()
+
+  # Register some callbacks and verify IDs are monotonically increasing
+  let id1 = registerCallback(proc() = discard)
+  let id2 = registerCallback(proc() = discard)
+  let id3 = registerCallback(proc() = discard)
+
+  assert id1 < id2, "callback IDs should be monotonically increasing"
+  assert id2 < id3, "callback IDs should be monotonically increasing"
+
+  # Remove a callback and register a new one — ID should still increase
+  removeCallback(id2)
+  let id4 = registerCallback(proc() = discard)
+  assert id4 > id3, "callback IDs should not be reused after removal"
 
   resetCallbacks()
-  echo "test_renderer: trampoline pool exhaustion test passed"
+  echo "test_renderer: callback ID monotonicity test passed"
 
 # ===========================================================================
 # 8. Tree operations (requires Rust shim linked)

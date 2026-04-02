@@ -221,67 +221,44 @@ proc mapAttributeValue(name, value: string): string =
   else: value
 
 # ===========================================================================
-# Event callback bridge
+# Event callback bridge — dynamic callback ID registry
 # ===========================================================================
+#
+# Instead of a fixed pool of cdecl trampolines, we maintain a Table[int32, proc()]
+# keyed by monotonically increasing callback IDs. A single global dispatcher
+# (registered once with the Rust shim) looks up and invokes the closure.
 
-var callbackRegistry*: array[16, proc()]
-var nextCallbackSlot: int
+var callbackTable*: Table[int32, proc()]
+var nextCallbackId*: int32 = 1
+var dispatcherRegistered: bool = false
 
-proc trampoline0() {.cdecl.} =
-  if callbackRegistry[0] != nil: callbackRegistry[0]()
-proc trampoline1() {.cdecl.} =
-  if callbackRegistry[1] != nil: callbackRegistry[1]()
-proc trampoline2() {.cdecl.} =
-  if callbackRegistry[2] != nil: callbackRegistry[2]()
-proc trampoline3() {.cdecl.} =
-  if callbackRegistry[3] != nil: callbackRegistry[3]()
-proc trampoline4() {.cdecl.} =
-  if callbackRegistry[4] != nil: callbackRegistry[4]()
-proc trampoline5() {.cdecl.} =
-  if callbackRegistry[5] != nil: callbackRegistry[5]()
-proc trampoline6() {.cdecl.} =
-  if callbackRegistry[6] != nil: callbackRegistry[6]()
-proc trampoline7() {.cdecl.} =
-  if callbackRegistry[7] != nil: callbackRegistry[7]()
-proc trampoline8() {.cdecl.} =
-  if callbackRegistry[8] != nil: callbackRegistry[8]()
-proc trampoline9() {.cdecl.} =
-  if callbackRegistry[9] != nil: callbackRegistry[9]()
-proc trampoline10() {.cdecl.} =
-  if callbackRegistry[10] != nil: callbackRegistry[10]()
-proc trampoline11() {.cdecl.} =
-  if callbackRegistry[11] != nil: callbackRegistry[11]()
-proc trampoline12() {.cdecl.} =
-  if callbackRegistry[12] != nil: callbackRegistry[12]()
-proc trampoline13() {.cdecl.} =
-  if callbackRegistry[13] != nil: callbackRegistry[13]()
-proc trampoline14() {.cdecl.} =
-  if callbackRegistry[14] != nil: callbackRegistry[14]()
-proc trampoline15() {.cdecl.} =
-  if callbackRegistry[15] != nil: callbackRegistry[15]()
+proc globalDispatcher(callbackId: int32) {.cdecl.} =
+  if callbackId in callbackTable:
+    callbackTable[callbackId]()
 
-var trampolines: array[16, EventCallback] = [
-  trampoline0, trampoline1, trampoline2, trampoline3,
-  trampoline4, trampoline5, trampoline6, trampoline7,
-  trampoline8, trampoline9, trampoline10, trampoline11,
-  trampoline12, trampoline13, trampoline14, trampoline15,
-]
+proc ensureDispatcherRegistered() =
+  if not dispatcherRegistered:
+    gpui_set_event_dispatcher(globalDispatcher)
+    dispatcherRegistered = true
 
-const trampolineCount* = 16
+proc registerCallback*(handler: proc()): int32 =
+  ## Register a Nim closure and return its callback ID.
+  ensureDispatcherRegistered()
+  let id = nextCallbackId
+  inc nextCallbackId
+  callbackTable[id] = handler
+  id
 
-proc registerCallback*(handler: proc()): EventCallback =
-  assert nextCallbackSlot < trampolineCount,
-    "GpuiRenderer: event callback trampoline pool exhausted (" &
-    $trampolineCount & " slots)"
-  let slot = nextCallbackSlot
-  inc nextCallbackSlot
-  callbackRegistry[slot] = handler
-  trampolines[slot]
+proc removeCallback*(id: int32) =
+  ## Remove a callback from the registry by its ID.
+  callbackTable.del(id)
 
 proc resetCallbacks*() =
-  for i in 0 ..< trampolineCount:
-    callbackRegistry[i] = nil
-  nextCallbackSlot = 0
+  callbackTable.clear()
+  nextCallbackId = 1
+  # Re-register the dispatcher to ensure it's always set after reset
+  gpui_set_event_dispatcher(globalDispatcher)
+  dispatcherRegistered = true
 
 # ===========================================================================
 # RendererBackend implementation (13 procs)
@@ -321,8 +298,8 @@ proc setStyle*(r: GpuiRenderer; node: GpuiElement; prop, value: string) =
   gpui_set_style(node, gpuiProp.cstring, gpuiValue.cstring)
 
 proc addEventListener*(r: GpuiRenderer; node: GpuiElement; event: string; handler: proc()) =
-  let trampoline = registerCallback(handler)
-  gpui_add_event_listener(node, event.cstring, trampoline)
+  let callbackId = registerCallback(handler)
+  gpui_add_event_listener_id(node, event.cstring, callbackId)
 
 proc firstChild*(r: GpuiRenderer; node: GpuiElement): GpuiElement =
   gpui_first_child(node)
