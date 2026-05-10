@@ -73,8 +73,13 @@ jobs:
       - name: Run structural comparison tests
         run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r --path:../isonim/src tests/test_structural_comparison.nim"
 
-      - name: Run demo app tests
-        run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r --path:../isonim/src --path:demos/task-manager/src tests/test_demo_app.nim"
+      # The task-manager demo's end-to-end test lives in
+      # `isonim-examples/tests/test_gpui_leaves_end_to_end.nim` since
+      # EX-M3 (the standalone `tests/test_demo_app.nim` was deleted
+      # alongside the duplicated `demos/task-manager/` source). Cross-
+      # repo CI gating happens in the `isonim-examples` workflow; this
+      # repo only verifies the renderer + bindings + integration
+      # surface here.
 
       - name: Run GUI tests (render plan only)
         run: nix develop -c bash -c "LD_LIBRARY_PATH=rust/target/debug nim c -r --path:../isonim/src tests/test_gui.nim"

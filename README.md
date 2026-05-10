@@ -49,17 +49,26 @@ just test-all
 
 ## Running the Demo App
 
-The repo includes a **Task Manager** demo at `demos/task-manager/src/main.nim`.
-It exercises signals, memos, reactive rendering, event dispatch, and tree
-mutations — the same app that runs in the browser via isonim's web renderer.
+Since EX-M3, the canonical Task Manager demo lives in the
+[`isonim-examples`](../isonim-examples/) repo at
+`isonim-examples/task_app/main_gpui.nim`. It consumes the shared
+`TaskAppVM` (Layer 3) + view template (Layer 2) and only the GPUI-
+specific Layer 1 leaves + Layer 4 composition root differ from the
+TUI/web flavours.
 
 ### Headless mode (no display server)
 
-Builds the UI tree and runs through all interactions programmatically,
-printing the results to stdout:
+Builds the UI tree and runs through interactions programmatically,
+printing results to stdout:
 
 ```bash
+# From this repo's dev shell (provides the Rust shim's runtime libs):
 just demo-run
+
+# Or from the isonim-examples repo's dev shell:
+cd ../isonim-examples
+LD_LIBRARY_PATH=../isonim-gpui/rust/target/debug \
+  nim c -r task_app/main_gpui.nim
 ```
 
 ### Window mode (requires display server)
@@ -70,7 +79,8 @@ First build the Rust shim with the GPUI backend enabled, then compile with
 ```bash
 just rust-build          # build the shim library
 LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} \
-  nim c -r -d:gpuiGui --path:../isonim/src demos/task-manager/src/main.nim
+  nim c -r -d:gpuiGui --path:../isonim/src --path:../isonim-examples \
+  ../isonim-examples/task_app/main_gpui.nim
 ```
 
 > Window mode requires a running X11 or Wayland display. For headless CI
@@ -83,12 +93,15 @@ LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} \
 ```bash
 just test              # core renderer tests
 just test-cross        # cross-renderer compatibility with isonim
-just test-demo         # task manager demo verification
 just test-integration  # render plan integration tests
 just test-structural   # structural comparison tests
 just test-perf         # performance benchmarks
 just test-all          # all of the above + Rust tests
 ```
+
+The task-manager demo's end-to-end tests live in `isonim-examples/tests/`
+(`test_gpui_leaves_end_to_end.nim`); run them via that repo's
+`just test` recipe.
 
 ### Rust tests
 
@@ -136,9 +149,13 @@ isonim-gpui/
 ├── src/isonim_gpui/
 │   ├── bindings.nim              # Raw C bindings to Rust shim
 │   └── renderer.nim              # GpuiRenderer (RendererBackend impl)
-├── tests/                        # Nim test suite
-└── demos/task-manager/           # Task Manager demo app
+└── tests/                        # Nim test suite
 ```
+
+The Task Manager demo lives in [`isonim-examples`](../isonim-examples/)
+since EX-M3 (`isonim-examples/task_app/{gpui/leaves.nim,main_gpui.nim}`).
+The canonical shared core (`task_app/core/{vm,views}.nim`) is consumed
+by the TUI, web, and GPUI flavours from a single source.
 
 ## GPUI Notes
 

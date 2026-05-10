@@ -48,10 +48,6 @@ check-bindings:
 test-cross:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --nimcache:nimcache/test_cross_renderer tests/test_cross_renderer.nim
 
-# Run demo app tests (requires Rust shim + isonim)
-test-demo:
-    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --path:demos/task-manager/src --nimcache:nimcache/test_demo_app tests/test_demo_app.nim
-
 # Run render-plan integration tests (requires Rust shim + isonim)
 test-integration:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --nimcache:nimcache/test_render_integration tests/test_render_integration.nim
@@ -60,20 +56,26 @@ test-integration:
 test-perf:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r -d:release --path:../isonim/src --nimcache:nimcache/test_performance tests/test_performance.nim
 
-# Build the demo app
+# Build the canonical task-app demo (lives in isonim-examples since
+# EX-M3; this recipe just defers to that repo's composition root).
 demo-build:
-    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c --path:../isonim/src --nimcache:nimcache/demo demos/task-manager/src/main.nim
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c --path:../isonim/src --path:../isonim-examples --path:../isonim-examples/src --nimcache:nimcache/demo ../isonim-examples/task_app/main_gpui.nim
 
-# Run the demo app (headless mode)
+# Run the canonical task-app demo (headless mode). Sources live in
+# `isonim-examples/task_app/` per the EX-M3 migration; the Rust shim
+# is still built in this repo.
 demo-run:
-    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --nimcache:nimcache/demo demos/task-manager/src/main.nim
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --path:../isonim-examples --nimcache:nimcache/demo ../isonim-examples/task_app/main_gpui.nim
 
 # Run structural comparison tests (G4 — requires Rust shim and isonim)
 test-structural:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src --nimcache:nimcache/test_structural_comparison tests/test_structural_comparison.nim
 
-# Run all tests (Rust + Nim + cross-renderer + demo + integration)
-test-all: rust-test test test-cross test-demo test-integration test-structural
+# Run all tests (Rust + Nim + cross-renderer + integration). The
+# task-manager demo's tests live in `isonim-examples/tests/` since
+# EX-M3 (`test_gpui_leaves_end_to_end.nim`); run them via that repo's
+# `just test` recipe.
+test-all: rust-test test test-cross test-integration test-structural
 
 # Run GUI tests under Xvfb (X11 headless)
 test-gui-x11 *ARGS:
@@ -95,5 +97,5 @@ _run-gui-tests:
 
 # Clean build artifacts
 clean:
-    rm -rf nimcache tests/test_basic tests/test_bindings tests/test_cross_renderer tests/test_demo_app tests/test_performance tests/test_render_integration demos/task-manager/src/main
+    rm -rf nimcache tests/test_basic tests/test_bindings tests/test_cross_renderer tests/test_performance tests/test_render_integration
     cd rust && cargo clean
