@@ -341,6 +341,20 @@ proc nthChild*(node: GpuiElement; index: int): GpuiElement =
 proc fireEvent*(node: GpuiElement; event: string) =
   gpui_dispatch_event(node, event.cstring)
 
+proc getTag*(node: GpuiElement): string =
+  ## Read the element's tag name (e.g. "div", "button", "p"). Returns
+  ## "" for nil nodes or text nodes (which have no tag). Used by the
+  ## RS-M2 GPUI streaming adapter (in `isonim-render-serve`) to derive
+  ## a per-element fill colour when rasterizing the headless tree to
+  ## RGBA pixels.
+  if node == nil: return ""
+  let needed = gpui_get_tag(node, nil, 0)
+  if needed == 0: return ""
+  var buf = newString(int(needed) + 1)
+  discard gpui_get_tag(node, addr buf[0], uint64(buf.len))
+  buf.setLen(int(needed))
+  buf
+
 # ===========================================================================
 # Render plan inspection (G3-G — integration testing)
 # ===========================================================================
