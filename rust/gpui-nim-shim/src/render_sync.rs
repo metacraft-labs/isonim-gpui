@@ -280,7 +280,11 @@ pub fn count_render_nodes(plan: &RenderNode) -> usize {
 // GPUI rendering (only available with gpui-backend feature)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "gpui-backend")]
+// RS-M14 Phase 2: the headless rendering path (`gpui-headless` feature) reuses
+// `dispatch_shadow_event` and any helpers exposed by `gpui_render` so the
+// off-screen capture pipeline produces the same output the windowed launch
+// path produces. Widen the cfg gate accordingly.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub mod gpui_render {
     //! Actual GPUI element rendering from the shadow tree.
     //!

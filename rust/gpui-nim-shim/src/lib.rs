@@ -45,8 +45,16 @@ pub mod tree;
 #[allow(dead_code)]
 pub mod window;
 pub mod render_sync;
-#[cfg(feature = "gpui-backend")]
+// RS-M14 Phase 2: `gpui_app` is reused by the new headless rendering path
+// (`gpui_headless`) — both features need access to `NimRootView`,
+// `render_plan_to_gpui`, and the style/colour helpers. The
+// `launch_gpui_app` function itself is still gpui-backend-only; we just
+// widen the module-level gate so its inner items are visible to the
+// headless path too.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub mod gpui_app;
+#[cfg(feature = "gpui-headless")]
+pub mod gpui_headless;
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -484,6 +492,21 @@ pub extern "C" fn gpui_launch(
     {
         let _ = title_str;
     }
+}
+
+/// RS-M14 Phase 2: set the global `ROOT_NODE_ID` to the given element
+/// handle. Callers that build the shadow tree *without* going through
+/// `gpui_launch` (e.g. the GPUI streaming adapter in
+/// `isonim_render_serve`) must call this before invoking
+/// `gpui_render_to_pixels` so the headless `NimRootView` finds the
+/// correct tree root to render. Passing a null handle resets the root
+/// to `NodeId::NULL`, which causes the renderer to fall back to its
+/// "No shadow tree root" placeholder element.
+#[no_mangle]
+pub extern "C" fn gpui_set_root_element(handle: *mut GpuiElement) {
+    let node_id = unsafe { handle_to_node_id(handle) };
+    let mut root = ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
+    *root = node_id;
 }
 
 /// Trigger all event listeners for the given event on the given node.

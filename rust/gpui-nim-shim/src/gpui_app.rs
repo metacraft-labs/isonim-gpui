@@ -9,30 +9,37 @@
 //! extracted as module-level items so integration tests can construct views
 //! and verify rendering without launching a full event loop.
 
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 use crate::render_sync::gpui_render::dispatch_shadow_event;
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 use crate::window;
 
 // Import specific items from gpui rather than `use gpui::*` because gpui
 // re-exports a `test` proc macro that shadows `#[test]` and causes infinite
 // recursion in the compiler.
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 use gpui::{
     div, px, rgb, rgba, size, AnyElement, App, AppContext as _, Application, AsyncApp, Bounds,
     Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Rgba,
     Styled, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 
+// RS-M14 Phase 2 (git pin): `Application::new()` from crates.io `gpui = "0.2"`
+// was replaced by `Application::with_platform(Rc<dyn Platform>)` on the Zed
+// monorepo `main` branch. `gpui_platform::current_platform` returns the OS-
+// appropriate platform impl so we don't have to fan out `#[cfg]` ourselves.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+use gpui_platform::current_platform;
+
 /// The ID of the window that is currently being displayed by GPUI.
 /// Set before launching the event loop so that the root view and
 /// event handlers can reference the correct window in the registry.
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 static ACTIVE_WINDOW_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
 /// Get the active GPUI window ID (0 if none).
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 #[allow(dead_code)]
 pub fn active_window_id() -> u32 {
     ACTIVE_WINDOW_ID.load(std::sync::atomic::Ordering::Acquire)
@@ -44,13 +51,13 @@ pub fn active_window_id() -> u32 {
 
 /// NimRootView reads the global shadow tree and produces GPUI elements.
 /// It is the root view for both the real application window and test windows.
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub struct NimRootView {
     /// Whether the repaint polling timer has been started.
     poll_started: bool,
 }
 
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 impl NimRootView {
     pub fn new() -> Self {
         NimRootView {
@@ -59,7 +66,7 @@ impl NimRootView {
     }
 }
 
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 impl Render for NimRootView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Check and clear the repaint flag (so we know the frame is current).
@@ -111,7 +118,7 @@ impl Render for NimRootView {
 // ---------------------------------------------------------------------------
 
 /// Recursively convert a RenderNode to GPUI AnyElement.
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement {
     use crate::tree::GpuiElementKind;
 
@@ -191,7 +198,7 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
 }
 
 /// Apply GpuiStyles to a div builder.
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn apply_styles_to_div(
     mut el: Div,
     styles: &crate::render_sync::GpuiStyles,
@@ -298,7 +305,7 @@ pub fn apply_styles_to_div(
 }
 
 /// Parse a pixel value from a CSS-like string.
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn parse_px(s: &str) -> Option<f32> {
     let s = s.trim();
     let num_str = s.strip_suffix("px").unwrap_or(s);
@@ -307,7 +314,7 @@ pub fn parse_px(s: &str) -> Option<f32> {
 
 /// Parse a color from a CSS-like string.
 /// Returns an Hsla color for use with GPUI's `.bg()` and `.text_color()`.
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn parse_color(s: &str) -> Option<Hsla> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix('#') {
@@ -357,7 +364,7 @@ pub fn parse_color(s: &str) -> Option<Hsla> {
 /// * `width` - Initial window width in pixels
 /// * `height` - Initial window height in pixels
 /// * `window_id` - The window registry ID (from `gpui_create_window`), or 0
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     // Record the active window so components can reference it.
     ACTIVE_WINDOW_ID.store(window_id, std::sync::atomic::Ordering::Release);
@@ -371,7 +378,11 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     let w = width as f32;
     let h = height as f32;
 
-    Application::new().run(move |cx: &mut App| {
+    // RS-M14 Phase 2: pinned `gpui` requires an explicit platform implementation
+    // (the old crates.io `Application::new()` constructor is gone). Use
+    // `current_platform(false)` to get the windowed (non-headless) platform impl
+    // appropriate for the current OS.
+    Application::with_platform(current_platform(false)).run(move |cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(
@@ -393,7 +404,7 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
 }
 
 #[cfg(test)]
-#[cfg(feature = "gpui-backend")]
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 mod tests {
     // Do NOT use `use super::*` here because it would bring gpui traits
     // (re-exported via use statements) that include a `test` proc macro

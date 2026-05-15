@@ -197,4 +197,36 @@ proc gpui_render_plan_element_count*(root: GpuiElement): uint32
 proc gpui_verify_render_plan*(root: GpuiElement): uint8
   {.importc: "gpui_verify_render_plan".}
 
+# --- RS-M14 Phase 2: headless RGBA rendering via Zed's HeadlessAppContext ---
+#
+# Only exported when the shim is built with `--features gpui-headless`.
+# Returns 0 on success and writes the RGBA8888 pixel-buffer ptr +
+# byte count to the caller's out pointers. The buffer is owned by
+# the shim and MUST be released via `gpui_free_pixels(p, len)`.
+# On error returns a non-zero code and writes (nil, 0) to the
+# out pointers, so naive cleanup paths remain safe.
+#
+# Error codes (matching `gpui_headless::ErrorCode`):
+#   1 - InvalidArgs (zero dims, scale <= 0, null out-params)
+#   2 - RendererUnavailable (Linux: current_headless_renderer returned None)
+#   3 - WindowOpenFailed
+#   4 - CaptureFailed (Window::render_to_image error)
+#   5 - SizeMismatch
+#   6 - Panic (caught across the FFI boundary)
+
+proc gpui_render_to_pixels*(width: cuint; height: cuint; scale: cfloat;
+                             outPtr: ptr ptr uint8;
+                             outLen: ptr csize_t): cint
+  {.importc: "gpui_render_to_pixels".}
+
+proc gpui_free_pixels*(p: ptr uint8; len: csize_t)
+  {.importc: "gpui_free_pixels".}
+
+# RS-M14 Phase 2: callers that build the shadow tree without going through
+# `gpui_launch` (e.g. the streaming adapter in isonim-render-serve) must
+# call this before `gpui_render_to_pixels` so the headless renderer finds
+# the correct tree root. Passing nil resets to NULL.
+proc gpui_set_root_element*(handle: GpuiElement)
+  {.importc: "gpui_set_root_element".}
+
 {.pop.}

@@ -12,12 +12,55 @@ default = []
 # Enable actual GPUI rendering (requires GPU system deps).
 # Without this feature, the shim provides the shadow tree and extern "C" API
 # but the launch function does not start a real GPUI window.
-gpui-backend = ["gpui"]
+#
+# RS-M14 Phase 2: switched from gpui = "0.2" (crates.io) to a git pin at-or-after
+# Zed PR #55059 (2026-04-28). The git revision is shared with `gpui-headless`
+# below so a single fetched copy backs both features.
+gpui-backend = ["gpui", "gpui_platform", "gpui_platform/runtime_shaders"]
+# RS-M14 Phase 2: enable the headless RGBA rendering path via Zed's
+# `HeadlessAppContext::with_platform` + `Window::render_to_image`. Coexists
+# with `gpui-backend`; the windowed launch path in `gpui_app.rs` is untouched.
+# Pulls in `gpui` (with `test-support` so `HeadlessAppContext` and
+# `Window::render_to_image` are visible), `gpui_platform` for the
+# `current_platform` / `current_headless_renderer` helpers, and `image` for
+# converting the captured `RgbaImage` into raw bytes.
+#
+# `runtime_shaders` skips the build-time `metal` shader compiler invocation
+# (the dev shell here doesn't ship the macOS Metal Toolchain; gpui_macos's
+# default build path needs `xcodebuild -downloadComponent MetalToolchain`).
+# With `runtime_shaders`, the shaders are compiled at run time when the
+# Metal renderer first instantiates — which is fine for our headless
+# rendering use case.
+gpui-headless = [
+    "gpui/test-support",
+    "gpui",
+    "gpui_platform/test-support",
+    "gpui_platform/font-kit",
+    "gpui_platform/runtime_shaders",
+    "gpui_platform",
+    "image",
+]
 
 [dependencies]
-gpui = { version = "0.2", optional = true }
+# RS-M14 Phase 2: pin to zed-industries/zed at PR #55059 (2026-04-28,
+# "Query for window instead of capturing"). This is the final stabilization
+# PR for the cross-platform HeadlessAppContext path that lets us drive the
+# real GPUI render pipeline into an off-screen RGBA buffer.
+#
+# The same git revision is shared by `gpui` and `gpui_platform` so Cargo
+# fetches a single workspace checkout and resolves workspace-inherited deps
+# correctly.
+#
+# Bumping this revision requires verifying that:
+#   1. `cargo build --features gpui-backend` (the windowed launch path) still
+#      builds.
+#   2. `cargo build --features gpui-headless` builds and the headless test in
+#      `tests/test_headless_render.rs` still passes.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "562a0e03b5c3c6e696154de92fd56302a41683c4", optional = true }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "562a0e03b5c3c6e696154de92fd56302a41683c4", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 [dev-dependencies]
 serial_test = "3"
 serde_json = "1"
-gpui = { version = "0.2", features = ["test-support"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "562a0e03b5c3c6e696154de92fd56302a41683c4", features = ["test-support"] }
