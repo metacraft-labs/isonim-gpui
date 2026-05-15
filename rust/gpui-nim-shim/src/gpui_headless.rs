@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use gpui::{px, size, AnyWindowHandle, App, AppContext, HeadlessAppContext, Pixels, Size, Window};
 use gpui_platform::{current_headless_renderer, current_platform};
+use image::imageops::FilterType;
 
 use crate::gpui_app::NimRootView;
 
@@ -88,12 +89,24 @@ enum ErrorCode {
 ///
 /// # Scale semantics
 ///
-/// `width` and `height` are the output pixel dimensions. `scale` is the
-/// logical-to-physical ratio: the window is opened at
-/// `(width / scale, height / scale)` logical pixels. GPUI's pinned
-/// rendering pipeline currently captures at the logical size; callers
-/// in this milestone pass `scale = 1.0` so the logical and physical
-/// dimensions line up.
+/// `width` and `height` are both the **design canvas** in logical (dp)
+/// units AND the output pixel dimensions — the F/M/I bridge passes the
+/// browser canvas's CSS-pixel size and treats received frame bytes as
+/// the same canvas at 1:1. The GPUI window is opened at `(width,
+/// height)` logical pixels so leaves laid out in dp units (`padding:
+/// 10`, `gap: 8`, etc.) occupy the proportion of the design canvas the
+/// author intended.
+///
+/// The pinned Zed test platform hard-codes its scale factor to 2.0, so
+/// the headless capture produces a `(2*width, 2*height)` device-pixel
+/// image internally; the shim downsamples that with a triangle filter
+/// to the requested `(width, height)` before returning so the caller
+/// always receives `width * height * 4` bytes.
+///
+/// The `scale` argument is currently informational (validated against
+/// zero / non-finite); the F/M/I bridge always passes 1.0. A future
+/// revision can introduce explicit DPR control once GPUI exposes a
+/// configurable headless scale factor.
 ///
 /// # Safety
 ///
@@ -173,28 +186,40 @@ pub unsafe extern "C" fn gpui_free_pixels(ptr: *mut u8, len: usize) {
 /// Hard-coded scale factor of the `TestPlatform` test window
 /// (`TestWindow::scale_factor()` in the pinned Zed revision returns 2.0).
 /// `render_to_image` multiplies the logical window size by this factor when
-/// reading back the framebuffer, so we have to divide the caller-requested
-/// physical dimensions by it to open a window whose capture matches the
-/// requested output size.
+/// reading back the framebuffer, so the captured image is always twice as
+/// wide and twice as tall as the logical window we open.
 const TEST_WINDOW_SCALE_FACTOR: f32 = 2.0;
 
 /// Drive `HeadlessAppContext` to produce raw RGBA bytes from the current
 /// shadow tree.
 fn render_to_rgba(width: u32, height: u32, scale: f32) -> Result<Vec<u8>, ErrorCode> {
-    // The caller specifies (width, height) in *output / physical* pixels.
-    // GPUI's `TestWindow::render_to_image` returns an image whose dimensions
-    // are `logical_size * scale_factor`, where the test platform's
-    // `scale_factor` is hard-coded to 2.0. So we open the window at
-    // `(width, height) / TEST_WINDOW_SCALE_FACTOR` logical pixels and
-    // expect a `(width, height)` physical capture.
+    // The caller specifies (width, height) as the **design canvas** in
+    // logical (dp) units — same convention as CSS px / GPUI `Pixels`.
+    // The F-packet protocol's pixel dimensions match the design canvas
+    // 1:1 (the F/M/I bridge always passes scale = 1.0; the browser
+    // canvas treats received pixels as a CSS-pixel buffer).
     //
-    // The caller-supplied `scale` argument is currently informational
-    // (validated against zero / non-finite); the F/M/I bridge always passes
-    // 1.0. A future revision can introduce explicit DPR control once GPUI
-    // exposes a configurable headless scale factor.
+    // Previous implementation incorrectly divided width/height by the
+    // TestWindow scale factor before opening the window. That collapsed
+    // the design canvas to half its size in both dimensions, so a button
+    // styled with `padding: 10` (dp) occupied four times the canvas area
+    // it was meant to — the visible "everything is 4× too large" bug
+    // reported by M-EVP-14.
+    //
+    // Correct behaviour: open the window at the full requested
+    // (width, height) logical pixels so GPUI lays out elements against
+    // the caller-specified design canvas. The headless renderer then
+    // produces an oversampled `(2W, 2H)` device-pixel image (the test
+    // platform's hard-coded 2.0 scale factor), which we downsample to
+    // `(W, H)` with a triangle filter before returning to the caller.
+    //
+    // The caller-supplied `scale` argument remains informational
+    // (validated against zero / non-finite); explicit DPR control would
+    // require the test platform to expose a configurable scale factor,
+    // which the pinned Zed revision does not.
     let _ = scale; // not yet plumbed through the test platform.
-    let logical_w = (width as f32 / TEST_WINDOW_SCALE_FACTOR).max(1.0);
-    let logical_h = (height as f32 / TEST_WINDOW_SCALE_FACTOR).max(1.0);
+    let logical_w = (width as f32).max(1.0);
+    let logical_h = (height as f32).max(1.0);
     let window_size: Size<Pixels> = size(px(logical_w), px(logical_h));
 
     // The platform's text system is what `MacTextSystem` (on macOS) /
@@ -247,18 +272,42 @@ fn render_to_rgba(width: u32, height: u32, scale: f32) -> Result<Vec<u8>, ErrorC
 
     // Capture: `capture_screenshot` is the public surface that wraps
     // `app.update_window(window, |_, window, _| window.render_to_image())`.
-    // The returned `RgbaImage` is RGBA8888 non-premultiplied sRGB.
+    // The returned `RgbaImage` is RGBA8888 non-premultiplied sRGB. With
+    // a logical window of (W, H) and the test platform's hard-coded
+    // scale_factor of 2.0, the captured image is (2W, 2H).
     let image = cx
         .capture_screenshot(window)
         .map_err(|_| ErrorCode::CaptureFailed)?;
 
+    let expected_scale = TEST_WINDOW_SCALE_FACTOR as u32;
+    let expected_capture_w = width.saturating_mul(expected_scale);
+    let expected_capture_h = height.saturating_mul(expected_scale);
     let actual_w = image.width();
     let actual_h = image.height();
-    if actual_w != width || actual_h != height {
+
+    // If the captured image dimensions match the requested output
+    // exactly (e.g. a future GPUI revision changes the test platform
+    // scale_factor to 1.0), skip the downsample step.
+    if actual_w == width && actual_h == height {
+        return Ok(image.into_raw());
+    }
+
+    // Otherwise verify the capture matches `request × scale_factor`,
+    // then downsample by `scale_factor` to produce the (W, H) buffer
+    // the caller asked for. A triangle filter (bilinear-equivalent)
+    // gives clean text anti-aliasing without the blur of Lanczos.
+    if actual_w != expected_capture_w || actual_h != expected_capture_h {
         return Err(ErrorCode::SizeMismatch);
     }
 
-    Ok(image.into_raw())
+    let downsampled = image::imageops::resize(
+        &image,
+        width,
+        height,
+        FilterType::Triangle,
+    );
+
+    Ok(downsampled.into_raw())
 }
 
 /// Refresh the window after first opening so the deferred draw produces
