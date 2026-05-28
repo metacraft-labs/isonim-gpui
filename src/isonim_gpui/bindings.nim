@@ -6,17 +6,34 @@
 ## 40 exported symbols total:
 ##   13 RendererBackend + window management + tree inspection + utilities
 
+import std/os
+
 type
   GpuiElement* = pointer
     ## Opaque handle to a GPUI element managed by the Rust shim.
     ## The actual layout is a Rust struct; Nim only holds a pointer to it.
 
+const shimTargetDir = currentSourcePath().parentDir.parentDir.parentDir /
+  "rust" / "target" / "debug"
+
 when defined(macosx):
-  const shimLib = "libgpui_nim_shim.dylib"
+  const localShimLib = shimTargetDir / "libgpui_nim_shim.dylib"
+  when fileExists(localShimLib):
+    const shimLib = localShimLib
+  else:
+    const shimLib = "libgpui_nim_shim.dylib"
 elif defined(windows):
-  const shimLib = "gpui_nim_shim.dll"
+  const localShimLib = shimTargetDir / "gpui_nim_shim.dll"
+  when fileExists(localShimLib):
+    const shimLib = localShimLib
+  else:
+    const shimLib = "gpui_nim_shim.dll"
 else:
-  const shimLib = "libgpui_nim_shim.so"
+  const localShimLib = shimTargetDir / "libgpui_nim_shim.so"
+  when fileExists(localShimLib):
+    const shimLib = localShimLib
+  else:
+    const shimLib = "libgpui_nim_shim.so"
 
 # --- Callback types ---
 

@@ -59,17 +59,34 @@ cat > "$FINAL_OUTPUT" << 'HEADER'
 ##   - GpuiElement is treated as an opaque pointer (not a struct with fields)
 ##   - Unnecessary NodeId type is removed
 
+import std/os
+
 type
   GpuiElementObj* {.importc: "GpuiElement", header: "".} = object
   GpuiElement* = ptr GpuiElementObj
     ## Opaque handle to a GPUI element managed by the Rust shim.
 
+const shimTargetDir = currentSourcePath().parentDir.parentDir.parentDir /
+  "rust" / "target" / "debug"
+
 when defined(macosx):
-  const shimLib = "libgpui_nim_shim.dylib"
+  const localShimLib = shimTargetDir / "libgpui_nim_shim.dylib"
+  when fileExists(localShimLib):
+    const shimLib = localShimLib
+  else:
+    const shimLib = "libgpui_nim_shim.dylib"
 elif defined(windows):
-  const shimLib = "gpui_nim_shim.dll"
+  const localShimLib = shimTargetDir / "gpui_nim_shim.dll"
+  when fileExists(localShimLib):
+    const shimLib = localShimLib
+  else:
+    const shimLib = "gpui_nim_shim.dll"
 else:
-  const shimLib = "libgpui_nim_shim.so"
+  const localShimLib = shimTargetDir / "libgpui_nim_shim.so"
+  when fileExists(localShimLib):
+    const shimLib = localShimLib
+  else:
+    const shimLib = "libgpui_nim_shim.so"
 
 HEADER
 
