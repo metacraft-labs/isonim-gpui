@@ -246,4 +246,46 @@ proc gpui_free_pixels*(p: ptr uint8; len: csize_t)
 proc gpui_set_root_element*(handle: GpuiElement)
   {.importc: "gpui_set_root_element".}
 
+# --- EMC2-M1: dedicated GPUI render thread (async API) ---
+#
+# The async API moves ``Window::render_to_image`` + the deferred-draw pump
+# off the bridge's async ``frameLoop`` thread onto a dedicated worker
+# thread that lazily constructs and reuses ``HeadlessAppContext`` across
+# frames. The bridge submits frame N+1 immediately and polls for frame
+# N-1 on the next tick; if the result is not yet ready, the bridge emits
+# the previous frame again (smoother than blocking on the synchronous
+# ~41 ms ``render_to_image`` wait).
+#
+# Token semantics:
+#   * ``gpui_render_submit_async`` returns 0 on submission failure and a
+#     non-zero monotonic token otherwise.
+#   * ``gpui_render_try_take`` consumes a token on Ready / Failed /
+#     UnknownToken; leaves it alive on Pending.
+#
+# Try-take return codes:
+#   *  0 (TakeReady)       — render complete; ptr/len carry RGBA bytes.
+#                            Release via ``gpui_free_pixels``.
+#   *  1 (TakePending)     — still in flight; ptr/len are (nil, 0).
+#   * -1 to -6             — negation of the per-render ``ErrorCode``
+#                            (1=InvalidArgs … 6=Panic). Token consumed.
+#   * -100 (UnknownToken)  — token never submitted, already taken, or
+#                            expired. Token consumed.
+
+proc gpui_render_submit_async*(width: cuint; height: cuint;
+                                scale: cfloat): cuint
+  {.importc: "gpui_render_submit_async".}
+
+proc gpui_render_try_take*(token: cuint;
+                            outPtr: ptr ptr uint8;
+                            outLen: ptr csize_t): cint
+  {.importc: "gpui_render_try_take".}
+
+proc gpui_render_cancel*(token: cuint)
+  {.importc: "gpui_render_cancel".}
+
 {.pop.}
+
+const
+  GpuiRenderTakeReady*        = cint(0)
+  GpuiRenderTakePending*      = cint(1)
+  GpuiRenderTakeUnknownToken* = cint(-100)

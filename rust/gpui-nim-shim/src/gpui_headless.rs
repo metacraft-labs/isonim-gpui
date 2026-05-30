@@ -30,7 +30,12 @@
 //! conversion is needed; the bytes can be fed directly into a browser
 //! `canvas.putImageData(ImageData(...))` call.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    mpsc, Arc, LazyLock, Mutex,
+};
+use std::thread;
 
 use gpui::{px, size, AnyWindowHandle, App, AppContext, HeadlessAppContext, Pixels, Size, Window};
 use gpui_platform::{current_headless_renderer, current_platform};
@@ -320,4 +325,441 @@ fn refresh_window(cx: &mut HeadlessAppContext, window: AnyWindowHandle) {
     let _ = cx.update_window(window, |_, window: &mut Window, _| {
         window.refresh();
     });
+}
+
+// ===========================================================================
+// EMC2-M1: dedicated GPUI render thread (Approach 1).
+// ===========================================================================
+//
+// Background
+// ----------
+//
+// EMC-M1 audit measured ``gpui_render_to_pixels`` at 41-43 ms median per
+// frame on the bridge's async ``frameLoop`` thread. The bridge's
+// per-connection frame loop is single-threaded and yields only at FFI
+// boundaries that internally call ``await sendBinary`` etc., so the
+// entire 41 ms shim body blocks the loop and prevents the matrix's
+// 50 ms inter-frame gate from being met.
+//
+// ``HeadlessAppContext`` from Zed is built on top of ``Rc<AppCell>``
+// (``RefCell``-backed, ``!Send``, ``!Sync``). That forbids moving an
+// existing context across threads — but it does NOT forbid creating
+// the context on a dedicated worker thread and keeping all subsequent
+// interaction on that same thread. The ``TREE`` shadow tree is a
+// ``Mutex<Tree>`` (Send + Sync), so the worker thread can read it
+// freely; the FFI surface is the only thing that needs marshalling.
+//
+// Design
+// ------
+//
+// The first call to ``gpui_render_submit_async`` lazily spawns a
+// **single, long-lived worker thread**. The worker:
+//
+//   1. Constructs ``HeadlessAppContext::with_platform`` **once**
+//      (EMC-M1's biggest single cost item — paid once instead of per
+//      frame).
+//   2. Opens a window at the first-requested size and keeps it open
+//      across frames; resizes (reopens) on demand when the requested
+//      ``(width, height)`` changes. Window reuse skips the pump-from-
+//      scratch cost; consecutive same-size requests just refresh and
+//      re-capture.
+//   3. Loops on a ``mpsc::Receiver<RenderRequest>``: when a request
+//      arrives, runs the existing pump-refresh-pump-refresh-pump
+//      sequence then ``capture_screenshot`` + downsample. The result
+//      (Vec<u8>) is stored in a per-token slot.
+//   4. Wakes any waiter blocked on the per-token ``Condvar`` (used
+//      only by the optional ``gpui_render_wait_async`` API; the
+//      production path is non-blocking ``gpui_render_try_take``).
+//
+// FFI surface
+// -----------
+//
+//   * ``gpui_render_submit_async(w, h, scale) -> u32 token``
+//     Submits a render request and returns immediately. The token
+//     identifies the in-flight render for ``try_take``/``cancel``.
+//     A token value of 0 indicates submission failure (e.g. the
+//     worker thread is stopped); the caller should fall back.
+//
+//   * ``gpui_render_try_take(token, out_ptr, out_len) -> i32``
+//     Non-blocking; returns:
+//       * ``0`` if the render is complete and writes (ptr, len) to
+//         the out-params. The buffer is shim-owned until
+//         ``gpui_free_pixels`` returns it (same convention as the
+//         sync API).
+//       * ``1`` if the render is still in flight; out-params are
+//         set to (null, 0).
+//       * The negative of the per-render error code if the worker
+//         thread reported failure (e.g. ``-2`` for
+//         RendererUnavailable). The token is consumed in this
+//         case too.
+//       * ``-100`` if the token is unknown (already taken, never
+//         submitted, or expired).
+//
+// The Nim adapter is expected to pipeline:
+//   - Tick N: submit frame N+1 (immediate return)
+//   - Tick N: try_take frame N-1 (typically ready, sometimes not)
+//   - If not ready: emit the previous frame again (smoother than
+//     blocking the bridge loop on the 41 ms wait).
+
+/// A token-keyed slot for an in-flight render's result.
+enum RenderSlot {
+    Pending,
+    Ready(Vec<u8>),
+    Failed(ErrorCode),
+}
+
+struct WorkerState {
+    /// Per-token result slots. The worker fills entries here when a
+    /// render completes; ``gpui_render_try_take`` drains them.
+    slots: Mutex<HashMap<u32, RenderSlot>>,
+    /// Channel sender. ``None`` after the worker thread has been
+    /// asked to shut down (used by tests; the production path
+    /// keeps the worker alive for the process lifetime).
+    sender: Mutex<Option<mpsc::Sender<RenderRequest>>>,
+    /// Monotonic token counter. Zero is reserved for "submission
+    /// failed".
+    next_token: AtomicU32,
+}
+
+struct RenderRequest {
+    token: u32,
+    width: u32,
+    height: u32,
+    scale: f32,
+}
+
+static WORKER: LazyLock<Arc<WorkerState>> = LazyLock::new(|| {
+    let state = Arc::new(WorkerState {
+        slots: Mutex::new(HashMap::new()),
+        sender: Mutex::new(None),
+        next_token: AtomicU32::new(1),
+    });
+    spawn_worker(state.clone());
+    state
+});
+
+fn spawn_worker(state: Arc<WorkerState>) {
+    let (tx, rx) = mpsc::channel::<RenderRequest>();
+    {
+        let mut sender_slot = state.sender.lock().unwrap_or_else(|p| p.into_inner());
+        *sender_slot = Some(tx);
+    }
+    // Dedicated GPUI render thread. The thread lives for the process
+    // lifetime — there is no shutdown path in production. Tests that
+    // need to inspect worker state use the slot APIs directly.
+    let state_for_thread = state.clone();
+    thread::Builder::new()
+        .name("isonim-gpui-render".into())
+        .spawn(move || worker_main(state_for_thread, rx))
+        .expect("failed to spawn isonim-gpui-render worker thread");
+}
+
+/// Worker-thread main loop. Owns the long-lived ``HeadlessAppContext``
+/// and the cached ``AnyWindowHandle`` across frames. Drains the
+/// request channel forever; terminates only when the sender side is
+/// dropped (the static ``WORKER`` never drops in production, so this
+/// is effectively process-lifetime).
+///
+/// **Reuse strategy.** EMC-M1 audit found that ``HeadlessAppContext::
+/// with_platform`` is the single most expensive line in the
+/// synchronous render path (~30 ms of the 41 ms median, primarily
+/// font-system + Metal renderer-factory init). Caching the context
+/// across frames eliminates that cost from every subsequent render.
+/// The window is also cached: same-size requests reuse it, so the
+/// expensive ``open_window`` + first-frame pump pays once per
+/// (W, H) pair. A resize closes the prior window before opening a
+/// fresh one at the new size, preserving correctness.
+///
+/// **Render panic isolation.** Each request runs inside
+/// ``catch_unwind`` so a panic in one render does not poison the
+/// worker thread. After a panic the cached context is torn down;
+/// the next request rebuilds it from scratch.
+fn worker_main(state: Arc<WorkerState>, rx: mpsc::Receiver<RenderRequest>) {
+    let mut cached: Option<WorkerCtx> = None;
+
+    while let Ok(req) = rx.recv() {
+        let token = req.token;
+
+        // Validate args at the front of the request (mirrors the
+        // checks ``gpui_render_to_pixels`` does on the bridge
+        // thread).
+        if req.width == 0
+            || req.height == 0
+            || req.width > MAX_DIMENSION
+            || req.height > MAX_DIMENSION
+            || !req.scale.is_finite()
+            || req.scale <= 0.0
+        {
+            publish_failure(&state, token, ErrorCode::InvalidArgs);
+            continue;
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            render_via_cached(&mut cached, req.width, req.height)
+        }));
+        match result {
+            Ok(Ok(bytes)) => publish_success(&state, token, bytes),
+            Ok(Err(code)) => {
+                // Tear down on RendererUnavailable / CaptureFailed
+                // so the next request retries from scratch — the
+                // failure may be transient (e.g. a GPU eviction).
+                cached = None;
+                publish_failure(&state, token, code);
+            }
+            Err(_) => {
+                cached = None;
+                publish_failure(&state, token, ErrorCode::Panic);
+            }
+        }
+    }
+}
+
+/// Per-worker cached render context. Holds the long-lived
+/// ``HeadlessAppContext`` plus the most-recently-opened window's
+/// dimensions and handle.
+struct WorkerCtx {
+    cx: HeadlessAppContext,
+    window_size: Option<(u32, u32)>,
+    window: Option<AnyWindowHandle>,
+}
+
+/// Render via the cached context if available; lazily construct on
+/// first call. Reopens the window on size change.
+fn render_via_cached(
+    cached: &mut Option<WorkerCtx>,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, ErrorCode> {
+    if cached.is_none() {
+        if current_headless_renderer().is_none() {
+            return Err(ErrorCode::RendererUnavailable);
+        }
+        let platform = current_platform(true);
+        let text_system = platform.text_system();
+        let cx = HeadlessAppContext::with_platform(
+            text_system,
+            Arc::new(()),
+            || current_headless_renderer(),
+        );
+        *cached = Some(WorkerCtx {
+            cx,
+            window_size: None,
+            window: None,
+        });
+    }
+    let entry = cached.as_mut().expect("cached is Some after lazy init");
+
+    let need_open = match entry.window_size {
+        Some((w, h)) => w != width || h != height,
+        None => true,
+    };
+    if need_open {
+        // Close the previous window if any so the test platform's
+        // window registry doesn't accumulate stale entries.
+        if let Some(prev) = entry.window {
+            let _ = entry.cx.update_window(prev, |_, window: &mut Window, _| {
+                window.remove_window();
+            });
+            entry.cx.run_until_parked();
+        }
+        let logical_w = (width as f32).max(1.0);
+        let logical_h = (height as f32).max(1.0);
+        let window_size: Size<Pixels> = size(px(logical_w), px(logical_h));
+        let new_window: AnyWindowHandle = entry
+            .cx
+            .open_window(window_size, |_, cx: &mut App| {
+                cx.new(|_| NimRootView::new())
+            })
+            .map_err(|_| ErrorCode::WindowOpenFailed)?
+            .into();
+        // Prime the deferred-draw schedule so the first capture has
+        // content. Same pump pattern as the synchronous path.
+        entry.cx.run_until_parked();
+        refresh_window(&mut entry.cx, new_window);
+        entry.cx.run_until_parked();
+        refresh_window(&mut entry.cx, new_window);
+        entry.cx.run_until_parked();
+        entry.window = Some(new_window);
+        entry.window_size = Some((width, height));
+    }
+    let window = entry.window.expect("window is Some after open");
+
+    // On reused-window calls the tree may have mutated; re-pump so
+    // ``NimRootView::render`` re-reads the shadow tree and a fresh
+    // scene is encoded into the next capture.
+    refresh_window(&mut entry.cx, window);
+    entry.cx.run_until_parked();
+    refresh_window(&mut entry.cx, window);
+    entry.cx.run_until_parked();
+
+    let image = entry
+        .cx
+        .capture_screenshot(window)
+        .map_err(|_| ErrorCode::CaptureFailed)?;
+
+    let expected_scale = TEST_WINDOW_SCALE_FACTOR as u32;
+    let expected_capture_w = width.saturating_mul(expected_scale);
+    let expected_capture_h = height.saturating_mul(expected_scale);
+    let actual_w = image.width();
+    let actual_h = image.height();
+
+    if actual_w == width && actual_h == height {
+        return Ok(image.into_raw());
+    }
+    if actual_w != expected_capture_w || actual_h != expected_capture_h {
+        return Err(ErrorCode::SizeMismatch);
+    }
+    let downsampled =
+        image::imageops::resize(&image, width, height, FilterType::Triangle);
+    Ok(downsampled.into_raw())
+}
+
+fn publish_success(state: &WorkerState, token: u32, bytes: Vec<u8>) {
+    let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+    slots.insert(token, RenderSlot::Ready(bytes));
+}
+
+fn publish_failure(state: &WorkerState, token: u32, code: ErrorCode) {
+    let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+    slots.insert(token, RenderSlot::Failed(code));
+}
+
+/// Submit a render request to the dedicated GPUI render thread.
+///
+/// Returns a non-zero token on success; the caller can poll for the
+/// result via [`gpui_render_try_take`]. Returns ``0`` if the worker
+/// thread is not running or the request channel is closed (callers
+/// should fall back to the synchronous [`gpui_render_to_pixels`] in
+/// that rare event).
+///
+/// This function does not block — it places the request on a channel
+/// and returns immediately. The 41 ms render cost is paid on the
+/// dedicated worker thread, freeing the bridge's async ``frameLoop``
+/// to continue ticking.
+#[no_mangle]
+pub extern "C" fn gpui_render_submit_async(width: u32, height: u32, scale: f32) -> u32 {
+    let state = WORKER.clone();
+    let token = state.next_token.fetch_add(1, Ordering::AcqRel);
+    // Reserve token 0 for failure; if the counter wraps, skip 0.
+    let token = if token == 0 {
+        state.next_token.fetch_add(1, Ordering::AcqRel)
+    } else {
+        token
+    };
+    // Mark the slot Pending so try_take can distinguish "in flight"
+    // from "unknown token".
+    {
+        let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+        slots.insert(token, RenderSlot::Pending);
+    }
+    let sender = {
+        let guard = state.sender.lock().unwrap_or_else(|p| p.into_inner());
+        guard.clone()
+    };
+    match sender {
+        Some(s) => {
+            if s.send(RenderRequest {
+                token,
+                width,
+                height,
+                scale,
+            })
+            .is_err()
+            {
+                // Receiver dropped — clear the reserved slot and
+                // report submission failure.
+                let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+                slots.remove(&token);
+                return 0;
+            }
+            token
+        }
+        None => {
+            let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+            slots.remove(&token);
+            0
+        }
+    }
+}
+
+/// Per-call result code for [`gpui_render_try_take`]. ``Ready = 0``
+/// matches the sync API's success convention; ``Pending = 1`` is a
+/// non-error retry signal; negative values are the negation of the
+/// per-render [`ErrorCode`] that the worker reported, plus a
+/// sentinel ``-100`` for unknown tokens.
+const TAKE_READY: i32 = 0;
+const TAKE_PENDING: i32 = 1;
+const TAKE_UNKNOWN_TOKEN: i32 = -100;
+
+/// Non-blocking poll for an in-flight render's bytes.
+///
+/// Returns:
+///   * ``0``  — render complete; ``*out_ptr`` + ``*out_len`` carry
+///     the RGBA buffer (shim-owned; release via [`gpui_free_pixels`]).
+///     The token is consumed.
+///   * ``1``  — render still in flight; ``*out_ptr`` / ``*out_len``
+///     are set to (null, 0). The token remains valid; the caller
+///     should poll again on the next tick.
+///   * ``-N``  — render failed with [`ErrorCode`] N; the token is
+///     consumed.
+///   * ``-100`` — unknown token (never submitted, already taken,
+///     or expired); the token is consumed.
+///
+/// # Safety
+///
+/// ``out_ptr`` and ``out_len`` MUST be non-null and point to writable
+/// storage. On a non-zero (or pending) return code, the caller MUST
+/// NOT read or free the output buffer.
+#[no_mangle]
+pub extern "C" fn gpui_render_try_take(
+    token: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if out_ptr.is_null() || out_len.is_null() {
+        return -(ErrorCode::InvalidArgs as i32);
+    }
+    unsafe {
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
+    }
+    if token == 0 {
+        return TAKE_UNKNOWN_TOKEN;
+    }
+    let state = WORKER.clone();
+    let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+    match slots.remove(&token) {
+        None => TAKE_UNKNOWN_TOKEN,
+        Some(RenderSlot::Pending) => {
+            // Re-insert so the next poll keeps the token alive.
+            slots.insert(token, RenderSlot::Pending);
+            TAKE_PENDING
+        }
+        Some(RenderSlot::Failed(code)) => -(code as i32),
+        Some(RenderSlot::Ready(bytes)) => {
+            let len = bytes.len();
+            let boxed: Box<[u8]> = bytes.into_boxed_slice();
+            let ptr = Box::leak(boxed).as_mut_ptr();
+            unsafe {
+                *out_ptr = ptr;
+                *out_len = len;
+            }
+            TAKE_READY
+        }
+    }
+}
+
+/// Drop a pending or completed token without taking the bytes. Tests
+/// and edge-case Nim cleanup paths use this to avoid leaking slot
+/// entries when a connection terminates with renders in flight.
+#[no_mangle]
+pub extern "C" fn gpui_render_cancel(token: u32) {
+    if token == 0 {
+        return;
+    }
+    let state = WORKER.clone();
+    let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(RenderSlot::Ready(_bytes)) = slots.remove(&token) {
+        // Bytes drop here, freeing the Vec. No leak.
+    }
 }
