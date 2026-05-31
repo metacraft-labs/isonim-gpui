@@ -19,7 +19,7 @@ use std::ffi::CString;
 use std::time::{Duration, Instant};
 
 use gpui_nim_shim::gpui_headless::{
-    gpui_free_pixels, gpui_render_cancel, gpui_render_submit_async,
+    gpui_bump_generation, gpui_free_pixels, gpui_render_cancel, gpui_render_submit_async,
     gpui_render_try_take,
 };
 use gpui_nim_shim::tree::{Node, NodeId};
@@ -231,4 +231,67 @@ fn async_try_take_unknown_token() {
     // An arbitrary high token that was never issued is also unknown.
     let rc = gpui_render_try_take(0xDEAD_BEEF, &mut p, &mut l);
     assert_eq!(rc, -100);
+}
+
+/// ERV-M3: a token submitted BEFORE ``gpui_bump_generation`` must
+/// surface as ``TAKE_STALE`` (return code 2) instead of the
+/// previously-rendered bytes — so a story-switch can't paint the
+/// prior story's pixels.
+///
+/// The Pending branch is exercised here because the production
+/// race is "submit, switch story, take" — the take observes a
+/// Pending or Ready slot whose snapshot is older than the live
+/// generation. We assert on the Pending path because it does not
+/// require the headless renderer to actually complete a frame
+/// (so the test passes on non-macOS hosts that bail with
+/// RendererUnavailable inside the worker).
+#[test]
+#[serial]
+fn stale_token_after_bump_returns_stale_sentinel() {
+    // Submit a render, then bump the generation BEFORE polling.
+    // The slot is most likely still Pending; the try_take must
+    // return TAKE_STALE = 2.
+    let token = gpui_render_submit_async(64, 48, 1.0);
+    assert_ne!(token, 0);
+
+    let new_gen = gpui_bump_generation();
+    assert!(new_gen >= 1, "bump must return a monotonically increasing value");
+
+    let mut out_ptr: *mut u8 = std::ptr::null_mut();
+    let mut out_len: usize = 0;
+    let rc = gpui_render_try_take(token, &mut out_ptr, &mut out_len);
+    // The slot was submitted at the prior generation, so try_take
+    // either:
+    //   * observes Pending with stale gen   → TAKE_STALE (2)
+    //   * observes Ready with stale gen     → TAKE_STALE (2)
+    //   * observes Failed with stale gen    → TAKE_STALE (2)
+    // (The non-stale Pending value is impossible because the bump
+    // happened before this poll; the worker captured the prior gen
+    // at submit time.)
+    assert_eq!(
+        rc, 2,
+        "stale token must return TAKE_STALE (2); got {}",
+        rc
+    );
+    assert!(out_ptr.is_null());
+    assert_eq!(out_len, 0);
+
+    // Token must be consumed — a second poll returns UnknownToken.
+    let rc = gpui_render_try_take(token, &mut out_ptr, &mut out_len);
+    assert_eq!(rc, -100, "stale-consumed token must be unknown on re-poll");
+}
+
+/// ERV-M3: ``gpui_bump_generation`` is monotonic and the value it
+/// returns is observable from a subsequent submit. This is the
+/// happens-before edge the staleness check depends on.
+#[test]
+#[serial]
+fn bump_generation_is_monotonic() {
+    let g0 = gpui_bump_generation();
+    let g1 = gpui_bump_generation();
+    let g2 = gpui_bump_generation();
+    assert!(g1 > g0, "bump must increase: {} -> {}", g0, g1);
+    assert!(g2 > g1, "bump must increase: {} -> {}", g1, g2);
+    assert_eq!(g1, g0 + 1);
+    assert_eq!(g2, g1 + 1);
 }

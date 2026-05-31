@@ -7,6 +7,32 @@
 //! (test-support-gated) into an off-screen `image::RgbaImage` rather than
 //! presenting to an OS swapchain.
 //!
+//! ## ERV-M3: story-generation guard against stale in-flight renders
+//!
+//! The async worker thread holds a long-lived `HeadlessAppContext` and
+//! reuses an `AnyWindowHandle` across frames. When the bridge mutates
+//! the shadow tree because the user picked a new story via
+//! `select-story`, the worker may already have an in-flight render
+//! submitted against the prior tree state. That render completes and
+//! its bytes would be returned to the bridge — painting the wrong
+//! story for a tick or two before the next render lands.
+//!
+//! The guard is a process-wide `AtomicU64` `current_generation`. Each
+//! `gpui_render_submit_async` snapshots the value at submit time into
+//! the per-token slot. The Nim adapter calls
+//! `gpui_bump_generation()` BEFORE mutating the GPUI tree (i.e. inside
+//! its `select-story` handler). Subsequent `gpui_render_try_take`
+//! calls compare the slot's snapshot against the live counter; if the
+//! snapshot is older the bytes are freed and a `TAKE_STALE` sentinel
+//! is returned. The bridge treats `TAKE_STALE` like Pending (no frame
+//! to paint this tick) and submits a fresh request whose snapshot is
+//! current.
+//!
+//! Single shared generation suffices because the worker is a single
+//! global; there is no per-connection or per-handle generation
+//! counter (the FFI surface has no handle parameter). Future revisions
+//! that introduce per-connection workers can shard the counter then.
+//!
 //! ## Production-path preservation
 //!
 //! This module is behind the `gpui-headless` Cargo feature and does not
@@ -32,7 +58,7 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
     mpsc, Arc, LazyLock, Mutex,
 };
 use std::thread;
@@ -401,11 +427,15 @@ fn refresh_window(cx: &mut HeadlessAppContext, window: AnyWindowHandle) {
 //   - If not ready: emit the previous frame again (smoother than
 //     blocking the bridge loop on the 41 ms wait).
 
-/// A token-keyed slot for an in-flight render's result.
+/// A token-keyed slot for an in-flight render's result. Each variant
+/// carries the **generation** the request was submitted at, so a
+/// ``try_take`` against a slot whose generation is older than the
+/// live ``current_generation`` can detect the staleness and discard
+/// the bytes (ERV-M3).
 enum RenderSlot {
-    Pending,
-    Ready(Vec<u8>),
-    Failed(ErrorCode),
+    Pending { generation: u64 },
+    Ready { generation: u64, bytes: Vec<u8> },
+    Failed { generation: u64, code: ErrorCode },
 }
 
 struct WorkerState {
@@ -419,6 +449,13 @@ struct WorkerState {
     /// Monotonic token counter. Zero is reserved for "submission
     /// failed".
     next_token: AtomicU32,
+    /// Monotonic story / tree generation counter. Bumped by
+    /// ``gpui_bump_generation`` (called by the Nim adapter's
+    /// ``select-story`` handler BEFORE the GPUI shadow tree mutates).
+    /// ``gpui_render_submit_async`` snapshots this into the per-token
+    /// slot; ``gpui_render_try_take`` rejects slots whose snapshot
+    /// is older than the live value. ERV-M3.
+    current_generation: AtomicU64,
 }
 
 struct RenderRequest {
@@ -426,6 +463,12 @@ struct RenderRequest {
     width: u32,
     height: u32,
     scale: f32,
+    /// Snapshot of ``WorkerState::current_generation`` taken at
+    /// submit time. Worker echoes it back into the completed slot so
+    /// ``try_take`` can compare against the live counter and detect
+    /// stale frames produced for a tree state that has since been
+    /// superseded by a story-switch.
+    generation: u64,
 }
 
 static WORKER: LazyLock<Arc<WorkerState>> = LazyLock::new(|| {
@@ -433,6 +476,7 @@ static WORKER: LazyLock<Arc<WorkerState>> = LazyLock::new(|| {
         slots: Mutex::new(HashMap::new()),
         sender: Mutex::new(None),
         next_token: AtomicU32::new(1),
+        current_generation: AtomicU64::new(0),
     });
     spawn_worker(state.clone());
     state
@@ -479,6 +523,7 @@ fn worker_main(state: Arc<WorkerState>, rx: mpsc::Receiver<RenderRequest>) {
 
     while let Ok(req) = rx.recv() {
         let token = req.token;
+        let generation = req.generation;
 
         // Validate args at the front of the request (mirrors the
         // checks ``gpui_render_to_pixels`` does on the bridge
@@ -490,7 +535,7 @@ fn worker_main(state: Arc<WorkerState>, rx: mpsc::Receiver<RenderRequest>) {
             || !req.scale.is_finite()
             || req.scale <= 0.0
         {
-            publish_failure(&state, token, ErrorCode::InvalidArgs);
+            publish_failure(&state, token, generation, ErrorCode::InvalidArgs);
             continue;
         }
 
@@ -498,17 +543,17 @@ fn worker_main(state: Arc<WorkerState>, rx: mpsc::Receiver<RenderRequest>) {
             render_via_cached(&mut cached, req.width, req.height)
         }));
         match result {
-            Ok(Ok(bytes)) => publish_success(&state, token, bytes),
+            Ok(Ok(bytes)) => publish_success(&state, token, generation, bytes),
             Ok(Err(code)) => {
                 // Tear down on RendererUnavailable / CaptureFailed
                 // so the next request retries from scratch — the
                 // failure may be transient (e.g. a GPU eviction).
                 cached = None;
-                publish_failure(&state, token, code);
+                publish_failure(&state, token, generation, code);
             }
             Err(_) => {
                 cached = None;
-                publish_failure(&state, token, ErrorCode::Panic);
+                publish_failure(&state, token, generation, ErrorCode::Panic);
             }
         }
     }
@@ -614,14 +659,14 @@ fn render_via_cached(
     Ok(downsampled.into_raw())
 }
 
-fn publish_success(state: &WorkerState, token: u32, bytes: Vec<u8>) {
+fn publish_success(state: &WorkerState, token: u32, generation: u64, bytes: Vec<u8>) {
     let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
-    slots.insert(token, RenderSlot::Ready(bytes));
+    slots.insert(token, RenderSlot::Ready { generation, bytes });
 }
 
-fn publish_failure(state: &WorkerState, token: u32, code: ErrorCode) {
+fn publish_failure(state: &WorkerState, token: u32, generation: u64, code: ErrorCode) {
     let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
-    slots.insert(token, RenderSlot::Failed(code));
+    slots.insert(token, RenderSlot::Failed { generation, code });
 }
 
 /// Submit a render request to the dedicated GPUI render thread.
@@ -646,11 +691,21 @@ pub extern "C" fn gpui_render_submit_async(width: u32, height: u32, scale: f32) 
     } else {
         token
     };
+    // ERV-M3: snapshot the live story generation at submit time. The
+    // worker echoes this back into the completed slot so
+    // ``gpui_render_try_take`` can compare against the live counter
+    // and drop bytes rendered against a tree state that has since
+    // been superseded by a story-switch. ``Acquire`` pairs with the
+    // ``Release`` ordering in ``gpui_bump_generation`` so a submit
+    // that happens-after a bump observes the new generation.
+    let generation = state.current_generation.load(Ordering::Acquire);
     // Mark the slot Pending so try_take can distinguish "in flight"
-    // from "unknown token".
+    // from "unknown token". Carry the generation through so a stale
+    // poll on the Pending state (before the worker has rendered)
+    // is still detectable.
     {
         let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
-        slots.insert(token, RenderSlot::Pending);
+        slots.insert(token, RenderSlot::Pending { generation });
     }
     let sender = {
         let guard = state.sender.lock().unwrap_or_else(|p| p.into_inner());
@@ -663,6 +718,7 @@ pub extern "C" fn gpui_render_submit_async(width: u32, height: u32, scale: f32) 
                 width,
                 height,
                 scale,
+                generation,
             })
             .is_err()
             {
@@ -682,13 +738,43 @@ pub extern "C" fn gpui_render_submit_async(width: u32, height: u32, scale: f32) 
     }
 }
 
+/// ERV-M3: bump the shared story-generation counter and return the
+/// new value.
+///
+/// Called by the Nim adapter's ``select-story`` handler BEFORE the
+/// GPUI shadow tree mutates. Any render request whose snapshot
+/// generation predates the bump is considered stale; its bytes are
+/// discarded by ``gpui_render_try_take`` and the bridge submits a
+/// fresh render against the new tree state instead of painting the
+/// previous story.
+///
+/// Uses ``AcqRel`` so the bump synchronises-with the ``Acquire``
+/// load in ``gpui_render_submit_async``: a subsequent submit on
+/// any thread is guaranteed to observe the new generation.
+///
+/// The single global counter matches the single global worker; if
+/// per-connection workers are ever introduced this will need to
+/// shard. The current FFI surface has no handle parameter, so the
+/// bump is process-wide.
+#[no_mangle]
+pub extern "C" fn gpui_bump_generation() -> u64 {
+    let state = WORKER.clone();
+    // ``fetch_add`` returns the prior value; add one to obtain the
+    // post-bump generation that submits will observe.
+    state.current_generation.fetch_add(1, Ordering::AcqRel) + 1
+}
+
 /// Per-call result code for [`gpui_render_try_take`]. ``Ready = 0``
 /// matches the sync API's success convention; ``Pending = 1`` is a
-/// non-error retry signal; negative values are the negation of the
-/// per-render [`ErrorCode`] that the worker reported, plus a
-/// sentinel ``-100`` for unknown tokens.
+/// non-error retry signal; ``Stale = 2`` (ERV-M3) means the bytes
+/// were rendered against a tree state superseded by a later
+/// ``gpui_bump_generation`` call (e.g. a story-switch) and were
+/// discarded; negative values are the negation of the per-render
+/// [`ErrorCode`] that the worker reported, plus a sentinel
+/// ``-100`` for unknown tokens.
 const TAKE_READY: i32 = 0;
 const TAKE_PENDING: i32 = 1;
+const TAKE_STALE: i32 = 2;
 const TAKE_UNKNOWN_TOKEN: i32 = -100;
 
 /// Non-blocking poll for an in-flight render's bytes.
@@ -700,6 +786,13 @@ const TAKE_UNKNOWN_TOKEN: i32 = -100;
 ///   * ``1``  — render still in flight; ``*out_ptr`` / ``*out_len``
 ///     are set to (null, 0). The token remains valid; the caller
 ///     should poll again on the next tick.
+///   * ``2``  — ERV-M3: the slot was either Pending or Ready but
+///     its captured generation predates the current generation
+///     (a story-switch happened after submit). The bytes (if any)
+///     were freed; the token is consumed. ``*out_ptr`` /
+///     ``*out_len`` are set to (null, 0). The caller should treat
+///     this exactly like Pending — submit a fresh render against
+///     the new tree state instead of painting the stale frame.
 ///   * ``-N``  — render failed with [`ErrorCode`] N; the token is
 ///     consumed.
 ///   * ``-100`` — unknown token (never submitted, already taken,
@@ -727,24 +820,58 @@ pub extern "C" fn gpui_render_try_take(
         return TAKE_UNKNOWN_TOKEN;
     }
     let state = WORKER.clone();
+    // Snapshot the live generation OUTSIDE the slots lock so the
+    // comparison below is free of cross-mutex contention. ``Acquire``
+    // pairs with the ``Release`` half of ``fetch_add(_, AcqRel)``
+    // inside ``gpui_bump_generation``.
+    let live_generation = state.current_generation.load(Ordering::Acquire);
     let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
     match slots.remove(&token) {
         None => TAKE_UNKNOWN_TOKEN,
-        Some(RenderSlot::Pending) => {
-            // Re-insert so the next poll keeps the token alive.
-            slots.insert(token, RenderSlot::Pending);
-            TAKE_PENDING
-        }
-        Some(RenderSlot::Failed(code)) => -(code as i32),
-        Some(RenderSlot::Ready(bytes)) => {
-            let len = bytes.len();
-            let boxed: Box<[u8]> = bytes.into_boxed_slice();
-            let ptr = Box::leak(boxed).as_mut_ptr();
-            unsafe {
-                *out_ptr = ptr;
-                *out_len = len;
+        Some(RenderSlot::Pending { generation }) => {
+            if generation < live_generation {
+                // ERV-M3: token was submitted before the most recent
+                // story-switch. Consume it (do NOT re-insert) — the
+                // worker will eventually publish Ready bytes against
+                // this token, but those bytes are also stale; we
+                // tolerate the orphan slot entry until the worker
+                // fills it (we re-key by token, so future submits
+                // get fresh tokens; this slot just overwrites with
+                // stale Ready and is collected on next mismatch, or
+                // never read at all).
+                TAKE_STALE
+            } else {
+                // Re-insert so the next poll keeps the token alive.
+                slots.insert(token, RenderSlot::Pending { generation });
+                TAKE_PENDING
             }
-            TAKE_READY
+        }
+        Some(RenderSlot::Failed { generation, code }) => {
+            if generation < live_generation {
+                // Drop the stale failure too — the caller would
+                // otherwise latch the async path off on a failure
+                // that the bumped generation has already invalidated.
+                TAKE_STALE
+            } else {
+                -(code as i32)
+            }
+        }
+        Some(RenderSlot::Ready { generation, bytes }) => {
+            if generation < live_generation {
+                // Bytes are stale. ``bytes`` (a ``Vec<u8>``) drops
+                // here, freeing the allocation. No leak.
+                drop(bytes);
+                TAKE_STALE
+            } else {
+                let len = bytes.len();
+                let boxed: Box<[u8]> = bytes.into_boxed_slice();
+                let ptr = Box::leak(boxed).as_mut_ptr();
+                unsafe {
+                    *out_ptr = ptr;
+                    *out_len = len;
+                }
+                TAKE_READY
+            }
         }
     }
 }
@@ -759,7 +886,9 @@ pub extern "C" fn gpui_render_cancel(token: u32) {
     }
     let state = WORKER.clone();
     let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(RenderSlot::Ready(_bytes)) = slots.remove(&token) {
-        // Bytes drop here, freeing the Vec. No leak.
-    }
+    // ``remove`` drops whichever ``RenderSlot`` variant was stored —
+    // ``Ready { bytes, .. }`` drops the ``Vec<u8>`` and frees the
+    // allocation; ``Pending`` / ``Failed`` carry no heap data. No
+    // leak on any branch.
+    let _ = slots.remove(&token);
 }

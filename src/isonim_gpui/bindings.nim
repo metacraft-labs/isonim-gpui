@@ -283,9 +283,30 @@ proc gpui_render_try_take*(token: cuint;
 proc gpui_render_cancel*(token: cuint)
   {.importc: "gpui_render_cancel".}
 
+# ERV-M3: story-generation guard.
+#
+# Bump the shared story / tree generation counter inside the shim
+# BEFORE mutating the GPUI shadow tree (i.e. inside the Nim
+# adapter's ``select-story`` handler). Render requests submitted
+# at an earlier generation are dropped by ``gpui_render_try_take``
+# with the new ``GpuiRenderTakeStale`` (2) sentinel — preventing
+# the prior story's pixels from being painted after the switch.
+#
+# Returns the new (post-bump) generation value. No handle parameter:
+# the shim's render worker is a single global so the counter is
+# process-wide.
+proc gpui_bump_generation*(): uint64
+  {.importc: "gpui_bump_generation".}
+
 {.pop.}
 
 const
   GpuiRenderTakeReady*        = cint(0)
   GpuiRenderTakePending*      = cint(1)
+  GpuiRenderTakeStale*        = cint(2)
+    ## ERV-M3: the in-flight render was submitted at an older
+    ## generation (a story-switch bumped the counter after
+    ## ``gpui_render_submit_async`` snapshotted it). Bytes were
+    ## freed by the shim; the token is consumed. Treat like
+    ## Pending — submit a fresh render against the current tree.
   GpuiRenderTakeUnknownToken* = cint(-100)
