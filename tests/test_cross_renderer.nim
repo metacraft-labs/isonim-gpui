@@ -15,7 +15,7 @@ import std/tables
 
 # IsoNim renderers
 import isonim/testing/mock_dom
-import isonim/renderers/terminal
+import isonim/renderers/terminal_demo as terminal
 
 # IsoNim reactive core
 import isonim/core/[signals, computation, owner]
