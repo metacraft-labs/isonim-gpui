@@ -3,7 +3,11 @@
 ## These map 1:1 to the extern "C" functions exported by
 ## rust/gpui-nim-shim/src/lib.rs.
 ##
-## 40 exported symbols total:
+## The symbol count is NOT written down here. It is asserted, against the
+## Rust source, by `tools/check_bindings.sh` (which both sides run in CI)
+## and by `tests/test_bindings.nim`, so a number in a comment cannot
+## drift away from the table it describes. See PLAT-19.
+##
 ##   13 RendererBackend + window management + tree inspection + utilities
 
 import std/os
@@ -42,6 +46,14 @@ type RootBuilderCallback* = proc(root: GpuiElement) {.cdecl.}
 type ResizeCallback* = proc(width: cdouble; height: cdouble) {.cdecl.}
 type FocusCallback* = proc(focused: uint8) {.cdecl.}
 type CloseCallback* = proc(): uint8 {.cdecl.}
+
+# PLAT-19 — window-id-carrying dispatchers. One per event kind,
+# registered process-wide; the id is the first argument, so the Nim side
+# keeps an id-keyed registry instead of a fixed pool of trampolines.
+type WindowResizeDispatcher* = proc(windowId: uint32; width: cdouble;
+                                     height: cdouble) {.cdecl.}
+type WindowFocusDispatcher* = proc(windowId: uint32; focused: uint8) {.cdecl.}
+type WindowCloseDispatcher* = proc(windowId: uint32): uint8 {.cdecl.}
 
 {.push cdecl, dynlib: shimLib.}
 
@@ -188,6 +200,26 @@ proc gpui_on_focus*(window_id: uint32; callback: FocusCallback)
 
 proc gpui_on_close*(window_id: uint32; callback: CloseCallback)
   {.importc: "gpui_on_close".}
+
+# --- PLAT-19: id-carrying window lifecycle dispatch ---
+
+proc gpui_set_window_resize_dispatcher*(dispatcher: WindowResizeDispatcher)
+  {.importc: "gpui_set_window_resize_dispatcher".}
+
+proc gpui_set_window_focus_dispatcher*(dispatcher: WindowFocusDispatcher)
+  {.importc: "gpui_set_window_focus_dispatcher".}
+
+proc gpui_set_window_close_dispatcher*(dispatcher: WindowCloseDispatcher)
+  {.importc: "gpui_set_window_close_dispatcher".}
+
+proc gpui_on_resize_id*(window_id: uint32): uint8
+  {.importc: "gpui_on_resize_id".}
+
+proc gpui_on_focus_id*(window_id: uint32): uint8
+  {.importc: "gpui_on_focus_id".}
+
+proc gpui_on_close_id*(window_id: uint32): uint8
+  {.importc: "gpui_on_close_id".}
 
 proc gpui_notify_resize*(window_id: uint32; width, height: cdouble)
   {.importc: "gpui_notify_resize".}

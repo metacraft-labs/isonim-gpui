@@ -14,11 +14,30 @@ import isonim_gpui/bindings
 # Helpers
 # ============================================================================
 
-proc getPlan(r: GpuiRenderer; node: GpuiElement): JsonNode =
+# Trap 13 (Verification-Harness-Traps.md): written as a `proc`, the
+# `check` below sets `unittest`'s MODULE-LEVEL `testStatusIMPL` instead
+# of the running test's local, so every case printed `Check failed:` and
+# then reported `[OK]`. Measured on 2026-09-15 by planting
+# `check jsonStr.len < 0` into the HEAD (`proc`) form of this helper and
+# running it: **seven** `Check failed:` lines — one per `getPlan` CALL
+# SITE in this file — fourteen `[OK]`s, and not one `[FAILED]`. (An
+# earlier draft of this comment said eight. Eight is what `grep -c
+# getPlan` answers, because it counts the declaration too. The run says
+# seven, and the run is the measurement.)
+#
+# The process still exited 1, because `programResult` reads the same
+# module-level status the `check` corrupted. So the defect is precisely
+# that every CASE reports `[OK]`, and the only instrument that noticed
+# was the exit code — which is why `ci/run-suite.sh` takes every verdict
+# from an rc and never from an `[OK]` count.
+#
+# As a `template` this expands inside the test body, where
+# `testStatusIMPL` is the test's own.
+template getPlan(r: GpuiRenderer; node: GpuiElement): JsonNode =
   ## Build the render plan for a node and parse it as JSON.
   let jsonStr = r.renderPlanJson(node)
   check jsonStr.len > 0
-  result = parseJson(jsonStr)
+  parseJson(jsonStr)
 
 # ============================================================================
 # Render Plan Smoke Tests (no display server required)

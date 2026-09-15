@@ -20,3 +20,7 @@ tests/test_performance
 tests/test_render_integration
 tests/test_structural_comparison
 tests/test_gui
+
+# PLAT-19 mutation-harness run lock (flock is on the inode; never `rm -f` it)
+.plat19-mutations.lock
+tests/test_window_callback_registry

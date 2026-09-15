@@ -13,9 +13,50 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 /// C function pointer types for lifecycle callbacks.
+///
+/// LEGACY PATH. None of these carries the window id, so the caller has
+/// to hand a *distinct* function pointer per window — which on the Nim
+/// side meant a fixed pool of pre-generated `cdecl` trampolines. See the
+/// dispatcher types below for the replacement, and PLAT-19 /
+/// `tests/test_window_callback_registry.nim` for what the pool cost.
 pub type ResizeCallback = extern "C" fn(width: f64, height: f64);
 pub type FocusCallback = extern "C" fn(focused: u8);
 pub type CloseCallback = extern "C" fn() -> u8; // return 1 to allow close, 0 to prevent
+
+/// PLAT-19 — window-id-carrying dispatchers.
+///
+/// One dispatcher is registered process-wide per event kind; every
+/// window that opts in (`on_resize_dispatched` & co.) is delivered
+/// through it, with its own id as the first argument. The consumer then
+/// keeps an id-keyed registry and needs no per-window function pointer
+/// at all — the same shape `gpui_set_event_dispatcher` +
+/// `gpui_add_event_listener_id` already use for element events.
+pub type WindowResizeDispatcher = extern "C" fn(window_id: u32, width: f64, height: f64);
+pub type WindowFocusDispatcher = extern "C" fn(window_id: u32, focused: u8);
+pub type WindowCloseDispatcher = extern "C" fn(window_id: u32) -> u8;
+
+static RESIZE_DISPATCHER: Mutex<Option<WindowResizeDispatcher>> = Mutex::new(None);
+static FOCUS_DISPATCHER: Mutex<Option<WindowFocusDispatcher>> = Mutex::new(None);
+static CLOSE_DISPATCHER: Mutex<Option<WindowCloseDispatcher>> = Mutex::new(None);
+
+fn take_lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+pub fn set_resize_dispatcher(d: WindowResizeDispatcher) {
+    *take_lock(&RESIZE_DISPATCHER) = Some(d);
+}
+
+pub fn set_focus_dispatcher(d: WindowFocusDispatcher) {
+    *take_lock(&FOCUS_DISPATCHER) = Some(d);
+}
+
+pub fn set_close_dispatcher(d: WindowCloseDispatcher) {
+    *take_lock(&CLOSE_DISPATCHER) = Some(d);
+}
 
 /// Unique window identifier (simple incrementing counter).
 static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
@@ -41,10 +82,16 @@ pub struct WindowConfig {
     pub height: f64,
     pub state: WindowState,
 
-    // Lifecycle callbacks (optional)
+    // Lifecycle callbacks (optional, LEGACY per-window function pointers)
     pub on_resize: Option<ResizeCallback>,
     pub on_focus: Option<FocusCallback>,
     pub on_close: Option<CloseCallback>,
+
+    // PLAT-19: this window opted into the id-carrying global dispatcher
+    // for the given event kind. Takes precedence over the legacy pointer.
+    pub dispatch_resize: bool,
+    pub dispatch_focus: bool,
+    pub dispatch_close: bool,
 }
 
 impl WindowConfig {
@@ -58,6 +105,9 @@ impl WindowConfig {
             on_resize: None,
             on_focus: None,
             on_close: None,
+            dispatch_resize: false,
+            dispatch_focus: false,
+            dispatch_close: false,
         }
     }
 }
@@ -139,15 +189,18 @@ pub fn show_window(id: u32) -> bool {
 /// Request window close. Calls the on_close callback if registered.
 /// Returns true if the window was closed (or close was accepted).
 pub fn close_window(id: u32) -> bool {
-    // First check the on_close callback
-    let allow_close = with_window(id, |w| {
-        if let Some(cb) = w.on_close {
-            cb() != 0 // non-zero means allow close
-        } else {
-            true // no callback means always allow
-        }
-    })
-    .unwrap_or(false);
+    // Read the decision inputs under the lock, then call OUT of it — a
+    // close handler is free to touch the window registry.
+    let Some((dispatched, legacy)) = with_window(id, |w| (w.dispatch_close, w.on_close)) else {
+        return false;
+    };
+    let dispatcher = *take_lock(&CLOSE_DISPATCHER);
+
+    let allow_close = match (dispatched, dispatcher, legacy) {
+        (true, Some(d), _) => d(id) != 0,
+        (_, _, Some(cb)) => cb() != 0, // non-zero means allow close
+        _ => true,                     // no handler means always allow
+    };
 
     if allow_close {
         with_window_mut(id, |w| {
@@ -156,6 +209,20 @@ pub fn close_window(id: u32) -> bool {
     }
 
     allow_close
+}
+
+/// PLAT-19 — opt a window into id-carrying dispatch for one event kind.
+/// Returns false if no window has that id.
+pub fn enable_resize_dispatch(id: u32) -> bool {
+    with_window_mut(id, |w| w.dispatch_resize = true).is_some()
+}
+
+pub fn enable_focus_dispatch(id: u32) -> bool {
+    with_window_mut(id, |w| w.dispatch_focus = true).is_some()
+}
+
+pub fn enable_close_dispatch(id: u32) -> bool {
+    with_window_mut(id, |w| w.dispatch_close = true).is_some()
 }
 
 /// Get the current state of a window. Returns None if window not found.
@@ -170,20 +237,36 @@ pub fn window_size(id: u32) -> Option<(f64, f64)> {
 
 /// Simulate a resize event (for testing or when the real window resizes).
 pub fn notify_resize(id: u32, width: f64, height: f64) {
-    let callback = with_window_mut(id, |w| {
+    let Some((dispatched, legacy)) = with_window_mut(id, |w| {
         w.width = width;
         w.height = height;
-        w.on_resize
-    });
-    if let Some(Some(cb)) = callback {
+        (w.dispatch_resize, w.on_resize)
+    }) else {
+        return;
+    };
+    if dispatched {
+        if let Some(d) = *take_lock(&RESIZE_DISPATCHER) {
+            d(id, width, height);
+            return;
+        }
+    }
+    if let Some(cb) = legacy {
         cb(width, height);
     }
 }
 
 /// Simulate a focus event.
 pub fn notify_focus(id: u32, focused: bool) {
-    let callback = with_window(id, |w| w.on_focus);
-    if let Some(Some(cb)) = callback {
+    let Some((dispatched, legacy)) = with_window(id, |w| (w.dispatch_focus, w.on_focus)) else {
+        return;
+    };
+    if dispatched {
+        if let Some(d) = *take_lock(&FOCUS_DISPATCHER) {
+            d(id, if focused { 1 } else { 0 });
+            return;
+        }
+    }
+    if let Some(cb) = legacy {
         cb(if focused { 1 } else { 0 });
     }
 }
@@ -347,6 +430,137 @@ mod tests {
         assert!(window_state(id).is_some());
         destroy_window(id);
         assert!(window_state(id).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // PLAT-19 — id-carrying dispatchers
+    // -----------------------------------------------------------------
+
+    static DISPATCH_LOG: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+
+    fn log() -> std::sync::MutexGuard<'static, Vec<(u32, u64)>> {
+        match DISPATCH_LOG.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    extern "C" fn resize_dispatcher(id: u32, w: f64, _h: f64) {
+        log().push((id, w as u64));
+    }
+
+    extern "C" fn focus_dispatcher(id: u32, focused: u8) {
+        log().push((id, focused as u64));
+    }
+
+    extern "C" fn close_dispatcher(id: u32) -> u8 {
+        log().push((id, 0));
+        // Deny the SECOND window created in the close test, allow others.
+        u8::from(id % 2 == 1)
+    }
+
+    #[test]
+    #[serial]
+    fn test_dispatcher_routes_by_window_id() {
+        reset_windows();
+        log().clear();
+        set_resize_dispatcher(resize_dispatcher);
+        set_focus_dispatcher(focus_dispatcher);
+
+        let a = create_window("A", 100.0, 100.0);
+        let b = create_window("B", 100.0, 100.0);
+        assert!(enable_resize_dispatch(a));
+        assert!(enable_resize_dispatch(b));
+        assert!(enable_focus_dispatch(a));
+        assert!(enable_focus_dispatch(b));
+
+        notify_resize(a, 11.0, 1.0);
+        notify_resize(b, 22.0, 2.0);
+        notify_focus(a, true);
+        notify_focus(b, false);
+
+        assert_eq!(*log(), vec![(a, 11), (b, 22), (a, 1), (b, 0)]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_dispatcher_is_not_consulted_for_windows_that_did_not_opt_in() {
+        // The negative control for the case above: a dispatcher that
+        // fires for EVERY window would satisfy "each window's event
+        // arrived" just as well, and only this can tell them apart.
+        reset_windows();
+        log().clear();
+        set_resize_dispatcher(resize_dispatcher);
+
+        let a = create_window("A", 100.0, 100.0);
+        let b = create_window("B", 100.0, 100.0);
+        assert!(enable_resize_dispatch(a));
+        // b deliberately does NOT opt in and has no legacy callback.
+
+        notify_resize(a, 11.0, 1.0);
+        notify_resize(b, 22.0, 2.0);
+
+        assert_eq!(*log(), vec![(a, 11)]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_unknown_window_id_reaches_no_dispatcher() {
+        reset_windows();
+        log().clear();
+        set_resize_dispatcher(resize_dispatcher);
+        set_focus_dispatcher(focus_dispatcher);
+
+        notify_resize(4242, 1.0, 1.0);
+        notify_focus(4242, true);
+
+        assert!(log().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_close_dispatcher_decides_per_window() {
+        reset_windows();
+        log().clear();
+        set_close_dispatcher(close_dispatcher);
+
+        let a = create_window("A", 100.0, 100.0);
+        let b = create_window("B", 100.0, 100.0);
+        show_window(a);
+        show_window(b);
+        assert!(enable_close_dispatch(a));
+        assert!(enable_close_dispatch(b));
+
+        // `close_dispatcher` allows odd ids and denies even ones, so
+        // exactly one of the two is refused whichever order they got.
+        let a_closed = close_window(a);
+        let b_closed = close_window(b);
+        assert_eq!(a_closed, a % 2 == 1);
+        assert_eq!(b_closed, b % 2 == 1);
+        assert_ne!(
+            a_closed, b_closed,
+            "ids are consecutive, so exactly one closes"
+        );
+        assert_eq!(log().len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_legacy_pointer_still_works_when_not_opted_in() {
+        // The legacy `gpui_on_resize` path is a shipped API; the
+        // dispatcher must be additive, not a replacement that silently
+        // stops delivering to existing consumers.
+        reset_windows();
+        static LEGACY_W: TestAtomicU32 = TestAtomicU32::new(0);
+        extern "C" fn legacy(w: f64, _h: f64) {
+            LEGACY_W.store(w as u32, TestOrdering::SeqCst);
+        }
+        LEGACY_W.store(0, TestOrdering::SeqCst);
+
+        let id = create_window("Legacy", 100.0, 100.0);
+        with_window_mut(id, |w| w.on_resize = Some(legacy));
+        notify_resize(id, 777.0, 1.0);
+        assert_eq!(LEGACY_W.load(TestOrdering::SeqCst), 777);
     }
 
     #[test]
