@@ -16,7 +16,13 @@ default = []
 # RS-M14 Phase 2: switched from gpui = "0.2" (crates.io) to a git pin at-or-after
 # Zed PR #55059 (2026-04-28). The git revision is shared with `gpui-headless`
 # below so a single fetched copy backs both features.
-gpui-backend = ["gpui", "gpui_platform", "gpui_platform/runtime_shaders"]
+gpui-backend = [
+    "gpui",
+    "gpui_platform",
+    "gpui_platform/runtime_shaders",
+    "gpui_platform/x11",
+    "gpui_platform/wayland",
+]
 # RS-M14 Phase 2: enable the headless RGBA rendering path via Zed's
 # `HeadlessAppContext::with_platform` + `Window::render_to_image`. Coexists
 # with `gpui-backend`; the windowed launch path in `gpui_app.rs` is untouched.
