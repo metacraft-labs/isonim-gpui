@@ -21,10 +21,26 @@ import isonim_gpui/bindings
 # Helpers
 # ============================================================================
 
-proc getPlan(r: GpuiRenderer; node: GpuiElement): JsonNode =
+# Trap 13 (Verification-Harness-Traps.md): written as a `proc`, the
+# `check` below sets `unittest`'s MODULE-LEVEL `testStatusIMPL` instead
+# of the running test's local, so every case printed `Check failed:` and
+# then reported `[OK]`. The demonstration was run in `test_gui.nim` on
+# 2026-09-15 (see its header for the transcript): an impossible bound
+# planted in the HEAD `proc` form produced seven `Check failed:` lines,
+# fourteen `[OK]`s and not one `[FAILED]`.
+#
+# The same defect was here, with THIS file's numbers rather than that
+# one's: 3 `getPlan` call sites over 6 cases. Quoting the
+# other file's figures — which an earlier draft of this comment did,
+# unchanged, in all three files — would be a measurement about a
+# different subject.
+#
+# As a `template` this expands inside the test body, where
+# `testStatusIMPL` is the test's own.
+template getPlan(r: GpuiRenderer; node: GpuiElement): JsonNode =
   let jsonStr = r.renderPlanJson(node)
   check jsonStr.len > 0
-  result = parseJson(jsonStr)
+  parseJson(jsonStr)
 
 # ============================================================================
 # Test suites

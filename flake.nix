@@ -40,6 +40,10 @@
               pkgs.nim
               pkgs.nimble
               pkgs.just
+              # PLAT-19: `ci/run-suite.sh` runs the trap-13 assertion-helper
+              # sweep, which is a python3 script. Without this the lane's
+              # gate exits 127 and the sweep is silently never taken.
+              pkgs.python3
               pkgs.pkg-config
               pkgs.openssl
               pkgs.cmake

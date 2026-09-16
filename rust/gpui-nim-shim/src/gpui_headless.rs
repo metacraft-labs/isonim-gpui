@@ -432,10 +432,45 @@ fn refresh_window(cx: &mut HeadlessAppContext, window: AnyWindowHandle) {
 /// ``try_take`` against a slot whose generation is older than the
 /// live ``current_generation`` can detect the staleness and discard
 /// the bytes (ERV-M3).
+///
+/// PLAT-19 added `Abandoned`, and the invariant that makes it
+/// necessary is worth stating on its own line:
+///
+/// > **A `Pending` entry always has exactly one publish still to
+/// > come.** `gpui_render_submit_async` inserts `Pending` before it
+/// > sends, and removes the entry again on the only path where no
+/// > request reaches the worker (a closed channel, which returns
+/// > token 0). So every `Pending` slot the caller can observe is one
+/// > the worker WILL write to.
+///
+/// Therefore *removing* a `Pending` entry — which both the stale
+/// branch of `gpui_render_try_take` and `gpui_render_cancel` used to
+/// do — does not end the token's life. The worker's later
+/// `publish_success` / `publish_failure` re-creates the key, and
+/// nothing will ever poll it again, because tokens are handed out
+/// monotonically. Two consequences, and the first is the expensive
+/// one:
+///
+///   * **An orphaned `Ready` retains its `Vec<u8>` for the process
+///     lifetime** — `width * height * 4` bytes per occurrence. The
+///     occurrence is a story-switch landing on an in-flight render,
+///     which is the exact scenario ERV-M3 exists for.
+///   * The result code for a consumed token became a race: `-100`
+///     (`TAKE_UNKNOWN_TOKEN`) if the caller re-polled before the
+///     worker published, `2` (`TAKE_STALE`) if after.
+///
+/// `Abandoned` is the tombstone that closes both. It is bounded —
+/// at most one per in-flight render, cleared by the publish it is
+/// waiting for.
 enum RenderSlot {
     Pending { generation: u64 },
     Ready { generation: u64, bytes: Vec<u8> },
     Failed { generation: u64, code: ErrorCode },
+    /// The caller has been given its final answer for this token
+    /// (stale, or cancelled) while the render was still in flight.
+    /// The worker's pending publish must be dropped rather than
+    /// stored, and every further poll answers `TAKE_UNKNOWN_TOKEN`.
+    Abandoned,
 }
 
 struct WorkerState {
@@ -456,6 +491,58 @@ struct WorkerState {
     /// slot; ``gpui_render_try_take`` rejects slots whose snapshot
     /// is older than the live value. ERV-M3.
     current_generation: AtomicU64,
+    /// Count of worker publishes that have completed — incremented on
+    /// every `publish_success` / `publish_failure`, INCLUDING the ones
+    /// whose payload is dropped because the token was abandoned.
+    ///
+    /// It exists so a test can wait for "the worker has answered this
+    /// request" without inferring it from the slot map, whose contents
+    /// are the thing under test. Waiting on the slot map instead makes
+    /// the wait vacuous in exactly the world the case has to fail in:
+    /// with the tombstone removed, the entry is already gone when the
+    /// case looks, so the loop exits before the publish and the orphan
+    /// appears after the assertion (§4 — a check whose subject can be
+    /// emptied passes over the emptying).
+    publishes: AtomicU64,
+    /// Count of slots TOMBSTONED while in flight — the `Pending`
+    /// branch of `gpui_render_try_take`'s staleness check, and
+    /// `gpui_render_cancel` over a `Pending` slot.
+    ///
+    /// It exists so a case can prove it reached the branch it is
+    /// about. Both of those entry points answer identically whether
+    /// the worker had already published or not (`TAKE_STALE`,
+    /// `TAKE_UNKNOWN_TOKEN`), so a case that merely asserts the
+    /// RETURN CODE cannot tell the in-flight scenario — the only one
+    /// that can orphan — from the already-published one, and passes
+    /// over a run that never reached it (§4b: a partial set is worse
+    /// than an empty one).
+    abandons: AtomicU64,
+    /// Count of requests handed to the worker. Paired with `publishes`
+    /// it gives the only thing a case can wait on that is not itself
+    /// under test: `submits == publishes` means the worker owes nothing.
+    ///
+    /// Without it, "wait for a publish" is `publishes > n`, which ANY
+    /// publish satisfies — including one still in flight from an
+    /// earlier `#[serial]` case, which serialises test BODIES and not
+    /// the worker behind them. Measured: that made the two orphan cases
+    /// fail 20 times in 400 runs, reading `"abandoned"` because the
+    /// publish they waited for belonged to somebody else's token.
+    submits: AtomicU64,
+    /// Test-only gate. The worker takes it before handling each request,
+    /// so a test that holds it is GUARANTEED the worker cannot publish.
+    ///
+    /// It exists because "abandon a token while its render is in
+    /// flight" is otherwise a race the test has to win, and a case that
+    /// races for its own precondition is either flaky or — worse —
+    /// green over the scenario it is not about. Both shapes were
+    /// measured here: a bounded retry lost all 40 attempts twice in 400
+    /// runs under 8-way load, and a single unguarded attempt asserts
+    /// something true in both worlds whenever it loses.
+    ///
+    /// Production never touches it: nothing outside
+    /// `hold_worker_for_tests` ever locks it, so the worker's
+    /// uncontended acquire is one atomic per request.
+    worker_gate: Mutex<()>,
 }
 
 struct RenderRequest {
@@ -477,6 +564,10 @@ static WORKER: LazyLock<Arc<WorkerState>> = LazyLock::new(|| {
         sender: Mutex::new(None),
         next_token: AtomicU32::new(1),
         current_generation: AtomicU64::new(0),
+        publishes: AtomicU64::new(0),
+        abandons: AtomicU64::new(0),
+        submits: AtomicU64::new(0),
+        worker_gate: Mutex::new(()),
     });
     spawn_worker(state.clone());
     state
@@ -522,6 +613,9 @@ fn worker_main(state: Arc<WorkerState>, rx: mpsc::Receiver<RenderRequest>) {
     let mut cached: Option<WorkerCtx> = None;
 
     while let Ok(req) = rx.recv() {
+        // Test-only gate; uncontended in production. See
+        // `WorkerState::worker_gate`.
+        let _gate = state.worker_gate.lock().unwrap_or_else(|p| p.into_inner());
         let token = req.token;
         let generation = req.generation;
 
@@ -659,13 +753,44 @@ fn render_via_cached(
     Ok(downsampled.into_raw())
 }
 
+/// True when the token was abandoned while in flight, in which case
+/// the tombstone is cleared and the caller must DROP its payload
+/// rather than store it. Both publish paths go through this one
+/// function (§14: one predicate, one function) so the tombstone
+/// cannot be honoured on the success path and forgotten on the
+/// failure path.
+fn abandon_slot(state: &WorkerState, slots: &mut HashMap<u32, RenderSlot>, token: u32) {
+    state.abandons.fetch_add(1, Ordering::AcqRel);
+    slots.insert(token, RenderSlot::Abandoned);
+}
+
+fn clear_if_abandoned(slots: &mut HashMap<u32, RenderSlot>, token: u32) -> bool {
+    if matches!(slots.get(&token), Some(RenderSlot::Abandoned)) {
+        slots.remove(&token);
+        true
+    } else {
+        false
+    }
+}
+
 fn publish_success(state: &WorkerState, token: u32, generation: u64, bytes: Vec<u8>) {
     let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+    state.publishes.fetch_add(1, Ordering::AcqRel);
+    if clear_if_abandoned(&mut slots, token) {
+        // The whole point: `bytes` drops here instead of being
+        // retained under a token nobody will poll again.
+        drop(bytes);
+        return;
+    }
     slots.insert(token, RenderSlot::Ready { generation, bytes });
 }
 
 fn publish_failure(state: &WorkerState, token: u32, generation: u64, code: ErrorCode) {
     let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+    state.publishes.fetch_add(1, Ordering::AcqRel);
+    if clear_if_abandoned(&mut slots, token) {
+        return;
+    }
     slots.insert(token, RenderSlot::Failed { generation, code });
 }
 
@@ -707,6 +832,10 @@ pub extern "C" fn gpui_render_submit_async(width: u32, height: u32, scale: f32) 
         let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
         slots.insert(token, RenderSlot::Pending { generation });
     }
+    // Counted BEFORE the send, and decremented on the two paths that
+    // undo the reservation, so `submits >= publishes` always holds and
+    // equality means the worker owes nothing.
+    state.submits.fetch_add(1, Ordering::AcqRel);
     let sender = {
         let guard = state.sender.lock().unwrap_or_else(|p| p.into_inner());
         guard.clone()
@@ -723,7 +852,9 @@ pub extern "C" fn gpui_render_submit_async(width: u32, height: u32, scale: f32) 
             .is_err()
             {
                 // Receiver dropped — clear the reserved slot and
-                // report submission failure.
+                // report submission failure. No publish is owed, so the
+                // reservation is undone.
+                state.submits.fetch_sub(1, Ordering::AcqRel);
                 let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
                 slots.remove(&token);
                 return 0;
@@ -731,6 +862,7 @@ pub extern "C" fn gpui_render_submit_async(width: u32, height: u32, scale: f32) 
             token
         }
         None => {
+            state.submits.fetch_sub(1, Ordering::AcqRel);
             let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
             slots.remove(&token);
             0
@@ -828,17 +960,30 @@ pub extern "C" fn gpui_render_try_take(
     let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
     match slots.remove(&token) {
         None => TAKE_UNKNOWN_TOKEN,
+        Some(RenderSlot::Abandoned) => {
+            // Already answered (stale or cancelled) while in flight.
+            // Keep the tombstone — the worker has not published yet,
+            // and dropping it here would let that publish re-create
+            // an orphan. It is cleared by `clear_if_abandoned`.
+            slots.insert(token, RenderSlot::Abandoned);
+            TAKE_UNKNOWN_TOKEN
+        }
         Some(RenderSlot::Pending { generation }) => {
             if generation < live_generation {
                 // ERV-M3: token was submitted before the most recent
-                // story-switch. Consume it (do NOT re-insert) — the
-                // worker will eventually publish Ready bytes against
-                // this token, but those bytes are also stale; we
-                // tolerate the orphan slot entry until the worker
-                // fills it (we re-key by token, so future submits
-                // get fresh tokens; this slot just overwrites with
-                // stale Ready and is collected on next mismatch, or
-                // never read at all).
+                // story-switch. This is the caller's final answer for
+                // the token, but the worker still owes this slot one
+                // publish, so leave a TOMBSTONE rather than removing
+                // the entry. Removing it (what this did before
+                // PLAT-19) orphaned the worker's later write: a
+                // `Ready` orphan retained `w * h * 4` bytes for the
+                // process lifetime, and a re-poll returned `-100` or
+                // `2` depending on which side of the publish it
+                // landed — a 1-in-25 flake in
+                // `stale_token_after_bump_returns_stale_sentinel`:
+                // 4 failures in 200 runs under 8-way load before this
+                // line existed, 0 in 1,000 after it.
+                abandon_slot(&state, &mut slots, token);
                 TAKE_STALE
             } else {
                 // Re-insert so the next poll keeps the token alive.
@@ -888,7 +1033,116 @@ pub extern "C" fn gpui_render_cancel(token: u32) {
     let mut slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
     // ``remove`` drops whichever ``RenderSlot`` variant was stored —
     // ``Ready { bytes, .. }`` drops the ``Vec<u8>`` and frees the
-    // allocation; ``Pending`` / ``Failed`` carry no heap data. No
-    // leak on any branch.
-    let _ = slots.remove(&token);
+    // allocation; ``Failed`` carries no heap data.
+    //
+    // ``Pending`` is the exception, and the reason this is not a bare
+    // ``remove``: the worker still owes that slot one publish, so a
+    // removal here is re-created as an orphan a few microseconds
+    // later — with the bytes attached, if the render succeeded. The
+    // comment this replaces claimed "no leak on any branch" and the
+    // Pending branch was the leak. Tombstone it; the publish clears
+    // it.
+    match slots.remove(&token) {
+        Some(RenderSlot::Pending { .. }) => abandon_slot(&state, &mut slots, token),
+        Some(RenderSlot::Abandoned) => {
+            // Re-cancel of an already-abandoned token: restore the
+            // tombstone without counting a second abandonment.
+            slots.insert(token, RenderSlot::Abandoned);
+        }
+        _ => {}
+    }
+}
+
+/// Test-only view of one token's slot state, so the "no orphan is
+/// left behind" claim is an ASSERTION and not a comment.
+///
+/// Deliberately a plain `pub fn` and **not** an FFI export:
+/// `tools/check_bindings.sh` requires every C-ABI export in this crate
+/// to have a matching Nim binding, and this is crate API for the Rust
+/// integration tests, not part of the FFI surface. Nim owes it nothing.
+///
+/// (The sentence above avoids spelling the export form literally on
+/// purpose — §4d. A coarser future scan that drops the `\K\w+` tail
+/// would count the PROSE as a declaration; the gate's current pattern
+/// does not, but the comment should not be the thing standing between
+/// it and a wrong count.)
+///
+/// Returns one of `"none"`, `"pending"`, `"ready"`, `"failed"`,
+/// `"abandoned"`.
+#[doc(hidden)]
+pub fn slot_state_for_tests(token: u32) -> &'static str {
+    let state = WORKER.clone();
+    let slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+    match slots.get(&token) {
+        None => "none",
+        Some(RenderSlot::Pending { .. }) => "pending",
+        Some(RenderSlot::Ready { .. }) => "ready",
+        Some(RenderSlot::Failed { .. }) => "failed",
+        Some(RenderSlot::Abandoned) => "abandoned",
+    }
+}
+
+/// Test-only: how many worker publishes have completed, abandoned
+/// ones included. A case that must observe the state AFTER the worker
+/// answered waits on this rather than on the slot map — see the field
+/// comment on `WorkerState::publishes` for why that distinction is
+/// the difference between a case that can fail and one that cannot.
+#[doc(hidden)]
+pub fn publish_count_for_tests() -> u64 {
+    let state = WORKER.clone();
+    state.publishes.load(Ordering::Acquire)
+}
+
+/// Test-only: an outstanding hold on the render worker. While one is
+/// alive the worker cannot publish, so a case can put a token into the
+/// in-flight state and keep it there. Dropping it releases the worker.
+///
+/// Take it AFTER `quiesce_worker_for_tests` — quiescing while holding
+/// it would wait for a publish the hold is preventing.
+#[doc(hidden)]
+pub struct WorkerHold(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[doc(hidden)]
+pub fn hold_worker_for_tests() -> WorkerHold {
+    WorkerHold(WORKER.worker_gate.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+/// Test-only: block until the worker owes no publishes, or the
+/// deadline expires; returns whether the idle state was reached.
+///
+/// A case that needs to observe what a publish LEFT BEHIND must start
+/// from a quiet worker, or "wait for a publish" can be satisfied by an
+/// earlier case's in-flight request. `#[serial]` serialises test
+/// bodies; it does not serialise the render thread.
+#[doc(hidden)]
+pub fn quiesce_worker_for_tests(timeout_ms: u64) -> bool {
+    let state = WORKER.clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if state.submits.load(Ordering::Acquire) == state.publishes.load(Ordering::Acquire) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Test-only: how many in-flight slots have been tombstoned. A case
+/// that must reach the orphan-capable branch asserts this moved; see
+/// the field comment on `WorkerState::abandons`.
+#[doc(hidden)]
+pub fn abandon_count_for_tests() -> u64 {
+    let state = WORKER.clone();
+    state.abandons.load(Ordering::Acquire)
+}
+
+/// Test-only: total live slot entries, tombstones included. A steady
+/// state of 0 between cases is what "no orphan" means in aggregate.
+#[doc(hidden)]
+pub fn slot_count_for_tests() -> usize {
+    let state = WORKER.clone();
+    let slots = state.slots.lock().unwrap_or_else(|p| p.into_inner());
+    slots.len()
 }

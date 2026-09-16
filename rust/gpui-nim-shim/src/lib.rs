@@ -40,11 +40,11 @@
 
 // Modules are pub so integration tests can access the shadow tree, render plan,
 // and window state.
+pub mod render_sync;
 #[allow(dead_code)]
 pub mod tree;
 #[allow(dead_code)]
 pub mod window;
-pub mod render_sync;
 // RS-M14 Phase 2: `gpui_app` is reused by the new headless rendering path
 // (`gpui_headless`) — both features need access to `NimRootView`,
 // `render_plan_to_gpui`, and the style/colour helpers. The
@@ -306,8 +306,7 @@ pub extern "C" fn gpui_set_style(
     let value_str = unsafe { cstr_to_str(value) };
     let mut tree = lock_tree();
     if let Some(n) = tree.get_mut(node_id) {
-        n.styles
-            .insert(prop_str.to_string(), value_str.to_string());
+        n.styles.insert(prop_str.to_string(), value_str.to_string());
         window::request_repaint();
     }
 }
@@ -643,11 +642,7 @@ pub extern "C" fn gpui_child_count(node: *mut GpuiElement) -> u64 {
 /// Returns the number of bytes needed (excluding null terminator),
 /// or 0 if the node is not found.
 #[no_mangle]
-pub extern "C" fn gpui_get_text_content(
-    node: *mut GpuiElement,
-    buf: *mut u8,
-    buf_len: u64,
-) -> u64 {
+pub extern "C" fn gpui_get_text_content(node: *mut GpuiElement, buf: *mut u8, buf_len: u64) -> u64 {
     let node_id = unsafe { handle_to_node_id(node) };
     if node_id.is_null() {
         return 0;
@@ -728,11 +723,7 @@ pub extern "C" fn gpui_nth_child(node: *mut GpuiElement, index: u64) -> *mut Gpu
 /// Get the tag name of a node. Returns 0 for text nodes.
 /// Writes into `buf` if provided, returns the number of bytes needed.
 #[no_mangle]
-pub extern "C" fn gpui_get_tag(
-    node: *mut GpuiElement,
-    buf: *mut u8,
-    buf_len: u64,
-) -> u64 {
+pub extern "C" fn gpui_get_tag(node: *mut GpuiElement, buf: *mut u8, buf_len: u64) -> u64 {
     let node_id = unsafe { handle_to_node_id(node) };
     if node_id.is_null() {
         return 0;
@@ -789,11 +780,7 @@ pub extern "C" fn gpui_get_element_kind(node: *mut GpuiElement) -> u8 {
 /// Create a new window with the given title and initial size.
 /// Returns a window ID (> 0) on success, 0 on failure.
 #[no_mangle]
-pub extern "C" fn gpui_create_window(
-    title: *const c_char,
-    width: f64,
-    height: f64,
-) -> u32 {
+pub extern "C" fn gpui_create_window(title: *const c_char, width: f64, height: f64) -> u32 {
     let title_str = unsafe { cstr_to_str(title) };
     window::create_window(title_str, width, height)
 }
@@ -903,6 +890,61 @@ pub extern "C" fn gpui_on_close(window_id: u32, callback: CloseCallback) {
     window::with_window_mut(window_id, |w| {
         w.on_close = Some(callback);
     });
+}
+
+// ---------------------------------------------------------------------------
+// PLAT-19 — window lifecycle callbacks routed by WINDOW ID
+// ---------------------------------------------------------------------------
+//
+// `gpui_on_resize` / `_focus` / `_close` above take a bare function
+// pointer that carries no window id, so a consumer with N windows needs
+// N distinct function pointers — which on the Nim side meant a fixed
+// pool of hand-written `cdecl` trampolines, misrouting at TWO windows
+// and aborting (or, under `-d:danger`, segfaulting) at five. See
+// `tests/test_window_callback_registry.nim` for the measurements.
+//
+// The replacement is the shape element events already use: ONE
+// process-wide dispatcher per event kind, plus a per-window opt-in, with
+// the id delivered as the first argument. The legacy entry points are
+// retained and still work; a window that has opted in prefers the
+// dispatcher.
+
+/// Register the process-wide resize dispatcher.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_resize_dispatcher(dispatcher: window::WindowResizeDispatcher) {
+    window::set_resize_dispatcher(dispatcher);
+}
+
+/// Register the process-wide focus dispatcher.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_focus_dispatcher(dispatcher: window::WindowFocusDispatcher) {
+    window::set_focus_dispatcher(dispatcher);
+}
+
+/// Register the process-wide close dispatcher. It returns 1 to allow the
+/// close and 0 to prevent it, exactly like `CloseCallback`.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_close_dispatcher(dispatcher: window::WindowCloseDispatcher) {
+    window::set_close_dispatcher(dispatcher);
+}
+
+/// Opt `window_id` into dispatcher-based resize delivery.
+/// Returns 1 if the window exists, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn gpui_on_resize_id(window_id: u32) -> u8 {
+    u8::from(window::enable_resize_dispatch(window_id))
+}
+
+/// Opt `window_id` into dispatcher-based focus delivery.
+#[no_mangle]
+pub extern "C" fn gpui_on_focus_id(window_id: u32) -> u8 {
+    u8::from(window::enable_focus_dispatch(window_id))
+}
+
+/// Opt `window_id` into dispatcher-based close delivery.
+#[no_mangle]
+pub extern "C" fn gpui_on_close_id(window_id: u32) -> u8 {
+    u8::from(window::enable_close_dispatch(window_id))
 }
 
 /// Simulate a resize event on a window (for testing / event bridging).
@@ -1666,7 +1708,11 @@ mod tests {
         let value = c("100");
 
         gpui_append_child(std::ptr::null_mut(), std::ptr::null_mut());
-        gpui_insert_before(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+        gpui_insert_before(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
         gpui_remove_child(std::ptr::null_mut(), std::ptr::null_mut());
         gpui_set_attribute(std::ptr::null_mut(), name.as_ptr(), value.as_ptr());
         gpui_remove_attribute(std::ptr::null_mut(), name.as_ptr());
@@ -1684,9 +1730,18 @@ mod tests {
         assert!(pn.is_null());
 
         assert_eq!(gpui_child_count(std::ptr::null_mut()), 0);
-        assert_eq!(gpui_get_text_content(std::ptr::null_mut(), std::ptr::null_mut(), 0), 0);
-        assert_eq!(gpui_get_attribute(std::ptr::null_mut(), name.as_ptr(), std::ptr::null_mut(), 0), 0);
-        assert_eq!(gpui_get_tag(std::ptr::null_mut(), std::ptr::null_mut(), 0), 0);
+        assert_eq!(
+            gpui_get_text_content(std::ptr::null_mut(), std::ptr::null_mut(), 0),
+            0
+        );
+        assert_eq!(
+            gpui_get_attribute(std::ptr::null_mut(), name.as_ptr(), std::ptr::null_mut(), 0),
+            0
+        );
+        assert_eq!(
+            gpui_get_tag(std::ptr::null_mut(), std::ptr::null_mut(), 0),
+            0
+        );
         assert_eq!(gpui_get_element_kind(std::ptr::null_mut()), 0);
         let nth = gpui_nth_child(std::ptr::null_mut(), 0);
         assert!(nth.is_null());
@@ -1755,7 +1810,7 @@ mod tests {
         let id = gpui_create_window(title.as_ptr(), 640.0, 480.0);
         assert_eq!(gpui_show_window(id), 1);
         assert_eq!(gpui_window_state(id), 2); // Visible
-        // Cannot show again
+                                              // Cannot show again
         assert_eq!(gpui_show_window(id), 0);
         // Close
         assert_eq!(gpui_close_window(id), 1);
@@ -1916,10 +1971,17 @@ mod tests {
         gpui_reset_tree();
 
         // Container tags -> Div (1)
-        for tag_name in &["div", "section", "article", "nav", "header", "footer", "button", "ul", "li"] {
+        for tag_name in &[
+            "div", "section", "article", "nav", "header", "footer", "button", "ul", "li",
+        ] {
             let tag = c(tag_name);
             let node = gpui_create_element(tag.as_ptr());
-            assert_eq!(gpui_get_element_kind(node), 1, "Expected Div for tag '{}'", tag_name);
+            assert_eq!(
+                gpui_get_element_kind(node),
+                1,
+                "Expected Div for tag '{}'",
+                tag_name
+            );
             gpui_destroy_element(node);
         }
 
@@ -1927,7 +1989,12 @@ mod tests {
         for tag_name in &["span", "p", "h1", "h2", "h3", "label", "strong", "em"] {
             let tag = c(tag_name);
             let node = gpui_create_element(tag.as_ptr());
-            assert_eq!(gpui_get_element_kind(node), 2, "Expected TextContainer for tag '{}'", tag_name);
+            assert_eq!(
+                gpui_get_element_kind(node),
+                2,
+                "Expected TextContainer for tag '{}'",
+                tag_name
+            );
             gpui_destroy_element(node);
         }
 

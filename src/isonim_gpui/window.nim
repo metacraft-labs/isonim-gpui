@@ -18,6 +18,7 @@
 ##   # ... reactive updates happen, repaint is requested automatically ...
 ##   win.close()
 
+import std/tables
 import isonim_gpui/bindings
 
 type
@@ -34,79 +35,77 @@ type
     id*: uint32
 
 # ===========================================================================
-# Callback bridge
+# Callback bridge — a WINDOW-ID-KEYED REGISTRY (PLAT-19)
 # ===========================================================================
 #
-# Similar to the event callback bridge in renderer.nim, we need cdecl
-# trampolines for window lifecycle callbacks. We use a simpler approach
-# here since there are at most a few windows and 3 callback types each.
+# This replaces a fixed pool of four pre-generated `cdecl` trampolines per
+# callback kind. The pool had two failure modes, both reproduced before it
+# was replaced, and both are now cases in
+# `tests/test_window_callback_registry.nim`:
+#
+#   * MISROUTING AT TWO WINDOWS. `onFocus` / `onClose` chose their slot as
+#     `nextWindowSlot - 1`, so registering by callback KIND
+#     (`a.onResize; b.onResize; a.onFocus; b.onFocus`) made both focus
+#     registrations pick slot 1. Measured: `aFocus=0 bFocus=2` — window
+#     A's handler was overwritten and never ran, and B's ran for A's
+#     event.
+#
+#   * EXHAUSTION AT THE FIFTH WINDOW, with a failure mode that depends on
+#     the build. `assert nextWindowSlot < 4` aborts under the default and
+#     `-d:release` profiles (both keep `assertions:on`); under `-d:danger`
+#     the assert AND the bounds check are compiled out together and the
+#     fifth registration is an out-of-bounds write — measured as SIGSEGV.
+#
+# The shape here is the one `renderer.nim` already uses for element
+# events: ONE process-wide dispatcher per kind, registered once with the
+# shim, plus a per-window opt-in, with the window id delivered as the
+# first argument. There is no pool and no bound.
 
 var
-  resizeCallbacks: array[4, proc(width, height: float)]
-  focusCallbacks: array[4, proc(focused: bool)]
-  closeCallbacks: array[4, proc(): bool]
+  resizeCallbacks: Table[uint32, proc(width, height: float)]
+  focusCallbacks: Table[uint32, proc(focused: bool)]
+  closeCallbacks: Table[uint32, proc(): bool]
+  windowDispatchersRegistered = false
 
-# Trampolines for resize (up to 4 windows)
-proc resizeTrampoline0(w, h: cdouble) {.cdecl.} =
-  if resizeCallbacks[0] != nil: resizeCallbacks[0](w.float, h.float)
-proc resizeTrampoline1(w, h: cdouble) {.cdecl.} =
-  if resizeCallbacks[1] != nil: resizeCallbacks[1](w.float, h.float)
-proc resizeTrampoline2(w, h: cdouble) {.cdecl.} =
-  if resizeCallbacks[2] != nil: resizeCallbacks[2](w.float, h.float)
-proc resizeTrampoline3(w, h: cdouble) {.cdecl.} =
-  if resizeCallbacks[3] != nil: resizeCallbacks[3](w.float, h.float)
+proc resizeDispatcher(windowId: uint32; w, h: cdouble) {.cdecl.} =
+  let cb = resizeCallbacks.getOrDefault(windowId)
+  if cb != nil: cb(w.float, h.float)
 
-const resizeTrampolines: array[4, ResizeCallback] = [
-  resizeTrampoline0, resizeTrampoline1,
-  resizeTrampoline2, resizeTrampoline3,
-]
+proc focusDispatcher(windowId: uint32; f: uint8) {.cdecl.} =
+  let cb = focusCallbacks.getOrDefault(windowId)
+  if cb != nil: cb(f != 0)
 
-# Trampolines for focus
-proc focusTrampoline0(f: uint8) {.cdecl.} =
-  if focusCallbacks[0] != nil: focusCallbacks[0](f != 0)
-proc focusTrampoline1(f: uint8) {.cdecl.} =
-  if focusCallbacks[1] != nil: focusCallbacks[1](f != 0)
-proc focusTrampoline2(f: uint8) {.cdecl.} =
-  if focusCallbacks[2] != nil: focusCallbacks[2](f != 0)
-proc focusTrampoline3(f: uint8) {.cdecl.} =
-  if focusCallbacks[3] != nil: focusCallbacks[3](f != 0)
+proc closeDispatcher(windowId: uint32): uint8 {.cdecl.} =
+  let cb = closeCallbacks.getOrDefault(windowId)
+  # No handler means "allow", matching the shim's own default.
+  if cb == nil: 1'u8
+  elif cb(): 1'u8
+  else: 0'u8
 
-const focusTrampolines: array[4, FocusCallback] = [
-  focusTrampoline0, focusTrampoline1,
-  focusTrampoline2, focusTrampoline3,
-]
+proc ensureWindowDispatchers() =
+  if not windowDispatchersRegistered:
+    gpui_set_window_resize_dispatcher(resizeDispatcher)
+    gpui_set_window_focus_dispatcher(focusDispatcher)
+    gpui_set_window_close_dispatcher(closeDispatcher)
+    windowDispatchersRegistered = true
 
-# Trampolines for close
-proc closeTrampoline0(): uint8 {.cdecl.} =
-  if closeCallbacks[0] != nil:
-    if closeCallbacks[0](): 1'u8 else: 0'u8
-  else: 1'u8
-proc closeTrampoline1(): uint8 {.cdecl.} =
-  if closeCallbacks[1] != nil:
-    if closeCallbacks[1](): 1'u8 else: 0'u8
-  else: 1'u8
-proc closeTrampoline2(): uint8 {.cdecl.} =
-  if closeCallbacks[2] != nil:
-    if closeCallbacks[2](): 1'u8 else: 0'u8
-  else: 1'u8
-proc closeTrampoline3(): uint8 {.cdecl.} =
-  if closeCallbacks[3] != nil:
-    if closeCallbacks[3](): 1'u8 else: 0'u8
-  else: 1'u8
+proc windowCallbackCount*(): int =
+  ## Number of windows holding at least one registered lifecycle handler.
+  ## Exposed so a test can assert that destroying a window RELEASES its
+  ## entries rather than merely that a later event does not arrive — the
+  ## second is also true of a registry that leaks every window it ever saw.
+  var ids: seq[uint32]
+  for id in resizeCallbacks.keys: ids.add id
+  for id in focusCallbacks.keys:
+    if id notin ids: ids.add id
+  for id in closeCallbacks.keys:
+    if id notin ids: ids.add id
+  ids.len
 
-const closeTrampolines: array[4, CloseCallback] = [
-  closeTrampoline0, closeTrampoline1,
-  closeTrampoline2, closeTrampoline3,
-]
-
-var nextWindowSlot: int
-
-proc allocWindowSlot(): int =
-  ## Allocate a trampoline slot for a window. Returns the slot index.
-  assert nextWindowSlot < 4,
-    "GpuiWindow: maximum number of concurrent windows (4) exceeded"
-  result = nextWindowSlot
-  inc nextWindowSlot
+proc releaseWindowCallbacks(windowId: uint32) =
+  resizeCallbacks.del(windowId)
+  focusCallbacks.del(windowId)
+  closeCallbacks.del(windowId)
 
 # ===========================================================================
 # Window API
@@ -146,40 +145,34 @@ proc close*(win: GpuiWindow): bool =
   gpui_close_window(win.id) != 0
 
 proc destroy*(win: GpuiWindow) =
-  ## Destroy the window and free its resources.
+  ## Destroy the window and free its resources, including its entries in
+  ## the lifecycle-callback registry. Without the release, a long-lived
+  ## process that opens and closes windows accumulates one closure per
+  ## window for ever — which is the leak a registry trades a pool's
+  ## hard bound for, and the reason `windowCallbackCount` is exported.
+  releaseWindowCallbacks(win.id)
   gpui_destroy_window(win.id)
 
 proc onResize*(win: GpuiWindow; callback: proc(width, height: float)) =
   ## Register a callback for window resize events.
-  let slot = allocWindowSlot()
-  resizeCallbacks[slot] = callback
-  gpui_on_resize(win.id, resizeTrampolines[slot])
+  ## Registering again for the same window replaces that window's handler
+  ## and touches no other window's.
+  ensureWindowDispatchers()
+  resizeCallbacks[win.id] = callback
+  discard gpui_on_resize_id(win.id)
 
 proc onFocus*(win: GpuiWindow; callback: proc(focused: bool)) =
   ## Register a callback for window focus events.
-  # Reuse the same slot logic — for simplicity, we just use the
-  # next available slot. In practice a window would register all its
-  # callbacks at once.
-  let slot = nextWindowSlot - 1  # use same slot as last alloc
-  if slot < 0 or slot >= 4:
-    let newSlot = allocWindowSlot()
-    focusCallbacks[newSlot] = callback
-    gpui_on_focus(win.id, focusTrampolines[newSlot])
-  else:
-    focusCallbacks[slot] = callback
-    gpui_on_focus(win.id, focusTrampolines[slot])
+  ensureWindowDispatchers()
+  focusCallbacks[win.id] = callback
+  discard gpui_on_focus_id(win.id)
 
 proc onClose*(win: GpuiWindow; callback: proc(): bool) =
   ## Register a callback for window close requests.
   ## Return true from the callback to allow closing, false to prevent it.
-  let slot = nextWindowSlot - 1
-  if slot < 0 or slot >= 4:
-    let newSlot = allocWindowSlot()
-    closeCallbacks[newSlot] = callback
-    gpui_on_close(win.id, closeTrampolines[newSlot])
-  else:
-    closeCallbacks[slot] = callback
-    gpui_on_close(win.id, closeTrampolines[slot])
+  ensureWindowDispatchers()
+  closeCallbacks[win.id] = callback
+  discard gpui_on_close_id(win.id)
 
 proc requestRepaint*() =
   ## Request a repaint of the active window. Call this after modifying
@@ -197,8 +190,10 @@ proc repaintPending*(): bool =
 proc resetWindows*() =
   ## Reset all window state (for testing).
   gpui_reset_windows()
-  for i in 0 ..< 4:
-    resizeCallbacks[i] = nil
-    focusCallbacks[i] = nil
-    closeCallbacks[i] = nil
-  nextWindowSlot = 0
+  resizeCallbacks.clear()
+  focusCallbacks.clear()
+  closeCallbacks.clear()
+  # Re-register the dispatchers so they are always set after a reset,
+  # mirroring `renderer.resetCallbacks`.
+  windowDispatchersRegistered = false
+  ensureWindowDispatchers()
