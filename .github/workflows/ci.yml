@@ -1,6 +1,6 @@
 name: CI
 
-# PLAT-19 rewrote this workflow, because what was here could never have run.
+# This workflow was rewritten, because what was here could never have run.
 #
 # The `nim-tests` job checked isonim out with
 #
@@ -24,9 +24,8 @@ name: CI
 # Siblings are now cloned by `setup-dev-env`, which resolves each name in
 # `.github/sibling-repos` (isonim, nim-everywhere) against the per-commit
 # workspace lock in the manifest repo. That is the single approved sibling
-# revision source — see codetracer-specs/Testing/Cross-Repo-CI-Integration.md;
-# a second hand-pinned `actions/checkout` is another place for revisions to
-# drift away from what the workspace actually builds.
+# revision source; a second hand-pinned `actions/checkout` is another place
+# for revisions to drift away from what the workspace actually builds.
 #
 # And the suite is now ONE step (`ci/run-suite.sh`) rather than fifteen,
 # because fifteen steps report fifteen verdicts and no case count, and a
