@@ -78,6 +78,12 @@ UNITTEST_SUITES=(
 	tests/test_gui.nim
 	tests/test_render_integration.nim
 	tests/test_structural_comparison.nim
+	# NH-M1: the reactive root seam (`renderGpui`). Listed here rather than
+	# only under `just test-all`, which no workflow invokes — a verification
+	# test that never runs in CI stops discriminating the moment the seam
+	# regresses. Needs no extra flags: `nim.cfg` already carries
+	# `--path:../isonim/src`, and this script exports LD_LIBRARY_PATH.
+	tests/test_render_native_gpui_reactive.nim
 )
 ASSERT_SCRIPTS=(
 	tests/test_basic.nim
@@ -94,8 +100,13 @@ BENCHMARKS=(
 # Written LAST, from a run (trap 4c), on 2026-09-17:
 #   139 rust unit  +  10 window-registry  +  15 cross-renderer
 # +  14 gui        +  31 render-integration  +  6 structural
+# +   5 gpui-reactive
 # +   1 basic      +   1 bindings           + 23 renderer checkpoints
-# = 240
+# = 245
+#
+# Was 240 earlier on 2026-09-17, before NH-M1's
+# `test_render_native_gpui_reactive` joined the lane; that suite's five
+# cases were counted from a run of it, not predicted.
 #
 # Was 237 on 2026-09-15. The three are RS-M14b's shutdown-flag cases in
 # `rust/gpui-nim-shim/src/window.rs`
@@ -115,7 +126,7 @@ BENCHMARKS=(
 # The two `--features` runs are DELIBERATELY not in this total: they are
 # conditional on `--with-gpui`, and a total that changed with a flag
 # would be a fingerprint that means two different things.
-EXPECTED_CASES=240
+EXPECTED_CASES=245
 
 total_cases=0
 failed_steps=()

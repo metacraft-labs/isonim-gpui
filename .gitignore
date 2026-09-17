@@ -24,3 +24,6 @@ tests/test_gui
 # PLAT-19 mutation-harness run lock (flock is on the inode; never `rm -f` it)
 .plat19-mutations.lock
 tests/test_window_callback_registry
+
+# NH-M1 reactive-root suite binary
+tests/test_render_native_gpui_reactive
