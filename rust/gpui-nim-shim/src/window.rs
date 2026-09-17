@@ -128,6 +128,74 @@ pub fn take_repaint_request() -> bool {
     REPAINT_REQUESTED.swap(false, Ordering::AcqRel)
 }
 
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+//
+// RS-M14b. `gpui_launch` under `gpui-backend` enters
+// `Application::run(...)`, which does not return until the platform event
+// loop stops. Before this existed the shim had NO way to stop it: the
+// `gpui_close_window` / `gpui_reset_windows` pair only mutate the
+// `WindowConfig` registry above, which the event loop never reads. So a
+// process that called `gpui_launch` could only be killed, and the five
+// launch cases in `tests/test_gui.nim` hung forever the moment the
+// windowing backends were actually compiled in (measured 2026-09-17:
+// nine render-plan cases `[OK]`, then nothing, rc=124 under a 90s cap).
+//
+// GPUI's own answer is `App::quit()` (crates/gpui/src/app.rs), which
+// delegates to `Platform::quit()`; on Linux that is
+// `common.signal.stop()` — the calloop `LoopSignal` — so `LinuxClient::run`
+// returns and `Application::run` returns with it. What GPUI does NOT
+// offer is a handle to reach `App` from outside the loop: `Rc<dyn
+// Platform>` is `!Send` and `App` is only ever borrowed on the main
+// thread inside an update. The two flags below are that missing handle.
+// `launch_gpui_app` spawns one task inside the loop that reads them and
+// calls `cx.quit()` from the place GPUI requires it to be called from.
+
+/// Set by `gpui_quit` (from any thread). The in-loop shutdown poller
+/// installed by `launch_gpui_app` consumes it and quits the app.
+pub static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Deadline, in milliseconds from the moment the event loop starts, after
+/// which the app quits by itself. 0 disables it. Set by
+/// `gpui_quit_after_ms` BEFORE `gpui_launch`, and reset to 0 once the
+/// loop it armed has returned, so it can never leak into a later launch.
+///
+/// This is the backstop that makes a windowed test incapable of hanging
+/// even when the thing that was supposed to request the quit never runs.
+pub static AUTO_QUIT_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Request that a running GPUI event loop terminate. Thread-safe.
+pub fn request_quit() {
+    QUIT_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Check and clear the quit flag.
+pub fn take_quit_request() -> bool {
+    QUIT_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
+/// Observe the quit flag without consuming it.
+pub fn quit_requested() -> bool {
+    QUIT_REQUESTED.load(Ordering::Acquire)
+}
+
+/// Drop a pending quit request. Called at the top of `launch_gpui_app` so
+/// a request left over from a previous loop cannot terminate the next one
+/// before it has drawn anything.
+pub fn clear_quit_request() {
+    QUIT_REQUESTED.store(false, Ordering::Release);
+}
+
+/// Arm (ms > 0) or disarm (ms == 0) the auto-quit deadline.
+pub fn set_auto_quit_ms(ms: u32) {
+    AUTO_QUIT_MS.store(ms, Ordering::Release);
+}
+
+pub fn auto_quit_ms() -> u32 {
+    AUTO_QUIT_MS.load(Ordering::Acquire)
+}
+
 /// Global window registry. For now we support a single window (the common case).
 /// The mutex protects concurrent access from the event loop thread and the Nim thread.
 static WINDOWS: std::sync::LazyLock<Mutex<Vec<WindowConfig>>> =
@@ -282,6 +350,11 @@ pub fn reset_windows() {
     let mut windows = lock_windows();
     windows.clear();
     REPAINT_REQUESTED.store(false, Ordering::Release);
+    // A quit request or an armed deadline that survived a reset would be
+    // charged to whichever loop started next — a cross-test leak of
+    // exactly the kind `reset_windows` exists to prevent.
+    QUIT_REQUESTED.store(false, Ordering::Release);
+    AUTO_QUIT_MS.store(0, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -420,6 +493,55 @@ mod tests {
         assert!(take_repaint_request());
         // Should be cleared after take
         assert!(!take_repaint_request());
+    }
+
+    // -----------------------------------------------------------------
+    // RS-M14b — shutdown flags
+    // -----------------------------------------------------------------
+    //
+    // These cover the FLAGS, in the default (non-GPUI) build, so the
+    // semantics the in-loop poller depends on are checked by the 237-case
+    // lane rather than only by the one job that needs a compositor. That
+    // the poller then acts on them is a different claim, and the thing
+    // that establishes it is the windowed pixel case in
+    // `tests/test_gui.nim`: a process that returns from `gpui_launch`
+    // could not have done so without `cx.quit()` having run.
+
+    #[test]
+    #[serial]
+    fn test_quit_request_is_latched_and_consumed_once() {
+        clear_quit_request();
+        assert!(!quit_requested());
+        assert!(!take_quit_request());
+
+        request_quit();
+        assert!(quit_requested(), "observing must not consume");
+        assert!(quit_requested());
+        assert!(take_quit_request());
+        assert!(!take_quit_request(), "a taken request must not re-fire");
+    }
+
+    #[test]
+    #[serial]
+    fn test_auto_quit_deadline_round_trips_and_disarms() {
+        set_auto_quit_ms(0);
+        assert_eq!(auto_quit_ms(), 0, "0 is 'no deadline'");
+        set_auto_quit_ms(2500);
+        assert_eq!(auto_quit_ms(), 2500);
+        set_auto_quit_ms(0);
+        assert_eq!(auto_quit_ms(), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_reset_windows_clears_shutdown_state() {
+        // The negative control for the leak: without this, a test that
+        // armed a quit would hand it to the next test's event loop.
+        request_quit();
+        set_auto_quit_ms(1234);
+        reset_windows();
+        assert!(!quit_requested());
+        assert_eq!(auto_quit_ms(), 0);
     }
 
     #[test]

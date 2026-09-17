@@ -865,6 +865,55 @@ pub extern "C" fn gpui_take_repaint_request() -> u8 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shutdown (RS-M14b)
+// ---------------------------------------------------------------------------
+//
+// `gpui_launch` under `gpui-backend` blocks in `Application::run`. These
+// three are the only way to get it to return; see the "Shutdown" section
+// of `window.rs` for why a flag rather than a handle.
+//
+// All three exist in EVERY build, not just `gpui-backend` ones. Without
+// the feature `gpui_launch` never enters an event loop, so `gpui_quit` has
+// nothing to stop — but the flags still round-trip, which is what
+// `gpui_quit_requested` is for and what the default-build Rust unit tests
+// in `window.rs` check. A symbol that appears and disappears with a Cargo
+// feature would also put `tools/check_bindings.sh` in the position of
+// having to know which feature set it was scanning.
+
+/// Ask a running GPUI event loop to terminate, so `gpui_launch` returns.
+///
+/// Safe to call from any thread and at any time. The request is latched;
+/// the in-loop poller consumes it within one frame interval (~16 ms). If
+/// no loop is running the request is dropped when the next `gpui_launch`
+/// starts, so it cannot silently terminate a later window.
+#[no_mangle]
+pub extern "C" fn gpui_quit() {
+    window::request_quit();
+}
+
+/// Arm an automatic quit `ms` milliseconds after the event loop starts;
+/// 0 disarms it. Must be called BEFORE `gpui_launch`, which reads it once
+/// and resets it to 0 when the loop returns.
+///
+/// This is a backstop, not a substitute for `gpui_quit`: it bounds the
+/// runtime of a windowed test even when whatever was supposed to request
+/// the quit never ran, so "the harness broke" surfaces as a failed
+/// assertion rather than as a job that has to be killed.
+#[no_mangle]
+pub extern "C" fn gpui_quit_after_ms(ms: u32) {
+    window::set_auto_quit_ms(ms);
+}
+
+/// Returns 1 if a quit has been requested and not yet consumed.
+/// Observation only — unlike `gpui_take_repaint_request` this does not
+/// clear the flag, because the only consumer that may clear it is the
+/// event loop's own poller.
+#[no_mangle]
+pub extern "C" fn gpui_quit_requested() -> u8 {
+    u8::from(window::quit_requested())
+}
+
 /// Register a callback for window resize events.
 /// The callback receives (width: f64, height: f64).
 #[no_mangle]

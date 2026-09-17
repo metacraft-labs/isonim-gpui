@@ -82,9 +82,23 @@
               pkgs.mesa
               pkgs.libglvnd
               pkgs.sway
-              pkgs.weston
               pkgs.wayland-utils
               pkgs.wf-recorder
+              # RS-M14b: `scripts/wayland-capture-frame.sh` reads the
+              # compositor output back with grim (via
+              # `zwlr_screencopy_manager_v1`), which is what the windowed
+              # pixel case in `tests/test_gui.nim` asserts on. It was
+              # resolving from the host PATH on this workstation and was
+              # absent from the shell, so CI would have been the first
+              # place to find out.
+              pkgs.grim
+              # weston is deliberately NOT here. `weston
+              # --backend=headless-backend.so` advertises no `wl_seat`
+              # and GPUI unwraps that `None` at startup, so it cannot run
+              # a GPUI client at all; `scripts/wayland-run-test.sh`
+              # refuses `--compositor weston` with that reason. Shipping
+              # it would only make the refusal look like a missing
+              # package.
               pkgs.ffmpeg-full
               pkgs.mpv
             ];

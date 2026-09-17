@@ -1,6 +1,27 @@
 #!/usr/bin/env bash
 # xvfb-run-test.sh - Run commands in a virtual X11 display (Xvfb)
 #
+# ===========================================================================
+# NOT USABLE FOR GPUI RENDERING  (RS-M14b, 2026-09-17)
+# ===========================================================================
+#
+# Xvfb has no DRI3. wgpu therefore never obtains a surface, and a GPUI
+# window opened on this display reaches `IsViewable` at its requested
+# size and paints NOTHING. The `LIBGL_ALWAYS_SOFTWARE=1` and mesa driver
+# plumbing below does not change that: software GL is not the missing
+# piece, the buffer-passing extension is.
+#
+# What makes this worth a warning rather than a deletion is the shape of
+# the failure. A window that exists and never paints satisfies every
+# assertion the GUI suite had before RS-M14b — the shadow tree, the
+# render plan, the window state machine — so the lane went green on a
+# display that had rendered nothing. `just test-gui-x11` now refuses for
+# this reason, and the GUI lane runs under headless sway via
+# `scripts/wayland-run-test.sh`, where `zwlr_screencopy_manager_v1` lets
+# `grim` read the output back and the pixels can actually be asserted on.
+#
+# This script is kept for X11 work that does not need the GPU.
+#
 # Usage:
 #   ./scripts/xvfb-run-test.sh <command> [args...]
 #   ./scripts/xvfb-run-test.sh --record <command> [args...]

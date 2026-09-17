@@ -91,16 +91,31 @@ BENCHMARKS=(
 	tests/test_performance.nim
 )
 
-# Written LAST, from a run (trap 4c), on 2026-09-15:
-#   136 rust unit  +  10 window-registry  +  15 cross-renderer
+# Written LAST, from a run (trap 4c), on 2026-09-17:
+#   139 rust unit  +  10 window-registry  +  15 cross-renderer
 # +  14 gui        +  31 render-integration  +  6 structural
 # +   1 basic      +   1 bindings           + 23 renderer checkpoints
-# = 237
+# = 240
+#
+# Was 237 on 2026-09-15. The three are RS-M14b's shutdown-flag cases in
+# `rust/gpui-nim-shim/src/window.rs`
+# (`test_quit_request_is_latched_and_consumed_once`,
+# `test_auto_quit_deadline_round_trips_and_disarms`,
+# `test_reset_windows_clears_shutdown_state`). They are in the DEFAULT
+# build deliberately: the flags are what `gpui_quit` /
+# `gpui_quit_after_ms` write and what the event loop's poller reads, and
+# only the poller half needs a compositor.
+#
+# `nim: test_gui` stays at 14 because the windowed pixel suite is behind
+# `when defined(gpuiBackend)` and this lane compiles without it. That
+# suite's home is `just test-gui` and the `gui-tests` CI job; a count
+# that moved here when the GUI lane changed would mean the two lanes had
+# stopped being separable.
 #
 # The two `--features` runs are DELIBERATELY not in this total: they are
 # conditional on `--with-gpui`, and a total that changed with a flag
 # would be a fingerprint that means two different things.
-EXPECTED_CASES=237
+EXPECTED_CASES=240
 
 total_cases=0
 failed_steps=()

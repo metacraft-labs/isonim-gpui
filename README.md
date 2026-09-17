@@ -118,14 +118,44 @@ The integration test suite (`rust/gpui-nim-shim/tests/gpui_rendering.rs`)
 uses GPUI's `TestAppContext` to render through the actual GPUI pipeline
 headlessly — no display server needed.
 
-### GUI tests under headless display
+### GUI tests under a headless display
 
 ```bash
-just test-gui-x11                # run GUI tests under Xvfb
-just test-gui-wayland            # run GUI tests under headless Sway
-just test-gui-record             # run under Xvfb and record video
-just test-gui-x11 --stream       # run under Xvfb with live video stream
+just test-gui                    # GUI tests under headless Sway (THE GUI LANE)
+just test-gui-record             # ...and record the display to an MP4
+just test-gui --stream           # ...and stream it live to mpv
 ```
+
+This is the only lane that opens a real GPUI window, and — since
+RS-M14b — the only one that asserts on **drawn pixels**: the last suite
+in `tests/test_gui.nim` builds a scene of three flat colours with exact
+sizes and an exact gap, reads the compositor output back with `grim`
+(`scripts/wayland-capture-frame.sh`), and checks each colour's pixel
+count and bounding box.
+
+Two things follow from that, both measured rather than assumed:
+
+* **Xvfb cannot be used.** It has no DRI3, so wgpu never gets a surface
+  and the GPUI window paints nothing while still reporting itself as
+  viewable at the requested size. Every shadow-tree, render-plan and
+  window-state assertion passes on that. `just test-gui-x11` therefore
+  refuses and says so; `scripts/xvfb-run-test.sh` stays for X11 work
+  that does not need the GPU.
+* **Weston cannot be used.** `weston --backend=headless-backend.so`
+  advertises no `wl_seat`, and GPUI's Wayland client unwraps that
+  `None` at startup. It used to be this harness's default compositor;
+  `scripts/wayland-run-test.sh` now defaults to sway and rejects weston
+  with that reason.
+
+Headless sway works with the GPU (`gles2`) and with no GPU at all
+(`WLR_RENDERER=pixman`), and the captured frames are byte-identical
+between the two.
+
+Shutting the window down is the shim's job, not GPUI's: `Application::
+run` blocks until the platform loop stops, and GPUI exposes no handle
+to stop it from outside. `gpui_quit()` (any thread) and
+`gpui_quit_after_ms()` (a bound, armed before launch) are that handle —
+see the "Shutdown" section of `rust/gpui-nim-shim/src/window.rs`.
 
 ## Project Structure
 
@@ -134,8 +164,9 @@ isonim-gpui/
 ├── flake.nix                      # Nix flake (Rust + Nim + GPU deps)
 ├── Justfile                       # Build/test commands
 ├── scripts/
-│   ├── xvfb-run-test.sh          # X11 headless test runner
-│   └── wayland-run-test.sh       # Wayland headless test runner
+│   ├── xvfb-run-test.sh          # X11 headless runner (NO GPU rendering)
+│   ├── wayland-run-test.sh       # headless Sway runner — the GUI lane
+│   └── wayland-capture-frame.sh  # grim capture for the pixel assertions
 ├── rust/
 │   └── gpui-nim-shim/
 │       ├── src/

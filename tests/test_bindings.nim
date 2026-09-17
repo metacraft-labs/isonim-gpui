@@ -137,6 +137,11 @@ static:
   assert compiles(gpui_request_repaint())
   assert compiles(gpui_take_repaint_request())
 
+  # --- RS-M14b: shutdown ---
+  assert compiles(gpui_quit())
+  assert compiles(gpui_quit_after_ms(1000.uint32))
+  assert compiles(gpui_quit_requested())
+
   var rcb: ResizeCallback
   var fcb: FocusCallback
   var ccb: CloseCallback
@@ -238,6 +243,8 @@ static:
     var x: uint8 = gpui_window_state(1.uint32))
   assert compiles(block:
     var x: uint8 = gpui_take_repaint_request())
+  assert compiles(block:
+    var x: uint8 = gpui_quit_requested())
 
   # Verify functions that return uint32
   assert compiles(block:

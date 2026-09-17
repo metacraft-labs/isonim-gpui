@@ -12,7 +12,73 @@
 #   --window              Show compositor as a visible nested window
 #   --record              Record the Wayland display to a video file (MP4)
 #   --stream              Stream the Wayland display to a video player (mpv)
-#   --compositor <name>   Force specific compositor: weston, sway, or cage
+#   --compositor <name>   Force specific compositor: sway or cage
+#
+# ===========================================================================
+# WHICH COMPOSITOR, AND WHY IT IS NO LONGER WESTON  (RS-M14b, 2026-09-17)
+# ===========================================================================
+#
+# SWAY — the default, and the only configuration GPUI has been observed
+# to render under here. `WLR_BACKENDS=headless`, verified two independent
+# ways with the same byte-for-byte output: the gles2 renderer, and the
+# fully software path (`WLR_RENDERER=pixman` with lavapipe via
+# `VK_ICD_FILENAMES`). It advertises `wl_seat` and
+# `zwlr_screencopy_manager_v1`, the latter being what lets `grim` read
+# the output back for `scripts/wayland-capture-frame.sh`. Xwayland hosted
+# by sway works too.
+#
+# WESTON — REMOVED, and it used to be the DEFAULT, which is the part that
+# mattered. `weston --backend=headless-backend.so` advertises no
+# `wl_seat`, and GPUI's Wayland client unwraps that `None`
+# (gpui_linux/src/linux/wayland/client.rs). So every GPUI client dies at
+# startup under it. This script defaulted to weston for any invocation
+# that was not `--record` / `--stream` / `--window`, i.e. for exactly the
+# plain `wayland-run-test.sh <cmd>` form a test lane uses — so the one
+# compositor that cannot run the thing under test was the one picked by
+# default. Asking for it now fails with that explanation rather than
+# silently producing a broken display.
+#
+# XVFB — cannot work at all, and is a different script
+# (`scripts/xvfb-run-test.sh`). No DRI3, so wgpu never gets a surface:
+# the window reaches `IsViewable` at its requested size and paints
+# nothing. That is a pass-shaped failure — any test that only checks the
+# window state machine goes green on it — which is why the GUI lane moved
+# to this script.
+#
+# THE RUNTIME DIRECTORY. In headless mode this script gives the
+# compositor a PRIVATE, SHORT `XDG_RUNTIME_DIR` under /tmp, for two
+# reasons, and the first one is measured.
+#
+# CORRECTNESS, and be precise about when the old code failed, because
+# the honest statement is narrower than "it never worked". The previous
+# code slept one second, diffed a glob of `$XDG_RUNTIME_DIR/wayland-*`
+# against a pre-computed list, and fell back to a literal when that came
+# up empty. Re-measured 2026-09-17 on this box, at load average 70-85:
+#
+#   * with a SHORT inherited `XDG_RUNTIME_DIR` (here `/run/user/1003`)
+#     the old sway path WORKED — 8 attempts, 8 passes. The one-second
+#     sleep is still an unbounded race in principle, but it did not lose
+#     it once, and claiming otherwise would be the same kind of
+#     unfalsifiable assertion this lane keeps finding.
+#
+#   * with a LONG `XDG_RUNTIME_DIR` (158 chars, i.e. any nested agent or
+#     CI scratch path) it failed 100%, and the mechanism is `sun_path`:
+#     sway ABORTS — "Aborted (core dumped)" — because the socket path
+#     does not fit in the 108 bytes of `sockaddr_un.sun_path`. No socket
+#     is created, the glob stays unexpanded, and the script reports
+#     `ERROR: sway did not become ready on wayland-*`. The same
+#     invocation under this script's private short directory passes.
+#
+# So the runtime directory is the defect, not the sleep, and a short
+# private one fixes it for every caller regardless of what it inherited.
+# A private directory also makes the new socket the ONLY socket, so it
+# is found by looking rather than by differencing.
+#
+# ISOLATION, the second reason: two runs (or two agents) sharing a
+# runtime directory raced over which socket was "new".
+#
+# `--window` mode keeps the host's runtime directory, since a nested
+# compositor has to reach the host's socket to connect at all.
 
 set -euo pipefail
 
@@ -42,7 +108,7 @@ while [[ $# -gt 0 ]]; do
     ;;
   --compositor)
     if [[ -z "${2:-}" ]]; then
-      echo "Error: --compositor requires an argument (weston, sway, or cage)" >&2
+      echo "Error: --compositor requires an argument (sway or cage)" >&2
       exit 1
     fi
     EXPLICIT_COMPOSITOR="$2"
@@ -68,19 +134,28 @@ if [[ $# -eq 0 ]]; then
   exit 1
 fi
 
-# Determine compositor
+# Determine compositor. Sway is the default in every mode; see the
+# header for what happened when weston was.
 if [[ -n "$EXPLICIT_COMPOSITOR" ]]; then
   case "$EXPLICIT_COMPOSITOR" in
-  weston | sway | cage) COMPOSITOR="$EXPLICIT_COMPOSITOR" ;;
+  sway | cage) COMPOSITOR="$EXPLICIT_COMPOSITOR" ;;
+  weston)
+    echo "Error: weston is not supported by this harness." >&2
+    echo "" >&2
+    echo "  'weston --backend=headless-backend.so' advertises no wl_seat, and" >&2
+    echo "  GPUI's Wayland client unwraps that None at startup, so every GPUI" >&2
+    echo "  process dies immediately under it. Measured 2026-09-17." >&2
+    echo "" >&2
+    echo "  Use sway (the default) or cage." >&2
+    exit 1
+    ;;
   *)
-    echo "Error: Unknown compositor '$EXPLICIT_COMPOSITOR'. Valid: weston, sway, cage" >&2
+    echo "Error: Unknown compositor '$EXPLICIT_COMPOSITOR'. Valid: sway, cage" >&2
     exit 1
     ;;
   esac
-elif [[ "$RECORD" == "1" ]] || [[ "$STREAM" == "1" ]] || [[ "$WINDOW" == "1" ]]; then
-  COMPOSITOR="sway"
 else
-  COMPOSITOR="weston"
+  COMPOSITOR="sway"
 fi
 
 USE_HEADLESS=1
@@ -113,14 +188,6 @@ cage)
     fi
   done
   ;;
-weston)
-  for tool in weston wayland-info; do
-    if ! command -v "$tool" &>/dev/null; then
-      echo "Error: $tool not found." >&2
-      exit 1
-    fi
-  done
-  ;;
 esac
 
 if [[ "$RECORD" == "1" ]] || [[ "$STREAM" == "1" ]]; then
@@ -137,77 +204,103 @@ if [[ "$RECORD" == "1" ]] && [[ "$STREAM" == "1" ]]; then
   fi
 fi
 
-# XDG_RUNTIME_DIR
-if [[ -z "${XDG_RUNTIME_DIR:-}" ]] || [[ ! -d "${XDG_RUNTIME_DIR:-}" ]]; then
-  export XDG_RUNTIME_DIR="$(mktemp -d)"
+# --- XDG_RUNTIME_DIR --------------------------------------------------
+#
+# Headless: a private, SHORT directory, so the compositor's socket is the
+# only one in it and can be found by looking rather than by differencing
+# a glob against a pre-computed list (which is what used to fail here —
+# see the header). Short because `sockaddr_un.sun_path` is 108 bytes and
+# sway reports an overrun only as `Unable to open wayland socket`.
+#
+# Nested (`--window`): keep the host's, because sway has to reach the
+# host compositor's socket to connect to it in the first place.
+if [[ "$USE_HEADLESS" == "1" ]]; then
+  _runtime_dir="$(mktemp -d /tmp/isonim-gpui-wl-XXXXXX)"
+  export XDG_RUNTIME_DIR="$_runtime_dir"
+  chmod 700 "$XDG_RUNTIME_DIR"
+  CLEANUP_XDG=1
+  echo "Private XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
+elif [[ -z "${XDG_RUNTIME_DIR:-}" ]] || [[ ! -d "${XDG_RUNTIME_DIR:-}" ]]; then
+  _runtime_dir="$(mktemp -d /tmp/isonim-gpui-wl-XXXXXX)"
+  export XDG_RUNTIME_DIR="$_runtime_dir"
+  chmod 700 "$XDG_RUNTIME_DIR"
   echo "Warning: XDG_RUNTIME_DIR not set, using temp dir: $XDG_RUNTIME_DIR"
   CLEANUP_XDG=1
 fi
+
+COMPOSITOR_LOG="$XDG_RUNTIME_DIR/$COMPOSITOR.log"
+
+# Comma-joined list of the wayland sockets already present, so
+# `wait_for_socket` can tell a pre-existing one from the compositor's.
+# Empty in headless mode, where the runtime dir is private and new.
+existing_sockets() {
+  local sock base out=""
+  for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
+    [[ "$sock" == *.lock ]] && continue
+    [[ -S "$sock" ]] || continue
+    base="$(basename "$sock")"
+    out="${out:+$out,}$base"
+  done
+  echo "$out"
+}
+
+# Wait (up to ~10 s) for a wayland socket to show up in $XDG_RUNTIME_DIR
+# and echo its name. Waits for the SOCKET, not for a fixed sleep: on a
+# loaded shared runner one second is not a bound on anything.
+wait_for_socket() {
+  local seen_before="$1" i sock base
+  for ((i = 0; i < 100; i++)); do
+    for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
+      [[ "$sock" == *.lock ]] && continue
+      [[ -S "$sock" ]] || continue
+      base="$(basename "$sock")"
+      if [[ ",$seen_before," != *",$base,"* ]]; then
+        echo "$base"
+        return 0
+      fi
+    done
+    sleep 0.1
+  done
+  return 1
+}
 
 # Start compositor
 case "$COMPOSITOR" in
 sway)
   if [[ "$USE_HEADLESS" == "1" ]]; then
     echo "Starting Sway compositor (headless)..."
+    SEEN=""
+    WLR_BACKENDS=headless WLR_RENDERER="${WLR_RENDERER:-pixman}" \
+      sway -c "$SWAY_CONFIG" >"$COMPOSITOR_LOG" 2>&1 &
   else
     echo "Starting Sway compositor (nested window)..."
-  fi
-
-  EXISTING_SOCKETS=$(ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' || true)
-
-  if [[ "$USE_HEADLESS" == "1" ]]; then
-    WLR_BACKENDS=headless WLR_RENDERER=pixman sway -c "$SWAY_CONFIG" &>/dev/null &
-  else
-    sway -c "$SWAY_CONFIG" &
+    SEEN="$(existing_sockets)"
+    sway -c "$SWAY_CONFIG" >"$COMPOSITOR_LOG" 2>&1 &
   fi
   COMPOSITOR_PID=$!
-  sleep 1
-
-  NEW_SOCKET=""
-  for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
-    [[ "$sock" == *.lock ]] && continue
-    if ! echo "$EXISTING_SOCKETS" | grep -q "^${sock}$"; then
-      NEW_SOCKET=$(basename "$sock")
-      break
-    fi
-  done
-  SOCKET="${NEW_SOCKET:-wayland-0}"
-  echo "Sway created socket: $SOCKET"
   ;;
 
 cage)
-  EXISTING_SOCKETS=$(ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' || true)
   if [[ "$USE_HEADLESS" == "1" ]]; then
-    WLR_BACKENDS=headless cage -d -- sh -c "sleep 3600" &>/dev/null &
+    SEEN=""
+    WLR_BACKENDS=headless cage -d -- sh -c "sleep 3600" >"$COMPOSITOR_LOG" 2>&1 &
   else
-    cage -d -- sh -c "sleep 3600" &
-  fi
-  COMPOSITOR_PID=$!
-  sleep 1
-
-  NEW_SOCKET=""
-  for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
-    [[ "$sock" == *.lock ]] && continue
-    if ! echo "$EXISTING_SOCKETS" | grep -q "^${sock}$"; then
-      NEW_SOCKET=$(basename "$sock")
-      break
-    fi
-  done
-  SOCKET="${NEW_SOCKET:-wayland-0}"
-  ;;
-
-weston)
-  SOCKET="wayland-test-$$"
-  if [[ "$USE_HEADLESS" == "1" ]]; then
-    echo "Starting Weston compositor (headless) on socket $SOCKET..."
-    weston --backend=headless-backend.so --socket="$SOCKET" &>/dev/null &
-  else
-    echo "Starting Weston compositor (nested window) on socket $SOCKET..."
-    weston --backend=wayland-backend.so --socket="$SOCKET" &
+    SEEN="$(existing_sockets)"
+    cage -d -- sh -c "sleep 3600" >"$COMPOSITOR_LOG" 2>&1 &
   fi
   COMPOSITOR_PID=$!
   ;;
 esac
+
+if ! SOCKET="$(wait_for_socket "$SEEN")"; then
+  echo "ERROR: $COMPOSITOR did not create a wayland socket in $XDG_RUNTIME_DIR" >&2
+  echo "--- $COMPOSITOR log ---" >&2
+  cat "$COMPOSITOR_LOG" >&2 || true
+  kill "$COMPOSITOR_PID" 2>/dev/null || true
+  [[ "${CLEANUP_XDG:-0}" == "1" ]] && rm -rf "$XDG_RUNTIME_DIR"
+  exit 1
+fi
+echo "$COMPOSITOR created socket: $SOCKET"
 
 export WAYLAND_DISPLAY="$SOCKET"
 
@@ -275,8 +368,36 @@ done
 
 if ! wayland-info &>/dev/null 2>&1; then
   echo "ERROR: $COMPOSITOR did not become ready on $WAYLAND_DISPLAY" >&2
+  echo "--- $COMPOSITOR log ---" >&2
+  cat "$COMPOSITOR_LOG" >&2 || true
   exit 1
 fi
+
+# The two globals GPUI and the capture harness actually need, checked by
+# name rather than discovered as a crash inside the client:
+#
+#   wl_seat                      GPUI's Wayland client unwraps this. Its
+#                                absence is why weston-headless is not
+#                                supported (see the header) — and the way
+#                                it presented was a bare `unwrap` on None
+#                                somewhere in gpui_linux, which tells the
+#                                reader nothing about the compositor.
+#   zwlr_screencopy_manager_v1   what `grim` uses, and therefore what
+#                                `scripts/wayland-capture-frame.sh` and
+#                                every pixel assertion rest on.
+WL_GLOBALS="$(wayland-info 2>/dev/null || true)"
+for global in wl_seat zwlr_screencopy_manager_v1; do
+  if ! grep -q "'$global'" <<<"$WL_GLOBALS"; then
+    echo "ERROR: $COMPOSITOR on $WAYLAND_DISPLAY advertises no $global." >&2
+    if [[ "$global" == "wl_seat" ]]; then
+      echo "       GPUI cannot start without it." >&2
+    else
+      echo "       grim cannot read the output back, so no pixel" >&2
+      echo "       assertion is possible." >&2
+    fi
+    exit 1
+  fi
+done
 
 export XDG_SESSION_TYPE=wayland
 unset DISPLAY

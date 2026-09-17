@@ -458,7 +458,12 @@ ARMS: list[Arm] = [
         grader="lane",
         kills="CASE COUNT DRIFT",
         control="LANE RESULT: FAILED",
-        because="CASE COUNT DRIFT: the lane ran 231 cases, not 237.",
+        # RS-M14b: carried from 231/237 to 234/240 with `EXPECTED_CASES`.
+        # The delta is unchanged — removing this suite removes its 6 cases
+        # — but see the note on L2: this string was NOT re-derived from a
+        # mutation run, because the tool refuses to run at the current
+        # digests.
+        because="CASE COUNT DRIFT: the lane ran 234 cases, not 240.",
     ),
     Arm(
         id="L2",
@@ -469,7 +474,23 @@ ARMS: list[Arm] = [
         replace="check plan[\"kind\"].getStr() == \"DivPLAT19\"",
         grader="lane",
         kills="nim: tests/test_structural_comparison.nim",
-        control="TOTAL CASES: 237   (expected 237)",
+        # RS-M14b: `EXPECTED_CASES` moved 237 -> 240, and this arm's
+        # CONTROL quotes that line verbatim. Left at 237 it would name a
+        # string the lane can no longer print, so L2 would score
+        # CONTROL-FAILURE for a reason that has nothing to do with its
+        # claim — a control that fails for its own reasons is not a
+        # control. The new text is quoted from an observed 2026-09-17
+        # `ci/run-suite.sh --with-gpui` transcript (240 cases, 0 failing
+        # steps).
+        #
+        # NEITHER THIS NOR L1's `because` HAS BEEN RE-DERIVED BY RUNNING
+        # THE ARMS. The tool fails closed on digest drift, and the
+        # recorded digests are stale — `rust/Cargo.lock` and
+        # `rust/gpui-nim-shim/Cargo.toml` were ALREADY stale before
+        # RS-M14b, so the tool was refusing to run at HEAD too. Re-record
+        # only after re-running the arms; re-recording first would assert
+        # a validation nobody performed.
+        control="TOTAL CASES: 240   (expected 240)",
         because="- nim: tests/test_structural_comparison.nim (rc=1)",
     ),
     Arm(

@@ -192,6 +192,29 @@ proc gpui_request_repaint*()
 proc gpui_take_repaint_request*(): uint8
   {.importc: "gpui_take_repaint_request".}
 
+# --- RS-M14b: shutdown ---
+#
+# `gpui_launch` built with `--features gpui-backend` blocks inside GPUI's
+# platform event loop. These are the only way to make it return; without
+# them a windowed test cannot terminate and has to be killed. See the
+# "Shutdown" section of `rust/gpui-nim-shim/src/window.rs`.
+
+proc gpui_quit*()
+  {.importc: "gpui_quit".}
+  ## Ask a running GPUI event loop to stop, so `gpui_launch` returns.
+  ## Safe from any thread — a windowed test calls it from a watcher
+  ## thread once it has the evidence it came for.
+
+proc gpui_quit_after_ms*(ms: uint32)
+  {.importc: "gpui_quit_after_ms".}
+  ## Arm an automatic quit `ms` after the loop starts (0 disarms).
+  ## Call BEFORE `gpui_launch`. This is the backstop that keeps a
+  ## windowed test bounded even when its watcher never fires.
+
+proc gpui_quit_requested*(): uint8
+  {.importc: "gpui_quit_requested".}
+  ## 1 if a quit is latched and not yet consumed. Observation only.
+
 proc gpui_on_resize*(window_id: uint32; callback: ResizeCallback)
   {.importc: "gpui_on_resize".}
 

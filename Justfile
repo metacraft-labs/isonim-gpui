@@ -77,19 +77,39 @@ test-structural:
 # `just test` recipe.
 test-all: rust-test test test-cross test-integration test-structural
 
-# Run GUI tests under Xvfb (X11 headless)
-test-gui-x11 *ARGS:
-    cd rust && cargo build --features gpui-backend
-    ./scripts/xvfb-run-test.sh {{ARGS}} just _run-gui-tests
-
-# Run GUI tests under Wayland headless (Sway)
-test-gui-wayland *ARGS:
+# Run the GUI tests, including the windowed pixel case, under headless
+# sway. THIS IS THE GUI LANE. (RS-M14b)
+#
+# `test-gui-wayland` is kept as an alias because CI and muscle memory
+# both refer to it.
+test-gui *ARGS:
     cd rust && cargo build --features gpui-backend
     ./scripts/wayland-run-test.sh {{ARGS}} just _run-gui-tests
 
-# Run GUI tests with video recording (X11)
+test-gui-wayland *ARGS:
+    just test-gui {{ARGS}}
+
+# Run the GUI tests with video recording.
 test-gui-record:
-    just test-gui-x11 --record
+    just test-gui --record
+
+# THE X11/XVFB PATH CANNOT RENDER, AND THIS RECIPE SAYS SO RATHER THAN
+# RUNNING. Measured 2026-09-17: under Xvfb the GPUI window reaches
+# `IsViewable` at its requested size and paints nothing, because Xvfb has
+# no DRI3 and wgpu therefore never gets a surface. Every assertion over
+# the shadow tree, the render plan and the window state machine passes on
+# that — which is exactly the pass-shaped failure the pixel case in
+# `tests/test_gui.nim` exists to end.
+#
+# It is a `just` recipe rather than a deleted line because
+# `.github/workflows/ci.yml` used to run `just test-gui-x11`, and a
+# recipe that has quietly become a no-op is worse than one that is gone.
+test-gui-x11:
+    #!/usr/bin/env bash
+    echo "test-gui-x11 is not supported: Xvfb has no DRI3, so wgpu gets no" >&2
+    echo "surface and the GPUI window paints nothing. Use 'just test-gui'," >&2
+    echo "which runs under headless sway and asserts on captured pixels." >&2
+    exit 1
 
 # Internal: actual GUI test commands (run inside headless display)
 _run-gui-tests:

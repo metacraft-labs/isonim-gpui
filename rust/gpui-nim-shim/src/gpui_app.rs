@@ -20,8 +20,8 @@ use crate::window;
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 use gpui::{
     div, px, rgb, rgba, size, AnyElement, App, AppContext as _, Application, AsyncApp, Bounds,
-    Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Rgba,
-    Styled, WeakEntity, Window, WindowBounds, WindowOptions,
+    Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, QuitMode,
+    Render, Rgba, Styled, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 
 // RS-M14 Phase 2 (git pin): `Application::new()` from crates.io `gpui = "0.2"`
@@ -364,6 +364,13 @@ pub fn parse_color(s: &str) -> Option<Hsla> {
 /// * `width` - Initial window width in pixels
 /// * `height` - Initial window height in pixels
 /// * `window_id` - The window registry ID (from `gpui_create_window`), or 0
+///
+/// # Shutdown
+///
+/// The event loop is stopped through `window::QUIT_REQUESTED` /
+/// `window::AUTO_QUIT_MS`, which a task spawned inside the loop polls and
+/// turns into `cx.quit()`. See the "Shutdown" section of `window.rs` for
+/// why the shim needs its own flags rather than a handle to GPUI's `App`.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     // Record the active window so components can reference it.
@@ -378,11 +385,27 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     let w = width as f32;
     let h = height as f32;
 
+    // Read the deadline ONCE, here, and drop any quit request that was
+    // latched before this loop existed. A stale request would otherwise
+    // terminate this window before it drew a frame — and a windowed test
+    // whose window closes before it paints is exactly the shape of pass
+    // that a pixel assertion is supposed to be immune to.
+    let auto_quit_ms = window::auto_quit_ms();
+    window::clear_quit_request();
+
     // RS-M14 Phase 2: pinned `gpui` requires an explicit platform implementation
     // (the old crates.io `Application::new()` constructor is gone). Use
     // `current_platform(false)` to get the windowed (non-headless) platform impl
     // appropriate for the current OS.
     Application::with_platform(current_platform(false)).run(move |cx: &mut App| {
+        // The shim owns the quit policy; see `spawn_shutdown_poller`.
+        // `QuitMode::Default` is `LastWindowClosed` off macOS, which
+        // quits INSIDE the update that removes the last window and so
+        // leaves the window's teardown unflushed. The poller reproduces
+        // the same user-visible rule (last window gone => app quits) with
+        // a drain in between.
+        cx.set_quit_mode(QuitMode::Explicit);
+
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(
@@ -393,14 +416,135 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
             |_, cx| cx.new(|_| NimRootView::new()),
         )
         .expect("Failed to open GPUI window");
+
+        spawn_shutdown_poller(cx, auto_quit_ms);
     });
 
-    // The event loop has returned -- the user closed the window.
+    // The event loop has returned -- the user closed the window, or a
+    // quit was requested via `gpui_quit` / the auto-quit deadline.
     if window_id != 0 {
         window::close_window(window_id);
     }
 
+    // Disarm, so the deadline this launch was given is not inherited by
+    // the next one.
+    window::set_auto_quit_ms(0);
+    window::clear_quit_request();
+
     ACTIVE_WINDOW_ID.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// How long the loop keeps running after the last window has been
+/// removed, before `cx.quit()` stops it.
+///
+/// This is not politeness, it is the difference between a window that is
+/// gone and a window that merely thinks it is. `Drop for WaylandWindow`
+/// (gpui_linux/src/linux/wayland/window.rs) sends `wl_surface.destroy`
+/// and then spawns `client.drop_window(..)` on the FOREGROUND EXECUTOR —
+/// so both the protocol flush and that task need the event loop to keep
+/// turning for a moment. Stop the loop in the same update that removed
+/// the window and the compositor never hears about it.
+///
+/// WHAT IS MEASURED, AND WHAT THIS NUMBER ACTUALLY IS. The two were
+/// conflated in an earlier draft of this comment, so they are separated
+/// here. `tests/test_gui.nim` makes six `gpui_launch` calls in one
+/// process, and the experiments below are over that binary.
+///
+///   * REMOVING THE WINDOWS IS LOAD-BEARING, and it is what the 11%
+///     measurement belongs to. With the poller replaced by a bare
+///     `cx.quit()` that removes nothing, all six surfaces stay alive:
+///     sway tiles the sixth window into a 320x1080 column and the pixel
+///     case never sees a paintable frame. Re-measured 2026-09-17, twice,
+///     both runs red at exactly 698,940 of 6,220,817 non-NUL bytes
+///     (11.2%), with the 7,740-byte teardown transient before it.
+///
+///   * THE LENGTH OF THIS WAIT IS NOT LOAD-BEARING, and calling it
+///     "measured" would be overclaiming. With `SHUTDOWN_DRAIN` set to
+///     ZERO the pixel case still passes, twice, with byte-identical
+///     counts — because the poller `continue`s and re-enters the
+///     `timer(SHUTDOWN_POLL).await` before it tests the deadline, so a
+///     zero drain is still one 16 ms tick and, crucially, still puts
+///     `cx.quit()` in a STRICTLY LATER app update than the removal.
+///
+/// That separation is the real condition: `Drop for WaylandWindow`
+/// spawns `client.drop_window(..)` on the foreground executor, and a
+/// task cannot run in the update that queued it. The condition is
+/// already structural, not timed — this constant only buys margin on top
+/// of it.
+///
+/// 150 ms is therefore a deliberately generous margin, not a threshold
+/// anyone measured a failure below. It is kept because the platforms
+/// this has NOT been measured on are the ones that matter here — the
+/// ephemeral Linux runners, and arm64, where no figure in this file was
+/// taken — and nine spare poll ticks cost one sixth of a second per
+/// launch. If that ever becomes expensive, the honest replacement is the
+/// condition itself (quit on the first tick after the removal), not a
+/// smaller magic number.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Polling interval for the shutdown task.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Spawn the task that owns this app's shutdown.
+///
+/// It runs on the foreground executor (the same place `NimRootView`'s
+/// repaint poller runs) because `App::quit` may only be reached from
+/// inside an app update, and `Rc<dyn Platform>` cannot be handed to
+/// another thread. That is also why the shim needs
+/// `window::QUIT_REQUESTED` at all: `gpui_quit` can be called from
+/// anywhere, and this is the one place allowed to act on it.
+///
+/// Three things end the loop, and all three take the same route out —
+/// remove the windows, drain, quit:
+///
+///   1. `gpui_quit()` from any thread.
+///   2. The `gpui_quit_after_ms` deadline, if one was armed.
+///   3. The last window disappearing, i.e. the user closed it. This
+///      reproduces `QuitMode::LastWindowClosed`, which `launch_gpui_app`
+///      turns off precisely so that the drain can happen in between.
+///
+/// `auto_quit_ms == 0` means "no deadline"; only (1) and (3) apply.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn spawn_shutdown_poller(cx: &mut App, auto_quit_ms: u32) {
+    let deadline = if auto_quit_ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(auto_quit_ms as u64))
+    };
+
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let started = std::time::Instant::now();
+        let mut draining_since: Option<std::time::Instant> = None;
+
+        loop {
+            cx.background_executor().timer(SHUTDOWN_POLL).await;
+
+            if let Some(since) = draining_since {
+                if since.elapsed() >= SHUTDOWN_DRAIN {
+                    cx.update(|cx: &mut App| cx.quit());
+                    break;
+                }
+                continue;
+            }
+
+            let asked = window::take_quit_request();
+            let expired = deadline.is_some_and(|d| started.elapsed() >= d);
+            let all_windows_gone = cx.update(|cx: &mut App| cx.windows().is_empty());
+
+            if asked || expired || all_windows_gone {
+                cx.update(|cx: &mut App| {
+                    for handle in cx.windows() {
+                        let _ =
+                            handle.update(cx, |_root, win: &mut Window, _cx| win.remove_window());
+                    }
+                });
+                draining_since = Some(std::time::Instant::now());
+            }
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]

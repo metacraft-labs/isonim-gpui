@@ -146,7 +146,52 @@ jobs:
     # given `continue-on-error`. It gates like everything else; if it turns
     # out to be unrunnable on the fleet, that is a finding to record rather
     # than a flag to set.
-    name: GUI tests (headless display) (${{ matrix.runner }})
+    #
+    # -----------------------------------------------------------------
+    # WHY THIS MOVED OFF XVFB, AND WHAT IS AND IS NOT MEASURED
+    # -----------------------------------------------------------------
+    #
+    # It used to run `just test-gui-x11`. That recipe now refuses,
+    # because Xvfb has no DRI3: wgpu never gets a surface and the GPUI
+    # window paints nothing while still reaching `IsViewable` at its
+    # requested size. The suite passed on that, since every assertion it
+    # had was over the shadow tree, the render plan, or the in-process
+    # window state machine. So the job was green over a display that had
+    # rendered nothing, and no Xvfb configuration fixes that.
+    #
+    # MEASURED, on the x86-64 dev workstation, 2026-09-17:
+    #   * headless sway (`WLR_BACKENDS=headless`) renders GPUI, and the
+    #     capture is byte-identical between the gles2 renderer and the
+    #     fully software path (`WLR_RENDERER=pixman`, lavapipe via
+    #     `VK_ICD_FILENAMES`). The pixel case's colour counts and
+    #     bounding boxes are exact under both.
+    #   * Xwayland hosted by sway also works.
+    #   * headless weston does NOT: no `wl_seat`, GPUI unwraps `None`.
+    #   * Xvfb can never work, per the above.
+    # `scripts/wayland-run-test.sh` defaults to sway accordingly and
+    # checks for `wl_seat` and `zwlr_screencopy_manager_v1` by name
+    # before handing the display over.
+    #
+    # INFERRED, NOT MEASURED, about this fleet: that the same software
+    # path is available inside the ephemeral Incus guests. The
+    # encouraging datum is that the all-software run here was identical
+    # to the GPU one, so a runner with no usable `/dev/dri` is not
+    # obviously disqualifying — `WLR_RENDERER=pixman` is CPU-only and is
+    # what the script already uses by default. But `/dev/dri` presence
+    # inside `eph-linux-x64` / `eph-linux-arm64` guests has NOT been
+    # checked from here, and neither has arm64 specifically: every
+    # measurement above is x86-64. The first run of this job on the fleet
+    # is the experiment, and the job gates so that its answer is
+    # recorded rather than discarded.
+    #
+    # NOT ADDED TO `eph-macos-arm64`. The capture is `grim`, i.e.
+    # `zwlr_screencopy_manager_v1`, i.e. wlroots — there is no Wayland
+    # compositor on macOS and no equivalent capture path wired up here.
+    # Making this case run on macOS is real work (a CoreGraphics capture
+    # backend behind the same two-file protocol
+    # `scripts/wayland-capture-frame.sh` implements) and is deliberately
+    # left undone rather than papered over with a skip.
+    name: GUI tests (headless sway) (${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
@@ -171,11 +216,31 @@ jobs:
           substituters: ${{ vars.SUBSTITUTERS }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
 
+      # Report what the guest actually offers BEFORE the job either works
+      # or does not. If this lane turns out to be unrunnable on the
+      # fleet, this step is the finding; without it the only artefact
+      # would be a failure whose cause has to be guessed at.
+      - name: Report the guest's rendering environment
+        if: always()
+        run: |
+          dev-exec bash -c '
+            echo "--- /dev/dri ---"; ls -la /dev/dri 2>&1 || echo "(absent)"
+            echo "--- tools ---"
+            for t in sway grim wayland-info wf-recorder; do
+              printf "%-14s %s\n" "$t" "$(command -v "$t" || echo MISSING)"
+            done
+            echo "--- sway version ---"; sway --version 2>&1 || true
+          '
+
       - name: Build shim with gpui-backend
         run: dev-exec bash -c "cd rust && cargo build --features gpui-backend"
 
-      - name: Run GUI tests under Xvfb
-        run: dev-exec just test-gui-x11 --record
+      # Headless sway, and the software renderer by default — see the
+      # long comment on this job. `--record` also leaves an MP4 behind,
+      # which is the other thing worth having when a pixel assertion
+      # fails on a machine nobody can look at.
+      - name: Run GUI tests under headless sway
+        run: dev-exec just test-gui --record
 
       - name: Upload test recordings
         if: failure()
