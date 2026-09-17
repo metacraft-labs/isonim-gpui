@@ -13,9 +13,10 @@ default = []
 # Without this feature, the shim provides the shadow tree and extern "C" API
 # but the launch function does not start a real GPUI window.
 #
-# RS-M14 Phase 2: switched from gpui = "0.2" (crates.io) to a git pin at-or-after
-# Zed PR #55059 (2026-04-28). The git revision is shared with `gpui-headless`
-# below so a single fetched copy backs both features.
+# The feature names below are `gpui_platform/*`, which is the DEPENDENCY KEY
+# in `[dependencies]`, not the package name. Since the gpui-kit alignment the
+# key is a rename of `gpui-pre-platform`; the spellings here are unchanged
+# because cargo namespaces features by key.
 gpui-backend = [
     "gpui",
     "gpui_platform",
@@ -48,25 +49,40 @@ gpui-headless = [
 ]
 
 [dependencies]
-# RS-M14 Phase 2: pin to zed-industries/zed at PR #55059 (2026-04-28,
-# "Query for window instead of capturing"). This is the final stabilization
-# PR for the cross-platform HeadlessAppContext path that lets us drive the
-# real GPUI render pipeline into an off-screen RGBA buffer.
+# THE GPUI PIN. See `docs/gpui-pin.md`; `tools/check_gpui_pin.sh` is the gate
+# that keeps the three copies of the version below in agreement.
 #
-# The same git revision is shared by `gpui` and `gpui_platform` so Cargo
-# fetches a single workspace checkout and resolves workspace-inherited deps
-# correctly.
+# `gpui-pre` is a crates.io republication of Zed's own `gpui` crate — 0.3.5 is
+# a snapshot of `zed-industries/zed@d89e9c2` (2026-09-14), and each sibling
+# carries the source revision in `[package.metadata.gpui-pre]`. The `package =`
+# renames matter and are not cosmetic:
 #
-# Bumping this revision requires verifying that:
+#   * `gpui-pre`'s `[lib] name` is already `gpui` and `gpui-pre-platform`'s is
+#     already `gpui_platform`, so every `use gpui::…` / `use gpui_platform::…`
+#     in `src/` is unchanged by the switch. Nothing in this crate's Rust source
+#     names the package.
+#   * It is the package NAME, not the lib name, that decides type identity
+#     across a binary. `gpui-kit` (`gpui-component`, `gpui-base`) depends on
+#     `gpui-pre`; while we depended on `gpui` from the zed git remote, its
+#     `Entity<T>`/`App`/`Window` and ours were different types and no gpui-kit
+#     component could be handed one of our windows. Same package name is what
+#     makes that graph unify.
+#
+# `=0.3.5` rather than `0.3.5`: the pin should move for a reason and be
+# recorded when it does, which a caret requirement silently defeats. The
+# `gpui-pre-*` siblings already inter-depend with `=` for the same reason.
+#
+# Moving this version requires verifying that:
 #   1. `cargo build --features gpui-backend` (the windowed launch path) still
 #      builds.
 #   2. `cargo build --features gpui-headless` builds and the headless test in
 #      `tests/test_headless_render.rs` still passes.
-gpui = { git = "https://github.com/zed-industries/zed", rev = "562a0e03b5c3c6e696154de92fd56302a41683c4", optional = true }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "562a0e03b5c3c6e696154de92fd56302a41683c4", optional = true }
+#   3. `just test-gui` still captures and asserts the scene's pixels.
+gpui = { package = "gpui-pre", version = "=0.3.5", optional = true }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.5", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 [dev-dependencies]
 serial_test = "3"
 serde_json = "1"
-gpui = { git = "https://github.com/zed-industries/zed", rev = "562a0e03b5c3c6e696154de92fd56302a41683c4", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.5", features = ["test-support"] }

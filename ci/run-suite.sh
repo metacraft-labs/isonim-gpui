@@ -139,7 +139,7 @@ run_gate() {
 	REPORT+=("$(printf '%-46s rc=%-3s cases=%s' "$name" "$rc" "n/a (gate)")")
 }
 
-run_gate "gate: GPUI pin is one revision" ./tools/check_gpui_pin.sh
+run_gate "gate: GPUI pin is one version" ./tools/check_gpui_pin.sh
 run_gate "gate: Rust exports == Nim bindings" ./tools/check_bindings.sh
 run_gate "gate: trap-13 assertion-helper sweep" python3 tools/trap13-assertion-helper-sweep.py tests src
 

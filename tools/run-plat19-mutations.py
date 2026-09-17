@@ -520,39 +520,89 @@ ARMS: list[Arm] = [
     ),
     Arm(
         id="G3",
-        claim="the pin gate catches a manifest whose copies of the revision "
+        claim="the pin gate catches a manifest whose copies of the version "
         "disagree",
         file=SHIM_TOML,
-        find='gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "562a0e03b5c3c6e696154de92fd56302a41683c4", optional = true }',
-        replace='gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "0000000000000000000000000000000000000000", optional = true }',
+        find='gpui_platform = { package = "gpui-pre-platform", version = "=0.3.5", optional = true }',
+        replace='gpui_platform = { package = "gpui-pre-platform", version = "=0.3.4", optional = true }',
         grader="check_pin",
-        kills="Pinned revisions disagree",
+        kills="Pinned versions disagree",
         control="__rc_is_1__",
-        because="Pinned revisions disagree across rust/**/Cargo.toml:",
+        because="Pinned versions disagree across rust/**/Cargo.toml:",
+    ),
+    Arm(
+        id="G3b",
+        claim="the pin gate requires every gpui-pre dependency to be pinned "
+        "EXACTLY — a caret requirement parses to no version at all, and a set "
+        "that silently lost a member is unanimous for free (§4)",
+        file=SHIM_TOML,
+        find='gpui_platform = { package = "gpui-pre-platform", version = "=0.3.5", optional = true }',
+        replace='gpui_platform = { package = "gpui-pre-platform", version = "0.3", optional = true }',
+        grader="check_pin",
+        kills="exact",
+        control="__rc_is_1__",
+        because='3 gpui-pre dependencies but only 2 exact ("=X.Y.Z") version requirements — every one must be pinned exactly',
     ),
     Arm(
         id="G4",
         claim="the pin gate reads the LOCK, so a manifest bumped without "
         "`cargo update` is red rather than quietly building the old tree",
         file=CARGO_LOCK,
-        find='name = "gpui_platform"\nversion = "0.1.0"\nsource = "git+https://github.com/zed-industries/zed?rev=562a0e03b5c3c6e696154de92fd56302a41683c4#562a0e03b5c3c6e696154de92fd56302a41683c4"',
-        replace='name = "gpui_platform"\nversion = "0.1.0"\nsource = "git+https://github.com/zed-industries/zed?rev=1111111111111111111111111111111111111111#1111111111111111111111111111111111111111"',
+        find='name = "gpui-pre-platform"\nversion = "0.3.5"',
+        replace='name = "gpui-pre-platform"\nversion = "0.3.4"',
         grader="check_pin",
-        kills="Cargo.lock resolved MORE THAN ONE zed revision",
+        kills="Cargo.lock resolved MORE THAN ONE gpui-pre version",
         control="manifests: 3 pin(s)",
-        because="Cargo.lock resolved MORE THAN ONE zed revision:",
+        because="Cargo.lock resolved MORE THAN ONE gpui-pre version:",
+    ),
+    Arm(
+        id="G4b",
+        claim="the pin gate refuses a SECOND GPUI CORE in the lock — type "
+        "identity in Rust is per package, so a zed git `gpui` resolved next to "
+        "`gpui-pre` is two incompatible `App`/`Entity`/`Window` sets that no "
+        "error message names, and it is the exact state that made gpui-kit "
+        "unreachable",
+        file=CARGO_LOCK,
+        find='name = "gpui-pre-scheduler"\nversion = "0.3.5"',
+        replace='name = "gpui-pre-scheduler"\nversion = "0.3.5"\nsource = "git+https://github.com/zed-industries/zed?rev=562a0e03b5c3c6e696154de92fd56302a41683c4#562a0e03b5c3c6e696154de92fd56302a41683c4"',
+        grader="check_pin",
+        # The gate names the two rogue sources on SEPARATE lines under one
+        # shared headline. `kills` is the arm's own line rather than that
+        # headline, so this arm and G4c cannot be attributed to each other's
+        # plant (§17b): the headline is in both transcripts, these two lines
+        # are each in exactly one.
+        kills="a zed-industries/zed git source",
+        control="lock:      23 gpui-pre package(s)",
+        because="  a zed-industries/zed git source",
+    ),
+    Arm(
+        id="G4c",
+        claim="…and refuses the OTHER second core the gate names: the "
+        "unrelated crates.io `gpui` package. Check 3 has two branches and "
+        "G4b arms only one; found unarmed on 2026-09-17, when the branch was "
+        "hand-planted instead — a check nobody plants is a check nobody has "
+        "seen kill (§4).",
+        file=CARGO_LOCK,
+        find='[[package]]\nname = "gpui-pre"\n',
+        replace='[[package]]\nname = "gpui"\nversion = "0.2.2"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n\n'
+        '[[package]]\nname = "gpui-pre"\n',
+        grader="check_pin",
+        kills="the crates.io `gpui` package",
+        control="lock:      23 gpui-pre package(s)",
+        because="  the crates.io `gpui` package",
     ),
     Arm(
         id="G5",
         claim="the pin gate reads the DOCUMENT, so the procedure a reader "
         "trusts cannot fall behind the build",
         file=PIN_DOC,
-        find="**Pinned revision:** `zed-industries/zed@562a0e03b5c3c6e696154de92fd56302a41683c4`",
-        replace="**Pinned revision:** `zed-industries/zed@2222222222222222222222222222222222222222`",
+        find="**Pinned version:** `gpui-pre 0.3.5`",
+        replace="**Pinned version:** `gpui-pre 0.4.9`",
         grader="check_pin",
-        kills="the documented revision is not",
-        control="lock:      23 zed source line(s)",
-        because="the documented revision is not 562a0e03b5c3c6e696154de92fd56302a41683c4 — the headline names 2222222222222222222222222222222222222222",
+        kills="the documented version is not",
+        control="cores:     gpui-pre is the only GPUI core",
+        because="the documented version is not 0.3.5 — the headline names 0.4.9",
     ),
     Arm(
         id="T1",

@@ -190,9 +190,23 @@ by the TUI, web, and GPUI flavours from a single source.
 
 ## GPUI Notes
 
-GPUI (v0.2.x) is available on crates.io. It uses:
+GPUI is Zed's GPU-accelerated UI framework. It uses:
 - A hybrid immediate/retained mode rendering model
 - GPU-accelerated rendering targeting 120 FPS
 - A Tailwind-inspired styling API (`.bg()`, `.flex()`, `.w()`, etc.)
 - `div()` as the primary layout primitive (flexbox-based)
 - Platform backends: Metal (macOS), Vulkan (Linux), DirectX (Windows)
+
+### Which GPUI crate this repository builds against
+
+Not the `gpui` crate zed-industries publishes. That one is still **0.2.2**
+(October 2025) and predates the headless render API this repository needs.
+The shim depends on the **`gpui-pre`** family instead — a crates.io
+republication of Zed's own Apache-2.0 crates, maintained by a third party
+rather than by Zed, currently pinned at `=0.3.5` (a snapshot of
+`zed-industries/zed@d89e9c2`).
+
+That is a supply-chain trade with real consequences, including who decides
+whether a revision we need gets published at all.
+**[`docs/gpui-pin.md`](docs/gpui-pin.md) states the reasons, the costs, and
+the procedure for moving the pin — read it before changing the dependency.**

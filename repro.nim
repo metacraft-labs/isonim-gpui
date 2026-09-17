@@ -13,9 +13,9 @@
 ##    macOS / Windows) under ``rust/target/debug/`` via the DEFAULT
 ##    (feature-less, "stub") cargo profile — the shadow-tree + extern-"C"
 ##    API without the ``gpui-backend`` / ``gpui-headless`` features (which
-##    pull in the ``zed-industries/zed`` git checkout + a GPU/display and
-##    are only needed for the on-screen / headless-RGBA render paths, NOT
-##    for the FFI corpus here). ``bindings.nim`` computes an ABSOLUTE
+##    pull in the ``gpui-pre`` crate family + a GPU/display and are only
+##    needed for the on-screen / headless-RGBA render paths, NOT for the
+##    FFI corpus here). ``bindings.nim`` computes an ABSOLUTE
 ##    ``dynlib`` path at Nim-compile time (``currentSourcePath()... /
 ##    rust/target/debug/libgpui_nim_shim.so`` guarded by ``fileExists``),
 ##    so as long as the ``.so`` exists at that path when a test COMPILES,

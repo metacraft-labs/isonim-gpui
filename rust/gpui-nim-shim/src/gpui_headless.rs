@@ -44,10 +44,12 @@
 //! ## Pin
 //!
 //! The headless API (`HeadlessAppContext::with_platform`,
-//! `Window::render_to_image`, `MetalHeadlessRenderer`) is unpublished on
-//! crates.io. The shim git-pins zed-industries/zed at-or-after PR #55059
-//! (2026-04-28, "Query for window instead of capturing"). The exact
-//! revision lives in `Cargo.toml`.
+//! `Window::render_to_image`, `MetalHeadlessRenderer`) is absent from the
+//! `gpui` releases zed-industries publishes — the newest is 0.2.2, from
+//! 2025-10-22. The shim pins the `gpui-pre` family instead, a crates.io
+//! republication of the same crates (0.3.5 = `zed@d89e9c2`, 2026-09-14),
+//! which is also the package graph `gpui-kit` builds against. The exact
+//! version lives in `Cargo.toml`; `docs/gpui-pin.md` says why.
 //!
 //! ## Color space + byte order
 //!

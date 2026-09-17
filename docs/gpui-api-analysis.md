@@ -4,8 +4,11 @@ This document captures the results of analyzing GPUI's public API surface and ma
 it to IsoNim's RendererBackend interface. GPUI is Zed's hybrid immediate/retained-mode,
 GPU-accelerated UI framework for Rust.
 
-Crate: `gpui` (https://docs.rs/gpui/latest/gpui/)
 Source: https://github.com/zed-industries/zed/tree/main/crates/gpui
+
+Crate: NOT `docs.rs/gpui`, which is 0.2.2 and much older than the API below.
+The dependency key is `gpui`, but the package is `gpui-pre` — see
+[`gpui-pin.md`](gpui-pin.md).
 
 ---
 
