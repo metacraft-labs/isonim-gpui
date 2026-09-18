@@ -314,6 +314,19 @@ proc parentNode*(r: GpuiRenderer; node: GpuiElement): GpuiElement =
 # Tree inspection helpers (for testing / cross-renderer comparison)
 # ===========================================================================
 
+proc nodeId*(node: GpuiElement): uint64 =
+  ## Stable identity of the shadow-tree node behind an opaque handle.
+  ## See `bindings.gpui_node_id` for why handle pointers cannot be
+  ## compared directly.
+  if node == nil: 0'u64 else: gpui_node_id(node)
+
+proc sameNode*(a, b: GpuiElement): bool =
+  ## "Are these two handles the same node?" — the comparison every
+  ## identity assertion in this repo must use. `a == b` compares
+  ## POINTERS and is false for two handles to one node.
+  let ia = nodeId(a)
+  ia != 0'u64 and ia == nodeId(b)
+
 proc childCount*(node: GpuiElement): int =
   int(gpui_child_count(node))
 

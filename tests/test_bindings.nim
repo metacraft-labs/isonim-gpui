@@ -205,6 +205,13 @@ static:
   assert compiles(block:
     var x: uint64 = gpui_bump_generation())
 
+  # Node identity. Not redundant with the handle pointer: every child /
+  # parent accessor mints a fresh Box, so two handles to one node are
+  # different pointers and `==` cannot be used to ask "same node?".
+  assert compiles(gpui_node_id(e))
+  assert compiles(block:
+    var x: uint64 = gpui_node_id(e))
+
   # --- Return type checks (via compiles + assignment) ---
   # Verify functions that return GpuiElement
   assert compiles(block:

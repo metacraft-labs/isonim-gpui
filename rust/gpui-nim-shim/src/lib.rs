@@ -620,6 +620,28 @@ pub extern "C" fn gpui_reset_tree() {
     *root = NodeId::NULL;
 }
 
+/// Stable identity of the shadow-tree node a handle refers to.
+///
+/// **This is not redundant with the handle pointer, and assuming it was
+/// is a real bug this export exists to remove.** `gpui_nth_child`,
+/// `gpui_first_child`, `gpui_parent_node` and friends each mint a FRESH
+/// `Box` (see `node_id_to_handle`), so two handles to the same node
+/// compare unequal as pointers. Anything that needs "is this the same
+/// node?" — the IsoNim reconciler's positional fallback, and every test
+/// that asserts a subtree survived a hot reload rather than being
+/// rebuilt — has to compare this instead.
+///
+/// Returns 0 for a null handle and for the null node, which are the same
+/// answer on purpose: neither is a node.
+#[no_mangle]
+pub extern "C" fn gpui_node_id(handle: *mut GpuiElement) -> u64 {
+    let id = unsafe { handle_to_node_id(handle) };
+    if id.is_null() {
+        return 0;
+    }
+    id.0
+}
+
 /// Get the number of nodes in the global tree (useful for debugging/testing).
 #[no_mangle]
 pub extern "C" fn gpui_tree_node_count() -> u64 {

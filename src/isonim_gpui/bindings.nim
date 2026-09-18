@@ -143,6 +143,16 @@ proc gpui_tree_node_count*(): uint64
 # Tree inspection (cross-renderer testing)
 # ===========================================================================
 
+proc gpui_node_id*(node: GpuiElement): uint64
+  {.importc: "gpui_node_id".}
+  ## Stable identity of the shadow-tree node this handle refers to.
+  ##
+  ## NOT redundant with the handle pointer: `gpui_nth_child`,
+  ## `gpui_first_child` and `gpui_parent_node` each return a FRESHLY
+  ## allocated handle, so two handles to the same node are different
+  ## pointers. Compare this instead — `renderer.sameNode` wraps it.
+  ## 0 means "no node" (null handle or null id).
+
 proc gpui_child_count*(node: GpuiElement): uint64
   {.importc: "gpui_child_count".}
 
