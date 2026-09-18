@@ -40,9 +40,23 @@ nim-check-bindings:
 generate-bindings:
     ./tools/generate_bindings.sh
 
-# Check that all Rust exports have matching Nim bindings
+# Check that all Rust exports have matching Nim bindings.
+#
+# SOURCE-LEVEL. This reads `extern "C"` declarations out of the crate's
+# .rs files and is `cfg`-blind by construction, so it cannot see a
+# declaration that the default feature selection compiles out. Run
+# `check-exported-symbols` for that; the two are complements, not
+# alternatives, and only the second one can catch a "could not import:"
+# at process load.
 check-bindings:
     ./tools/check_bindings.sh
+
+# Check that every symbol bindings.nim imports is EXPORTED BY A BUILT
+# SHIM. Builds the default (feature-less) profile itself and reads
+# `nm -D` off it — see the script header and
+# `codetracer-specs/Testing/Verification-Harness-Traps.md` §18.
+check-exported-symbols:
+    ./tools/check_exported_symbols.sh
 
 # Run cross-renderer tests (requires Rust shim + isonim)
 test-cross:
@@ -83,7 +97,7 @@ test-reactive-root:
 # task-manager demo's tests live in `isonim-examples/tests/` since
 # EX-M3 (`test_gpui_leaves_end_to_end.nim`); run them via that repo's
 # `just test` recipe.
-test-all: rust-test test test-cross test-integration test-structural test-reactive-root
+test-all: check-exported-symbols rust-test test test-cross test-integration test-structural test-reactive-root
 
 # Run the GUI tests, including the windowed pixel case, under headless
 # sway. THIS IS THE GUI LANE. (RS-M14b)

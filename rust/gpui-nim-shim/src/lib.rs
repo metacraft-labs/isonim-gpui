@@ -55,6 +55,15 @@ pub mod window;
 pub mod gpui_app;
 #[cfg(feature = "gpui-headless")]
 pub mod gpui_headless;
+// …and its feature-less counterpart, so the cdylib's EXPORTED SYMBOL SET
+// does not depend on which features it was built with. Without this a
+// plain `cargo build` produced 56 exports while `bindings.nim` imported
+// 62 under one `{.push dynlib.}`, and every GPUI launcher died before
+// `main` with "could not import: gpui_bump_generation". Read
+// `gpui_headless_unavailable.rs`'s module docs before changing either
+// gate.
+#[cfg(not(feature = "gpui-headless"))]
+pub mod gpui_headless_unavailable;
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
