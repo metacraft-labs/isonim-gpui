@@ -1,0 +1,30 @@
+[package]
+name = "gpui-kit-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# PLAT-42 — THE PROBE THAT SETTLES WHETHER gpui-kit CAN BE MEASURED AT ALL.
+#
+# PLAT-22 decided "draw it ourselves" on a SOURCE-LEVEL evaluation and recorded
+# three reasons why behaviour could not be measured. One of them was that the
+# package split (`gpui-pre` here, `gpui` there) forbids linking, so no gpui-kit
+# component could ever be handed one of our windows: same lib name, different
+# package name, different types.
+#
+# That reason is the one this crate tests rather than repeats. If `gpui-kit`
+# and this workspace resolve to ONE `gpui-pre`, the types unify and candidates
+# A and B are measurable. If cargo reports two versions, they are not, and the
+# decision stays where PLAT-22 left it — but for a reason a command produced.
+[dependencies]
+# PINNED WITH `=`, like the `gpui-pre` siblings and for the same stated
+# reason: a pin should move for a reason and be recorded when it does, which a
+# caret requirement silently defeats.
+#
+# The milestone cites 0.6.1; the resolver picked 0.6.4 for both crates on
+# 2026-09-23 (with `gpui-component-macros` at 0.6.6, which is the macro crate's
+# own line). 0.6.4 is what was MEASURED to unify, so 0.6.4 is what is pinned —
+# quoting 0.6.1 here would name a version nothing in this workspace has built.
+gpui-component = "=0.6.4"
+gpui-base = "=0.6.4"
+gpui = { package = "gpui-pre", version = "=0.3.5" }

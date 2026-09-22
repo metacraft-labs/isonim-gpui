@@ -133,6 +133,35 @@ test-gui *ARGS:
 test-gui-wayland *ARGS:
     just test-gui {{ARGS}}
 
+# PLAT-42 — CAN gpui-kit BE MEASURED AT ALL? A two-sided compile probe.
+#
+# PLAT-22 declined to measure gpui-kit's editor and gave three reasons. The
+# FIRST was that the package split forbids linking: gpui-kit depends on
+# `gpui-pre`, we depended on `gpui` from zed's git remote, and same lib name +
+# different package name = different types, so no gpui-kit component could ever
+# be handed one of our windows.
+#
+# This recipe tests that reason instead of repeating it, in BOTH directions,
+# because a compile that succeeds proves unification only if the same probe
+# FAILS on a split graph:
+#
+#   positive  `cargo build -p gpui-kit-probe` — values built through OUR gpui
+#             path are passed to gpui-base and gpui-component, and a value they
+#             RETURN is consumed as ours. Must succeed.
+#   negative  the same probe with our `gpui` pointed at the real `gpui` 0.2.2
+#             package. Must FAIL, with rustc naming two `Pixels` types.
+#
+# Measured 2026-09-23: positive rc 0; negative rc 101, "expected
+# `gpui::geometry::Pixels`, found `gpui::Pixels`". So the first reason is
+# REMOVED and candidates A and B are measurable.
+#
+# What it does NOT claim: that gpui-kit's editor is adoptable. The first draft
+# of the probe reached for `gpui_base::touch_selection::TouchSelection` and was
+# refused because that module is PRIVATE — evidence about candidate A's sealed
+# surface, not about linking, and the two must not be conflated.
+plat42-gpui-kit-probe:
+    cd rust && cargo build -p gpui-kit-probe
+
 # PLAT-37 (codetracer) — the THREE shim configurations, side by side.
 #
 # `rust/target/debug/libgpui_nim_shim.so` is ONE path that several recipes in
