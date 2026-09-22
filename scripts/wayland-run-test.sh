@@ -38,12 +38,27 @@
 # default. Asking for it now fails with that explanation rather than
 # silently producing a broken display.
 #
-# XVFB — cannot work at all, and is a different script
-# (`scripts/xvfb-run-test.sh`). No DRI3, so wgpu never gets a surface:
-# the window reaches `IsViewable` at its requested size and paints
-# nothing. That is a pass-shaped failure — any test that only checks the
-# window state machine goes green on it — which is why the GUI lane moved
-# to this script.
+# XVFB — a different script (`scripts/xvfb-run-test.sh`), and THIS BLOCK
+# WAS WRONG UNTIL 2026-09-22. It said: *"cannot work at all. No DRI3, so
+# wgpu never gets a surface: the window reaches `IsViewable` at its
+# requested size and paints nothing. That is a pass-shaped failure."*
+#
+# **IT PAINTS.** Re-measured from `codetracer`'s PLAT-37 lane
+# (`ci/test/plat37-window-frame.sh`, `probe_configurations`), with the
+# windowed shim at `gpui-pre 0.3.5`: the Xvfb framebuffer goes from 303
+# non-NUL bytes of 8,297,632 with no client attached to 5,184,303 with
+# `codetracer-gpui` running, and the frame read out of it is the whole
+# front-end at 1440x900. `libEGL warning: DRI3 error: Could not get DRI3
+# device` is still printed — that part was observed correctly — but the
+# conclusion does not follow from it: wgpu falls back to a software
+# Vulkan device and renders.
+#
+# What Xvfb genuinely cannot do is be CAPTURED the way this harness
+# captures: `scripts/wayland-capture-frame.sh` runs `grim`, which speaks
+# `zwlr_screencopy_manager_v1`, a Wayland protocol that does not exist on
+# an X display. (`Xvfb -fbdir` reads the framebuffer directly and is what
+# the PLAT-37 probe uses.) So sway remains this script's compositor
+# because of what READS the screen, not because X draws nothing.
 #
 # THE RUNTIME DIRECTORY. In headless mode this script gives the
 # compositor a PRIVATE, SHORT `XDG_RUNTIME_DIR` under /tmp, for two

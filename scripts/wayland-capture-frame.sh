@@ -10,9 +10,14 @@
 # picture of exists. So the picture has to be taken from outside the
 # process, and the process has to be told when it may stop.
 #
-# The protocol is two files:
+# The protocol is three files:
 #
 #   <out.ppm>        written ONLY if a frame was actually captured
+#   <out.ppm>.blank  the BLANK CONTROL — the same output, same
+#                    compositor, same run, with nothing drawn on it.
+#                    Written whenever phase 1 observes a blank screen,
+#                    which is a PRECONDITION of phase 1 rather than a
+#                    best effort; see below
 #   <out.ppm>.done   written ALWAYS, exactly once, as the last act
 #
 # `.done` is unconditional on purpose. The test's watcher thread waits
@@ -20,6 +25,31 @@
 # writing it, a capture failure would present as a hung test rather than
 # as a failed one. The absence of <out.ppm> next to a present `.done` is
 # what the test reads as "nothing was captured", and it fails on it.
+#
+# THE BLANK CONTROL IS AN ARTEFACT, AND ITS ABSENCE IS FATAL
+# ==========================================================
+#
+# This script always had phase 1 — wait for the output to go blank — and
+# phase 1 is exactly the right shape for a negative control: the same
+# compositor, the same output, the same run, with no client attached. It
+# just never KEPT the frame. `$OUT` was written only from the painted or
+# the timed-out frame, so every caller asserting "the captured frame is
+# not a blank screen" was asserting it against a blank screen nobody had.
+# `codetracer-specs/Testing/Verification-Harness-Traps.md` §7b names that
+# shape: an unfalsified negative control is a self-comparison wearing a
+# negation, and a "not blank" check with no blank to compare against is
+# §4 — a comparison with nothing on the other side is satisfied for free.
+#
+# So phase 1 now writes the frame it observed to `<out.ppm>.blank`, and
+# a run in which the screen NEVER goes blank FAILS HERE rather than
+# printing "continuing anyway". That sentence used to be defensible on
+# the grounds that the caller's own "nothing but my scene is on screen"
+# assertion would catch a dirty screen — but it is not defensible for a
+# caller whose assertion IS the comparison against the control, because
+# for that caller the missing control is the missing instrument. A
+# harness that cannot take its control does not have a weaker verdict; it
+# has no verdict, and saying so is the difference between a failed run
+# and a run that quietly measured against nothing.
 #
 # WHEN IS A FRAME READY?
 #
@@ -31,14 +61,15 @@
 # rather than green, which is the harness working; but the gate was
 # picking the wrong moment, so it was fixed.
 #
-#   PHASE 1 — WAIT FOR THE OUTPUT TO GO BLANK. A headless sway output's
-#   background is solid #000000, so once whatever was there has gone,
-#   the payload is very nearly all NUL. Entering phase 2 only from a
-#   blank screen means the frame phase 2 sees can only have been drawn
-#   by the window the test is about. Bounded: if the screen never goes
-#   blank we say so in this log and go on anyway, because the test's own
-#   "no colour other than the scene's" assertion will fail on a dirty
-#   screen, and a failed assertion beats a harness that gives up.
+#   PHASE 1 — WAIT FOR THE OUTPUT TO GO BLANK, AND KEEP THAT FRAME. A
+#   headless sway output's background is solid #000000, so once whatever
+#   was there has gone, the payload is very nearly all NUL. Entering
+#   phase 2 only from a blank screen means the frame phase 2 sees can
+#   only have been drawn by the window the test is about — and the blank
+#   frame itself is retained at `<out.ppm>.blank`, which is the negative
+#   control every vision assertion over `$OUT` is compared against.
+#   Bounded, and the bound is FATAL: if the screen never goes blank this
+#   script exits non-zero without entering phase 2. See the header.
 #
 #   PHASE 2 — WAIT FOR A PAINTED, SETTLED FRAME. Painted: at least
 #   PAINTED_PERCENT of the payload bytes are non-NUL. Settled: two
@@ -101,7 +132,8 @@ PAINT_TICKS=$((TIMEOUT_S * 4))
 
 PREV="${OUT}.prev"
 CUR="${OUT}.cur"
-rm -f "$OUT" "$PREV" "$CUR"
+BLANK="${OUT}.blank"
+rm -f "$OUT" "$PREV" "$CUR" "$BLANK"
 
 # Echoes "<non-NUL bytes> <payload bytes>" for the frame in $CUR, or
 # nothing at all if grim failed.
@@ -129,6 +161,11 @@ for ((i = 1; i <= BLANK_TICKS; i++)); do
     read -r nonzero total <<<"$m"
     if ! percent_at_least "$nonzero" "$total" "$BLANK_PERCENT"; then
       echo "phase1 tick $i: output is blank ($nonzero/$total non-NUL) — watching for the window"
+      # THE CONTROL IS KEPT, not merely observed. `mv` rather than `cp`
+      # so the next `measure` cannot append to a half-written file, and
+      # so a `$BLANK` that exists is a `$BLANK` that was complete.
+      mv "$CUR" "$BLANK"
+      echo "phase1: blank control kept at $BLANK ($nonzero/$total non-NUL)"
       blanked=1
       break
     fi
@@ -139,9 +176,23 @@ for ((i = 1; i <= BLANK_TICKS; i++)); do
   sleep "$TICK_S"
 done
 if [[ "$blanked" -eq 0 ]]; then
-  echo "phase1: output never went blank in $((BLANK_TICKS / 4))s; continuing anyway."
-  echo "        the test asserts that nothing but its own scene is on screen,"
-  echo "        so a dirty screen surfaces there rather than being hidden here."
+  # FATAL, and this used to be "continuing anyway". See the header: a
+  # caller whose assertion is a comparison against this control has no
+  # instrument without it, and a harness with no instrument must say so
+  # rather than produce a verdict.
+  echo "phase1: FATAL — the output never went blank in $((BLANK_TICKS / 4))s, so no"
+  echo "        blank control could be taken. Every vision assertion over the"
+  echo "        captured frame is a comparison against that control, and a"
+  echo "        comparison with nothing on the other side is satisfied for free"
+  echo "        (Verification-Harness-Traps §7b, §4). Nothing is captured and"
+  echo "        \$OUT is deliberately not written; the caller reads its absence"
+  echo "        as a failure."
+  if [[ -f "$CUR" ]]; then
+    mv "$CUR" "${OUT}.dirty.ppm"
+    echo "        the screen this run could not blank is kept at ${OUT}.dirty.ppm"
+  fi
+  rm -f "$PREV"
+  exit 2
 fi
 
 # --- Phase 2: wait for a painted, settled frame ----------------------

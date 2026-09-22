@@ -303,34 +303,13 @@ pub mod gpui_render {
     /// Supports both legacy function pointer listeners (callback_id == 0)
     /// and dispatcher-based listeners (callback_id > 0).
     pub fn dispatch_shadow_event(node_id: NodeId, event_name: &str) {
-        let listeners: Vec<(extern "C" fn(), i32)> = {
-            let tree = crate::lock_tree();
-            if let Some(node) = tree.get(node_id) {
-                node.event_listeners
-                    .get(event_name)
-                    .map(|ls| ls.iter().map(|l| (l.callback, l.callback_id)).collect())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        };
-
-        let dispatcher = {
-            crate::EVENT_DISPATCHER
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone()
-        };
-
-        for (cb, id) in listeners {
-            if id > 0 {
-                if let Some(dispatch) = dispatcher {
-                    dispatch(id);
-                }
-            } else {
-                cb();
-            }
-        }
+        // PLAT-38: this WAS a byte-identical copy of `gpui_dispatch_event`'s
+        // body. Two copies of one predicate is §30 — and this copy is the one
+        // a real compositor event runs, while almost every case in the
+        // campaign drives the other, so the suites were grading a different
+        // function from the one the window uses. One routine now; the payload
+        // is `None` because a mouse-up carries no key.
+        crate::input::deliver(node_id, event_name, None);
     }
 }
 
@@ -549,7 +528,7 @@ mod tests {
     fn test_build_render_plan_with_click_handler() {
         let mut tree = Tree::new();
         let mut node = Node::new_element("button");
-        extern "C" fn noop() {}
+        extern "C" fn noop(_p: *const crate::input::GpuiEventPayload) {}
         node.event_listeners
             .entry("click".into())
             .or_default()
@@ -660,7 +639,7 @@ mod tests {
     fn test_build_render_plan_with_input_handler() {
         let mut tree = Tree::new();
         let mut node = Node::new_element("div");
-        extern "C" fn noop() {}
+        extern "C" fn noop(_p: *const crate::input::GpuiEventPayload) {}
         node.event_listeners
             .entry("input".into())
             .or_default()
@@ -677,7 +656,7 @@ mod tests {
     fn test_build_render_plan_multiple_event_handlers() {
         let mut tree = Tree::new();
         let mut node = Node::new_element("button");
-        extern "C" fn noop() {}
+        extern "C" fn noop(_p: *const crate::input::GpuiEventPayload) {}
         node.event_listeners
             .entry("click".into())
             .or_default()
@@ -716,7 +695,7 @@ mod tests {
     #[test]
     fn test_render_plan_preserves_event_handlers_in_children() {
         let mut tree = Tree::new();
-        extern "C" fn noop() {}
+        extern "C" fn noop(_p: *const crate::input::GpuiEventPayload) {}
 
         let root = Node::new_element("root");
         let root_id = tree.insert(root);
@@ -872,7 +851,7 @@ mod integration_tests {
             let btn_text = gpui_create_text_node(c("+").as_ptr());
             gpui_append_child(button, btn_text);
 
-            extern "C" fn on_click() {}
+            extern "C" fn on_click(_p: *const crate::input::GpuiEventPayload) {}
             gpui_add_event_listener(button, c("click").as_ptr(), on_click);
             gpui_append_child(root, button);
 
@@ -988,7 +967,7 @@ mod integration_tests {
             gpui_reset_tree();
 
             static CLICKED: AtomicU32 = AtomicU32::new(0);
-            extern "C" fn on_click() {
+            extern "C" fn on_click(_p: *const crate::input::GpuiEventPayload) {
                 CLICKED.fetch_add(1, Ordering::SeqCst);
             }
             CLICKED.store(0, Ordering::SeqCst);
@@ -1013,7 +992,7 @@ mod integration_tests {
     fn test_render_plan_multiple_event_types_via_ffi() {
         unsafe {
             gpui_reset_tree();
-            extern "C" fn noop() {}
+            extern "C" fn noop(_p: *const crate::input::GpuiEventPayload) {}
 
             let node = gpui_create_element(c("div").as_ptr());
             gpui_add_event_listener(node, c("click").as_ptr(), noop);
@@ -1071,7 +1050,7 @@ mod integration_tests {
             let input = gpui_create_element(c("input").as_ptr());
             let add_btn = gpui_create_element(c("button").as_ptr());
             let add_text = gpui_create_text_node(c("Add").as_ptr());
-            extern "C" fn on_add() {}
+            extern "C" fn on_add(_p: *const crate::input::GpuiEventPayload) {}
             gpui_add_event_listener(add_btn, c("click").as_ptr(), on_add);
             gpui_append_child(add_btn, add_text);
             gpui_append_child(input_area, input);
@@ -1282,7 +1261,7 @@ mod integration_tests {
             let plan1 = get_plan_direct(div);
             assert!(!plan1.has_click_handler);
 
-            extern "C" fn noop() {}
+            extern "C" fn noop(_p: *const crate::input::GpuiEventPayload) {}
             gpui_add_event_listener(div, c("click").as_ptr(), noop);
 
             let plan2 = get_plan_direct(div);
@@ -1368,8 +1347,8 @@ mod integration_tests {
     fn test_render_plan_child_handlers_preserved() {
         unsafe {
             gpui_reset_tree();
-            extern "C" fn on_click() {}
-            extern "C" fn on_input() {}
+            extern "C" fn on_click(_p: *const crate::input::GpuiEventPayload) {}
+            extern "C" fn on_input(_p: *const crate::input::GpuiEventPayload) {}
 
             let root = gpui_create_element(c("div").as_ptr());
             let btn = gpui_create_element(c("button").as_ptr());
@@ -1438,7 +1417,7 @@ mod integration_tests {
 
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             COUNTER.store(0, Ordering::SeqCst);
-            extern "C" fn increment() {
+            extern "C" fn increment(_p: *const crate::input::GpuiEventPayload) {
                 COUNTER.fetch_add(1, Ordering::SeqCst);
             }
 
@@ -1486,7 +1465,7 @@ mod integration_tests {
             gpui_append_child(span, text);
             gpui_append_child(div, span);
 
-            extern "C" fn noop() {}
+            extern "C" fn noop(_p: *const crate::input::GpuiEventPayload) {}
             gpui_add_event_listener(div, c("click").as_ptr(), noop);
 
             let json = get_plan_json(div);
@@ -1513,6 +1492,43 @@ mod integration_tests {
             let node = gpui_create_text_node(c("hello \"world\"").as_ptr());
             let json = get_plan_json(node);
             assert_eq!(json["text"], "hello \"world\"");
+            gpui_destroy_element(node);
+        }
+    }
+
+    /// A text node carrying CONTROL CHARACTERS still serialises to a document
+    /// a strict parser accepts.
+    ///
+    /// The case above tested quotes and backslashes, which is what the old
+    /// hand-written escape chain handled — so it was green while
+    /// `gpui_render_plan_json` was emitting RFC 8259-invalid documents for
+    /// every text node containing a newline. That is not hypothetical: a real
+    /// `codetracer-gpui --plan-out` artefact taken on 2026-09-22 failed
+    /// Python's `json.load` at byte 39045 on the newline inside Python's
+    /// `builtins` docstring, while Nim's LENIENT `std/json` parsed the same
+    /// bytes without complaint. One document, two parsers, and only the
+    /// lenient one had ever been asked.
+    ///
+    /// `get_plan_json` goes through `serde_json::from_str(...).expect(...)`,
+    /// so the strictness is the harness's rather than this assertion's: a
+    /// regression fails at the parse, before any `assert_eq!` runs.
+    #[test]
+    #[serial]
+    fn test_render_plan_json_escapes_control_characters() {
+        unsafe {
+            gpui_reset_tree();
+            // Every class the escaper distinguishes, in one string: the two
+            // RFC-named ones it already handled, the three with short escapes,
+            // and one from the `\u00XX` tail that has no short form.
+            let raw = "line1\nline2\tcol\r\u{0b}end \\ \"q\"";
+            let node = gpui_create_text_node(c(raw).as_ptr());
+            let json = get_plan_json(node);
+            // Round trip: the parsed value is the ORIGINAL string, not an
+            // escaped rendering of it. An escaper that emitted a literal
+            // `\n` two-character sequence would also parse, and would be
+            // wrong — which is why this compares against `raw` rather than
+            // merely asserting that parsing succeeded.
+            assert_eq!(json["text"], raw);
             gpui_destroy_element(node);
         }
     }
@@ -1544,13 +1560,13 @@ mod integration_tests {
             static CALL_B: AtomicU32 = AtomicU32::new(0);
             static CALL_C: AtomicU32 = AtomicU32::new(0);
 
-            extern "C" fn handler_a() {
+            extern "C" fn handler_a(_p: *const crate::input::GpuiEventPayload) {
                 CALL_A.fetch_add(1, Ordering::SeqCst);
             }
-            extern "C" fn handler_b() {
+            extern "C" fn handler_b(_p: *const crate::input::GpuiEventPayload) {
                 CALL_B.fetch_add(1, Ordering::SeqCst);
             }
-            extern "C" fn handler_c() {
+            extern "C" fn handler_c(_p: *const crate::input::GpuiEventPayload) {
                 CALL_C.fetch_add(1, Ordering::SeqCst);
             }
 
@@ -1593,10 +1609,10 @@ mod integration_tests {
             static CLICK_COUNT: AtomicU32 = AtomicU32::new(0);
             static INPUT_COUNT: AtomicU32 = AtomicU32::new(0);
 
-            extern "C" fn on_click() {
+            extern "C" fn on_click(_p: *const crate::input::GpuiEventPayload) {
                 CLICK_COUNT.fetch_add(1, Ordering::SeqCst);
             }
-            extern "C" fn on_input() {
+            extern "C" fn on_input(_p: *const crate::input::GpuiEventPayload) {
                 INPUT_COUNT.fetch_add(1, Ordering::SeqCst);
             }
 
@@ -1659,7 +1675,7 @@ mod integration_tests {
             gpui_reset_tree();
 
             static CALL: AtomicU32 = AtomicU32::new(0);
-            extern "C" fn handler() {
+            extern "C" fn handler(_p: *const crate::input::GpuiEventPayload) {
                 CALL.fetch_add(1, Ordering::SeqCst);
             }
             CALL.store(0, Ordering::SeqCst);
@@ -1685,7 +1701,7 @@ mod integration_tests {
 
             static SUCCESS: AtomicU32 = AtomicU32::new(0);
 
-            extern "C" fn tree_accessing_handler() {
+            extern "C" fn tree_accessing_handler(_p: *const crate::input::GpuiEventPayload) {
                 // If the lock were still held, this would deadlock.
                 let count = crate::gpui_tree_node_count();
                 if count > 0 {
@@ -1718,7 +1734,7 @@ mod integration_tests {
 
         static SUCCESS: AtomicU32 = AtomicU32::new(0);
 
-        extern "C" fn tree_reader() {
+        extern "C" fn tree_reader(_p: *const crate::input::GpuiEventPayload) {
             // Access the tree to verify lock is released
             let count = crate::gpui_tree_node_count();
             if count > 0 {
@@ -1783,7 +1799,7 @@ mod integration_tests {
 
         static CLICK_FIRED: AtomicU32 = AtomicU32::new(0);
 
-        extern "C" fn on_click() {
+        extern "C" fn on_click(_p: *const crate::input::GpuiEventPayload) {
             CLICK_FIRED.fetch_add(1, Ordering::SeqCst);
         }
 

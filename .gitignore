@@ -28,3 +28,14 @@ tests/test_window_callback_registry
 # NH-M1 reactive-root suite binary
 tests/test_render_native_gpui_reactive
 tests/test_gpui_reconciler_identity
+
+# Input/focus suite binaries.
+#
+# These are listed BY NAME, as every entry above is, and the temptation to
+# collapse the list into `tests/test_*` should be resisted: the sources are
+# `tests/test_*.nim`, so that glob ignores the suites themselves. This repo's
+# sibling learned the general version of that lesson the hard way — a bare
+# `*map` pattern matched any path component ending in "map" and hid a whole
+# `keymap/` directory from git. Prefer a longer explicit list to a clever glob.
+tests/test_input_focus
+tests/test_gui_keyboard

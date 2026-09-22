@@ -92,6 +92,22 @@
               # absent from the shell, so CI would have been the first
               # place to find out.
               pkgs.grim
+              # PLAT-38: `wtype` is how a REAL key reaches a GPUI window
+              # here. It is a Wayland client speaking
+              # `zwp_virtual_keyboard_manager_v1`, which wlroots (and
+              # therefore sway) implements, so the key it sends is
+              # attached to the compositor's own `wl_seat` and is routed
+              # to the focused surface exactly as a physical keyboard's
+              # would be. That is the distinction PLAT-38's gate rests
+              # on: a synthesised call into `gpui_dispatch_event` would
+              # test the binding against itself.
+              #
+              # `ydotool` is NOT here and is not an alternative: it
+              # injects through `uinput`, which needs a privileged daemon
+              # and a device node a CI container does not have — and a
+              # key that never reached the compositor would be a
+              # different experiment wearing the same name.
+              pkgs.wtype
               # weston is deliberately NOT here. `weston
               # --backend=headless-backend.so` advertises no `wl_seat`
               # and GPUI unwraps that `None` at startup, so it cannot run

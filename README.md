@@ -135,12 +135,22 @@ count and bounding box.
 
 Two things follow from that, both measured rather than assumed:
 
-* **Xvfb cannot be used.** It has no DRI3, so wgpu never gets a surface
-  and the GPUI window paints nothing while still reporting itself as
-  viewable at the requested size. Every shadow-tree, render-plan and
-  window-state assertion passes on that. `just test-gui-x11` therefore
-  refuses and says so; `scripts/xvfb-run-test.sh` stays for X11 work
-  that does not need the GPU.
+* **Xvfb cannot be used *here*, and the reason is the CAPTURE, not the
+  renderer.** This bullet used to say Xvfb "has no DRI3, so wgpu never
+  gets a surface and the GPUI window paints nothing". Re-measured
+  2026-09-22 with the windowed shim: **it paints.** The X framebuffer
+  (read through `Xvfb -fbdir`) goes from 303 non-NUL bytes of 8,297,632
+  with no client attached to 5,184,303 with the window up, and the frame
+  decoded out of it is the whole front-end at 1440x900. The
+  `libEGL warning: DRI3 error` is still printed — that part was observed
+  correctly — but the conclusion did not follow: wgpu falls back to a
+  software Vulkan device and renders. What Xvfb cannot do is be READ BACK
+  by this harness: `grim` speaks `zwlr_screencopy_manager_v1`, a Wayland
+  protocol that does not exist on an X display, and the pinned `ffmpeg`
+  has no `x11grab` demuxer. So `just test-gui-x11` still refuses — the
+  decision is unchanged, only the reason is true now;
+  `scripts/xvfb-run-test.sh` stays for X11 work that does not need the
+  GPU.
 * **Weston cannot be used.** `weston --backend=headless-backend.so`
   advertises no `wl_seat`, and GPUI's Wayland client unwraps that
   `None` at startup. It used to be this harness's default compositor;

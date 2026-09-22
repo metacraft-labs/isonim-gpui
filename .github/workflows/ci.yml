@@ -151,13 +151,22 @@ jobs:
     # WHY THIS MOVED OFF XVFB, AND WHAT IS AND IS NOT MEASURED
     # -----------------------------------------------------------------
     #
-    # It used to run `just test-gui-x11`. That recipe now refuses,
-    # because Xvfb has no DRI3: wgpu never gets a surface and the GPUI
-    # window paints nothing while still reaching `IsViewable` at its
-    # requested size. The suite passed on that, since every assertion it
-    # had was over the shadow tree, the render plan, or the in-process
-    # window state machine. So the job was green over a display that had
-    # rendered nothing, and no Xvfb configuration fixes that.
+    # It used to run `just test-gui-x11`. That recipe now refuses — but
+    # NOT for the reason this comment gave until 2026-09-22. It said
+    # "Xvfb has no DRI3: wgpu never gets a surface and the GPUI window
+    # paints nothing". Re-measured with the windowed shim: it PAINTS —
+    # the `Xvfb -fbdir` framebuffer goes from 303 non-NUL bytes of
+    # 8,297,632 with no client to 5,184,303 with the window up. The
+    # `libEGL DRI3` warning is still printed; wgpu falls back to a
+    # software Vulkan device.
+    #
+    # The recipe refuses because this lane CAPTURES with `grim`, a
+    # `zwlr_screencopy_manager_v1` client, and that protocol does not
+    # exist on an X display. The pass-shaped failure behind the move is
+    # unchanged and is not Xvfb's: every assertion the suite had was over
+    # the shadow tree, the render plan, or the in-process window state
+    # machine, so a job can be green over a display that rendered
+    # nothing.
     #
     # MEASURED, on the x86-64 dev workstation, 2026-09-17:
     #   * headless sway (`WLR_BACKENDS=headless`) renders GPUI, and the

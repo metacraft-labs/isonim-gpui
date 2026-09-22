@@ -2,21 +2,34 @@
 # xvfb-run-test.sh - Run commands in a virtual X11 display (Xvfb)
 #
 # ===========================================================================
-# NOT USABLE FOR GPUI RENDERING  (RS-M14b, 2026-09-17)
+# NOT USABLE FOR THE GPUI PIXEL LANE  (RS-M14b, 2026-09-17;
+#                                      corrected 2026-09-22)
 # ===========================================================================
 #
-# Xvfb has no DRI3. wgpu therefore never obtains a surface, and a GPUI
-# window opened on this display reaches `IsViewable` at its requested
-# size and paints NOTHING. The `LIBGL_ALWAYS_SOFTWARE=1` and mesa driver
-# plumbing below does not change that: software GL is not the missing
-# piece, the buffer-passing extension is.
+# THIS HEADER SAID "NOT USABLE FOR GPUI RENDERING" AND GAVE THE WRONG
+# REASON. It read: "Xvfb has no DRI3. wgpu therefore never obtains a
+# surface, and a GPUI window opened on this display reaches `IsViewable`
+# at its requested size and paints NOTHING."
 #
-# What makes this worth a warning rather than a deletion is the shape of
-# the failure. A window that exists and never paints satisfies every
-# assertion the GUI suite had before RS-M14b — the shadow tree, the
-# render plan, the window state machine — so the lane went green on a
-# display that had rendered nothing. `just test-gui-x11` now refuses for
-# this reason, and the GUI lane runs under headless sway via
+# RE-MEASURED 2026-09-22 with the windowed shim: IT PAINTS. Read through
+# `Xvfb -fbdir`, the framebuffer goes from 303 non-NUL bytes of 8,297,632
+# with no client attached to 5,184,303 with the window up, and the frame
+# decoded out of it is the whole front-end at 1440x900. `libEGL warning:
+# DRI3 error: Could not get DRI3 device` is still printed — that part was
+# observed correctly — but the conclusion did not follow: wgpu falls back
+# to a software Vulkan device and renders. The original reading was taken
+# with a capture that cannot see an X root window, so it read blank.
+#
+# WHAT IS STILL TRUE is that this display cannot serve the GPUI PIXEL
+# lane, because that lane reads frames back with `grim`, a
+# `zwlr_screencopy_manager_v1` client, and that protocol does not exist
+# on X; the pinned `ffmpeg` has no `x11grab` demuxer either. And the
+# pass-shaped failure this warning was written against is unchanged and
+# not Xvfb-specific: a window that exists and never paints satisfies
+# every assertion the GUI suite had before RS-M14b — the shadow tree, the
+# render plan, the window state machine — so a lane can go green over a
+# display that rendered nothing. `just test-gui-x11` refuses for the
+# capture reason, and the GUI lane runs under headless sway via
 # `scripts/wayland-run-test.sh`, where `zwlr_screencopy_manager_v1` lets
 # `grim` read the output back and the pixels can actually be asserted on.
 #

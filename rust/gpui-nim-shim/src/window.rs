@@ -82,6 +82,14 @@ pub struct WindowConfig {
     pub height: f64,
     pub state: WindowState,
 
+    /// **PLAT-38: whether this window currently holds the seat's keyboard
+    /// focus.** `notify_focus` used to forward the event and remember
+    /// nothing, which was enough while focus was only something to report.
+    /// It is not enough once keys are ROUTED: PLAT-38 asks for *"the same key
+    /// delivered while the window does not hold focus changes nothing"*, and
+    /// a shim with no memory of window focus cannot refuse.
+    pub focused: bool,
+
     // Lifecycle callbacks (optional, LEGACY per-window function pointers)
     pub on_resize: Option<ResizeCallback>,
     pub on_focus: Option<FocusCallback>,
@@ -102,6 +110,7 @@ impl WindowConfig {
             width,
             height,
             state: WindowState::Created,
+            focused: false,
             on_resize: None,
             on_focus: None,
             on_close: None,
@@ -273,6 +282,10 @@ pub fn close_window(id: u32) -> bool {
     if allow_close {
         with_window_mut(id, |w| {
             w.state = WindowState::Closed;
+            // A closed window holding keyboard focus would keep routing keys
+            // to a surface that is gone — the negative twin passing for the
+            // wrong reason, in the direction that looks like success.
+            w.focused = false;
         });
     }
 
@@ -323,8 +336,22 @@ pub fn notify_resize(id: u32, width: f64, height: f64) {
     }
 }
 
+/// Whether ANY window holds the seat's keyboard focus.
+///
+/// **THE ONE PREDICATE.** `input::gpui_dispatch_key_to_focus` refuses on it
+/// and PLAT-38's negative-twin assertion reads it; two spellings would let
+/// the control agree with itself while the rule was broken
+/// (`Verification-Harness-Traps.md` §30).
+pub fn any_window_focused() -> bool {
+    lock_windows().iter().any(|w| w.focused)
+}
+
 /// Simulate a focus event.
 pub fn notify_focus(id: u32, focused: bool) {
+    // Recorded BEFORE the callback runs, so a handler that asks the shim
+    // "am I focused?" from inside its own focus callback gets the state the
+    // event announced rather than the one it replaced.
+    with_window_mut(id, |w| w.focused = focused);
     let Some((dispatched, legacy)) = with_window(id, |w| (w.dispatch_focus, w.on_focus)) else {
         return;
     };

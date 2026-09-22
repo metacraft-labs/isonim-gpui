@@ -153,9 +153,48 @@ static:
   assert compiles(gpui_reset_windows())
 
   # --- Element event dispatcher (the element-callback registry) ---
-  var disp: proc(callbackId: int32) {.cdecl.}
+  var disp: proc(callbackId: int32; payload: ptr GpuiEventPayload) {.cdecl.}
   assert compiles(gpui_set_event_dispatcher(disp))
   assert compiles(gpui_add_event_listener_id(e, "click".cstring, 1.int32))
+
+  # --- PLAT-38: payload-carrying delivery, and element focus ---
+  #
+  # The SIGNATURES, checked the way every other binding here is. The
+  # BEHAVIOUR is `tests/test_input_focus.nim`'s, which links the shim.
+  var pay: GpuiEventPayload
+  assert compiles(gpui_event_payload_layout(0.uint32))
+  assert compiles(gpui_dispatch_event_with(e, "keydown".cstring, addr pay))
+  assert compiles(gpui_dispatch_key_to_focus("keydown".cstring, addr pay))
+  assert compiles(gpui_last_event_key(e, nil, 0.uint64))
+  assert compiles(gpui_last_event_name(e, nil, 0.uint64))
+  assert compiles(gpui_last_event_modifiers(e))
+  assert compiles(gpui_last_event_kind(e))
+  assert compiles(gpui_last_event_repeat(e))
+  assert compiles(gpui_last_event_seq(e))
+  assert compiles(gpui_event_delivery_count(e))
+  assert compiles(gpui_set_focusable(e, 1.uint8))
+  assert compiles(gpui_is_focusable(e))
+  assert compiles(gpui_focus_element(e))
+  assert compiles(gpui_blur_element(e))
+  assert compiles(gpui_is_focused(e))
+  assert compiles(gpui_focused_element())
+  assert compiles(gpui_focused_count())
+  assert compiles(gpui_set_focus_trap(e, 1.uint8))
+  assert compiles(gpui_focus_trap_element())
+  assert compiles(gpui_focusable_count())
+  assert compiles(gpui_focusable_at(0.uint64))
+  assert compiles(gpui_focus_next())
+  assert compiles(gpui_focus_prev())
+  # The two-call sizing protocol answers a BYTE COUNT, not a handle, and the
+  # focus queries answer widths a caller will compare against 0 or 1. Both
+  # are asserted by TYPE, because a binding whose return type drifted would
+  # still `compiles`.
+  assert compiles(block:
+    var n: uint64 = gpui_last_event_seq(e))
+  assert compiles(block:
+    var n: uint32 = gpui_dispatch_event_with(e, "keydown".cstring, addr pay))
+  assert compiles(block:
+    var n: uint8 = gpui_focus_element(e))
 
   # --- PLAT-19: window lifecycle dispatchers (the window registry) ---
   var wrd: WindowResizeDispatcher

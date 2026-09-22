@@ -669,7 +669,7 @@ fn test_button_with_click_handler_renders() {
             button.set_text_content("Click me");
             button.parent = root_id;
 
-            extern "C" fn noop() {}
+            extern "C" fn noop(_p: *const gpui_nim_shim::input::GpuiEventPayload) {}
             button
                 .event_listeners
                 .entry("click".to_string())

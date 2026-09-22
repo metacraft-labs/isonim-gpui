@@ -98,6 +98,87 @@ pub struct Node {
     /// Event listeners keyed by event name.
     /// Each event can have multiple listeners.
     pub event_listeners: HashMap<String, Vec<EventListener>>,
+
+    // -----------------------------------------------------------------
+    // PLAT-38: element focus, and the delivery record
+    // -----------------------------------------------------------------
+    /// Whether this element can take focus. Declared by the caller via
+    /// `gpui_set_focusable`; the focus ORDER is the pre-order walk of the
+    /// elements carrying it.
+    pub focusable: bool,
+
+    /// **Whether this element currently holds focus — stored PER NODE, and
+    /// that is a deliberate design choice with a cost.**
+    ///
+    /// A single `focused: NodeId` on `Tree` would be cheaper and would make
+    /// exclusivity true by construction. It would also make PLAT-38's focus
+    /// partition law — *"the number of elements holding focus is exactly
+    /// zero or one, asserted over the whole element tree"* — unfalsifiable:
+    /// there would be no state in which two elements hold it, so the
+    /// published killing mutation (*"let two elements hold it"*) could not
+    /// be performed and the law would be a sentence rather than a check.
+    /// `codetracer-specs/Testing/Verification-Harness-Traps.md` §36 is
+    /// exactly this shape — a published killer that cannot kill its own law
+    /// because the implementation chose an invariant that swallows it — and
+    /// PLAT-38's own text says to read the killer against the
+    /// implementation before trusting the law.
+    ///
+    /// So exclusivity is ESTABLISHED by `Tree::focus_only`, which clears
+    /// every other flag, and OBSERVED by `Tree::focused_ids`, which counts
+    /// them. The cost is that focusing is O(n) in the tree rather than
+    /// O(1); measured against the alternative, an unkillable law is the
+    /// more expensive of the two.
+    pub focused: bool,
+
+    /// Whether this element traps focus inside its own subtree. This is what
+    /// makes the vocabulary's `Modal` expressible: the entry's specified
+    /// behaviour is *a region that takes exclusive input until dismissed*,
+    /// and a trap is that statement in the renderer rather than in prose.
+    pub focus_trap: bool,
+
+    /// **The last event DELIVERED to this element, recorded by the shim
+    /// before any callback runs.** This is the Rust-side element store that
+    /// PLAT-38's gate reads: a Nim handler cannot write it without crossing
+    /// the FFI boundary, so a binding that applied a key on its own side —
+    /// or an adapter that emulated delivery over the shadow tree — leaves it
+    /// untouched.
+    pub last_event: Option<DeliveredEvent>,
+
+    /// How many LISTENERS the deliveries to this element actually reached.
+    /// `last_event.is_some()` says a key arrived; this says whether it
+    /// reached anything, which is the difference PLAT-38's gate names
+    /// between *"a key that reaches nothing"* and *"a key that reaches
+    /// everything"*.
+    pub delivery_count: u64,
+}
+
+/// One event, as the element store recorded it arriving.
+///
+/// The key is kept as a BASE NAME plus a MODIFIER BITMASK rather than as a
+/// rendered string such as `"Shift+F10"`. The reason is
+/// `Verification-Harness-Traps.md` §25: a helper that silently drops a
+/// modifier it cannot spell hands you a test about a different key, and that
+/// has already been paid for once in this campaign. A bitmask cannot be
+/// dropped without the number changing, and the number is what the gate
+/// asserts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredEvent {
+    /// The event name it arrived under (`"keydown"`, `"click"`, …).
+    pub event: String,
+    /// One of the `GPUI_EVENT_*` kinds.
+    pub kind: u32,
+    /// The base key name, unmodified — `"Up"`, `"F10"`, `"a"`, `"Space"`,
+    /// `"é"`. Empty for an event that carries no key.
+    pub key: String,
+    /// `GPUI_MOD_*` bits.
+    pub modifiers: u32,
+    /// Whether the platform reported this as an auto-repeat.
+    pub repeat: bool,
+    /// Process-wide monotonic delivery sequence number, starting at 1.
+    /// A node that has never received anything answers 0, which is how
+    /// "nothing arrived" is distinguished from "an identical thing arrived
+    /// again".
+    pub seq: u64,
 }
 
 /// An event listener stored in the shadow tree.
@@ -110,7 +191,8 @@ pub struct Node {
 ///   `callback` is set to a dummy no-op in this mode.
 #[derive(Debug, Clone, Copy)]
 pub struct EventListener {
-    pub callback: extern "C" fn(),
+    /// PLAT-38 widened this from `extern "C" fn()`. See `crate::EventCallback`.
+    pub callback: crate::EventCallback,
     pub callback_id: i32,
 }
 
@@ -127,6 +209,11 @@ impl Node {
             children: Vec::new(),
             parent: NodeId::NULL,
             event_listeners: HashMap::new(),
+            focusable: false,
+            focused: false,
+            focus_trap: false,
+            last_event: None,
+            delivery_count: 0,
         }
     }
 
@@ -141,6 +228,11 @@ impl Node {
             children: Vec::new(),
             parent: NodeId::NULL,
             event_listeners: HashMap::new(),
+            focusable: false,
+            focused: false,
+            focus_trap: false,
+            last_event: None,
+            delivery_count: 0,
         }
     }
 
@@ -277,6 +369,113 @@ impl Tree {
                 parent.children.retain(|&c| c != child_id);
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // PLAT-38: focus over the whole store
+    // -----------------------------------------------------------------
+
+    /// Every node that currently holds focus, in ascending id order.
+    ///
+    /// **THE INSTRUMENT THE FOCUS PARTITION LAW READS**, and it walks the
+    /// WHOLE store rather than answering from a remembered id, which is the
+    /// only arrangement in which the law can go red. See `Node::focused`.
+    pub fn focused_ids(&self) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self
+            .nodes
+            .values()
+            .filter(|n| n.focused)
+            .map(|n| n.id)
+            .collect();
+        ids.sort_by_key(|i| i.0);
+        ids
+    }
+
+    /// Clear focus everywhere.
+    pub fn blur_all(&mut self) {
+        for n in self.nodes.values_mut() {
+            n.focused = false;
+        }
+    }
+
+    /// Give focus to `id` and to nothing else.
+    ///
+    /// The clear is a separate pass over every node rather than a targeted
+    /// unset of one remembered id: an implementation that unsets only the
+    /// previous holder is correct exactly as long as nothing else ever set
+    /// the flag, which is an assumption no assertion here could check.
+    pub fn focus_only(&mut self, id: NodeId) {
+        for n in self.nodes.values_mut() {
+            n.focused = n.id == id;
+        }
+    }
+
+    /// The node that traps focus, if any. At most one is honoured; when more
+    /// than one is set the innermost-by-id wins, and `focus_trap_ids` is what
+    /// lets a caller see that more than one exists.
+    pub fn focus_trap_ids(&self) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self
+            .nodes
+            .values()
+            .filter(|n| n.focus_trap)
+            .map(|n| n.id)
+            .collect();
+        ids.sort_by_key(|i| i.0);
+        ids
+    }
+
+    /// Whether `id` is `ancestor` or sits underneath it.
+    pub fn is_within(&self, id: NodeId, ancestor: NodeId) -> bool {
+        if ancestor.is_null() {
+            return true;
+        }
+        let mut cur = id;
+        // The walk is bounded by the store's size, so a parent cycle
+        // introduced by a future bug cannot hang the renderer here.
+        for _ in 0..=self.nodes.len() {
+            if cur.is_null() {
+                return false;
+            }
+            if cur == ancestor {
+                return true;
+            }
+            cur = self.nodes.get(&cur.0).map(|n| n.parent).unwrap_or(NodeId::NULL);
+        }
+        false
+    }
+
+    /// Pre-order walk from `root`, collecting the ids of focusable elements.
+    /// **This IS the declared focus order** — document order, which is the
+    /// order the leaf renderer built the tree in.
+    pub fn focus_order(&self, root: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        self.collect_focusable(root, &mut out);
+        out
+    }
+
+    fn collect_focusable(&self, id: NodeId, out: &mut Vec<NodeId>) {
+        let Some(node) = self.nodes.get(&id.0) else {
+            return;
+        };
+        if node.focusable {
+            out.push(id);
+        }
+        for child in &node.children {
+            self.collect_focusable(*child, out);
+        }
+    }
+
+    /// Every node with no parent, in ascending id order. Used as the walk
+    /// root when no root element has been declared.
+    pub fn root_ids(&self) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self
+            .nodes
+            .values()
+            .filter(|n| n.parent.is_null())
+            .map(|n| n.id)
+            .collect();
+        ids.sort_by_key(|i| i.0);
+        ids
     }
 
     /// Get the first child of a node.
@@ -657,8 +856,8 @@ mod tests {
     #[test]
     fn test_event_listeners() {
         let mut node = Node::new_element("button");
-        extern "C" fn handler1() {}
-        extern "C" fn handler2() {}
+        extern "C" fn handler1(_p: *const crate::input::GpuiEventPayload) {}
+        extern "C" fn handler2(_p: *const crate::input::GpuiEventPayload) {}
 
         node.event_listeners
             .entry("click".to_string())

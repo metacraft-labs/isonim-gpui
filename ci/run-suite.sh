@@ -84,6 +84,12 @@ UNITTEST_SUITES=(
 	# regresses. Needs no extra flags: `nim.cfg` already carries
 	# `--path:../isonim/src`, and this script exports LD_LIBRARY_PATH.
 	tests/test_render_native_gpui_reactive.nim
+	# PLAT-38: the widened event ABI and element focus, against the real
+	# shim. Listed here and not only under `just test-all` for the reason
+	# the line above gives — a verification suite no workflow invokes stops
+	# discriminating the moment the seam regresses, and this one is the
+	# only place `PLAT21-VG1`/`VG2`/`VG3` are asserted inside this repo.
+	tests/test_input_focus.nim
 )
 ASSERT_SCRIPTS=(
 	tests/test_basic.nim
@@ -126,7 +132,32 @@ BENCHMARKS=(
 # The two `--features` runs are DELIBERATELY not in this total: they are
 # conditional on `--with-gpui`, and a total that changed with a flag
 # would be a fingerprint that means two different things.
-EXPECTED_CASES=245
+# PLAT-38, 2026-09-22, written LAST and from a run (trap 4c):
+#   151 rust unit  +  10 window-registry  +  15 cross-renderer
+# +  14 gui        +  31 render-integration  +  6 structural
+# +   0 gpui-reactive   <-- SEE BELOW, this is not a zero anybody chose
+# +  26 input-focus
+# +   1 basic      +   1 bindings           + 23 renderer checkpoints
+# = 278
+#
+# Two terms moved and one of them is not this milestone's.
+#
+#   * rust 139 -> 151. Six are PLAT-38's `input` module; the other six
+#     arrived with PLAT-37 in the same window.
+#   * `test_input_focus` is new: PLAT-38's widened event ABI and element
+#     focus, driven against the real shim.
+#   * **`test_render_native_gpui_reactive` contributes 0 because it does
+#     not COMPILE**, and it is a SIBLING drift rather than a regression
+#     here: `src/isonim_gpui/reactive_root.nim` re-exports
+#     `isonim/renderers/native.NativeRootAccessor` and that symbol is not
+#     in the `../isonim` checkout this workspace carries
+#     (`grep -rn NativeRootAccessor ../isonim/src` returns nothing).
+#     `reactive_root.nim` is untouched by PLAT-38 and the lane was already
+#     red on it. Its five cases are therefore ABSENT from the figure above
+#     rather than predicted into it — when the sibling is repaired this
+#     becomes 283 and the drift check will say so, which is the check
+#     doing its job rather than a number to pre-empt.
+EXPECTED_CASES=278
 
 total_cases=0
 failed_steps=()

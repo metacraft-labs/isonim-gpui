@@ -474,10 +474,18 @@ when defined(gpuiBackend):
   # assertions cannot distinguish a renderer that works from a renderer
   # that is not there.
   #
-  # WHY WAYLAND AND NOT XVFB. Xvfb has no DRI3, so wgpu gets no surface:
-  # the window is `IsViewable` at its requested size and paints nothing,
-  # which is precisely the pass-shaped failure this suite exists to make
-  # impossible. Headless sway (`WLR_BACKENDS=headless`) works, on gles2
+  # WHY WAYLAND AND NOT XVFB — AND THIS COMMENT WAS WRONG UNTIL
+  # 2026-09-22. It said Xvfb "has no DRI3, so wgpu gets no surface: the
+  # window is `IsViewable` at its requested size and paints nothing".
+  # Re-measured with the windowed shim: IT PAINTS. The `Xvfb -fbdir`
+  # framebuffer goes from 303 non-NUL bytes of 8,297,632 with no client
+  # to 5,184,303 with the window up, and the frame decoded out of it is
+  # the whole front-end. The `libEGL DRI3` warning is still printed; wgpu
+  # falls back to a software Vulkan device and renders. The reason this
+  # suite is on Wayland is the CAPTURE: `grim` speaks
+  # `zwlr_screencopy_manager_v1`, which does not exist on an X display,
+  # and the pinned `ffmpeg` has no `x11grab`. Headless sway
+  # (`WLR_BACKENDS=headless`) works, on gles2
   # and on the fully-software `WLR_RENDERER=pixman` path alike, and
   # exposes `zwlr_screencopy_manager_v1` so `grim` can read the output
   # back. Headless weston does NOT work: it advertises no `wl_seat` and
@@ -672,9 +680,11 @@ when defined(gpuiBackend):
       let ppmPath = capDir / "frame.ppm"
       let donePath = ppmPath & ".done"
       let logPath = ppmPath & ".log"
+      let blankPath = ppmPath & ".blank"
       removeFile(ppmPath)
       removeFile(donePath)
       removeFile(logPath)
+      removeFile(blankPath)
 
       # Start the capture BEFORE the window: it polls, so it does not
       # matter that there is nothing to see yet, and starting it from the
@@ -713,8 +723,12 @@ when defined(gpuiBackend):
       # assertion nobody can act on from a CI log.
       let keepDir = getCurrentDir() / "target" / "test-recordings"
       createDir(keepDir)
-      for suffix in ["", ".timeout"]:
-        let src = if suffix == "": ppmPath else: ppmPath & ".timeout.ppm"
+      for suffix in ["", ".timeout", ".blank"]:
+        let src =
+          case suffix
+          of "": ppmPath
+          of ".blank": blankPath
+          else: ppmPath & ".timeout.ppm"
         if fileExists(src):
           let kept = keepDir / ("pixel-capture" & suffix & ".ppm")
           copyFile(src, kept)
@@ -776,5 +790,40 @@ when defined(gpuiBackend):
       check st.yellow.y0 == 0
       check st.yellow.x1 == SceneBoxAW + SceneGap + SceneBoxBW - 1
       check st.yellow.y1 == SceneBoxBH - 1
+
+      # --- THE BLANK CONTROL, FALSIFIED IN THIS RUN ---------------------
+      #
+      # Every assertion above is of the form "the frame contains N pixels
+      # of colour C". On its own that is a positive half with no negative
+      # beside it: it says what the frame HAS, and it would be equally
+      # satisfied by a stored picture, a frame from a previous case, or
+      # any screen that happened to hold those colours. What makes it a
+      # claim about THIS window is that the SAME compositor, in the SAME
+      # run, with no client attached, produced a frame on which those
+      # assertions are all false — and until `wayland-capture-frame.sh`
+      # retained that frame, there was no such frame to check against.
+      #
+      # `codetracer-specs/Testing/Verification-Harness-Traps.md` §7b: a
+      # control you have never made fail is not a control. So the control
+      # is made to fail here, on the three colour counts in the same
+      # order, rather than described in a comment.
+      require fileExists(blankPath)
+      let blank = readPpm(blankPath)
+      let bst = sceneStats(blank)
+      echo &"    blank control {blank.w}x{blank.h}; " &
+        &"magenta={bst.magenta.count} cyan={bst.cyan.count} " &
+        &"yellow={bst.yellow.count} other={bst.other}"
+      # The control is the same output, so the dimensions match and a
+      # difference in the counts cannot be a difference in the frame size.
+      check blank.w == frame.w
+      check blank.h == frame.h
+      # And the scene is absent from it, on all three colours.
+      check bst.magenta.count == 0
+      check bst.cyan.count == 0
+      check bst.yellow.count == 0
+      # Two-sided: "the scene's colours are absent" would also be true of
+      # a zero-byte read, so the control has to account for every pixel it
+      # claims to have. `other` is everything that is not one of the three.
+      check bst.other == blank.w * blank.h
 
       removeDir(capDir)

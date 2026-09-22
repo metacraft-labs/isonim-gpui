@@ -39,9 +39,45 @@ else:
   else:
     const shimLib = "libgpui_nim_shim.so"
 
+# --- The event payload (PLAT-38) ---
+
+type
+  GpuiEventPayload* {.bycopy.} = object
+    ## **What a dispatched event hands its listener.** The Nim mirror of
+    ## `rust/gpui-nim-shim/src/input.rs`'s `#[repr(C)] GpuiEventPayload`.
+    ##
+    ## Field ORDER and TYPES are the ABI; `tests/test_input_focus.nim`
+    ## asserts `sizeof`, `alignof` and every `offsetof` against what
+    ## `gpui_event_payload_layout` reports from the RUST side — not against
+    ## a literal both sides could be wrong about together. A layout that
+    ## drifted would not fail to link; it would deliver a different key,
+    ## which is the failure mode
+    ## `codetracer-specs/Testing/Verification-Harness-Traps.md` §25 names
+    ## one level up.
+    kind*: uint32          ## one of `GpuiEventKind*`
+    modifiers*: uint32     ## `GpuiMod*` bits
+    key*: cstring          ## base key name, or nil when the event has no key
+    repeat*: uint8         ## 1 for an auto-repeat
+    reserved*: array[7, uint8]
+
+const
+  GpuiEventOther* = 0'u32
+  GpuiEventKeyDown* = 1'u32
+  GpuiEventKeyUp* = 2'u32
+
+  GpuiModControl* = 1'u32 shl 0
+  GpuiModAlt* = 1'u32 shl 1
+  GpuiModShift* = 1'u32 shl 2
+  GpuiModPlatform* = 1'u32 shl 3
+  GpuiModFunction* = 1'u32 shl 4
+
 # --- Callback types ---
 
-type EventCallback* = proc() {.cdecl.}
+type EventCallback* = proc(payload: ptr GpuiEventPayload) {.cdecl.}
+  ## **PLAT-38 widened this from `proc() {.cdecl.}`.** A listener that takes
+  ## no argument can be told which handler it is and nothing else, which is
+  ## why `PLAT21-VG1` says a key cannot be delivered through this renderer at
+  ## all. `payload` is nil for an event that carries nothing.
 type RootBuilderCallback* = proc(root: GpuiElement) {.cdecl.}
 type ResizeCallback* = proc(width: cdouble; height: cdouble) {.cdecl.}
 type FocusCallback* = proc(focused: uint8) {.cdecl.}
@@ -94,7 +130,9 @@ proc gpui_add_event_listener*(node: GpuiElement; event: cstring; handler: EventC
 proc gpui_add_event_listener_id*(node: GpuiElement; event: cstring; callbackId: int32)
   {.importc: "gpui_add_event_listener_id".}
 
-type EventDispatcherCallback* = proc(callbackId: int32) {.cdecl.}
+type EventDispatcherCallback* = proc(callbackId: int32;
+                                     payload: ptr GpuiEventPayload) {.cdecl.}
+  ## **PLAT-38 widened this too.** See `EventCallback`.
 
 proc gpui_set_event_dispatcher*(dispatcher: EventDispatcherCallback)
   {.importc: "gpui_set_event_dispatcher".}
@@ -118,6 +156,112 @@ proc gpui_launch*(title: cstring; width, height: cdouble;
 
 proc gpui_dispatch_event*(node: GpuiElement; event: cstring)
   {.importc: "gpui_dispatch_event".}
+
+# ===========================================================================
+# PLAT-38 — payload-carrying delivery, and element focus
+# ===========================================================================
+#
+# `PLAT21-VG1` (a key cannot be delivered) and `PLAT21-VG3` (no element
+# focus) are the two gaps this block closes. Read
+# `rust/gpui-nim-shim/src/input.rs`'s module docs before changing any of it:
+# three of the decisions below (the payload being a base key plus a BITMASK,
+# focus being a per-node FLAG rather than one remembered id, and the store
+# recording a delivery BEFORE the callback runs) are each there to keep a
+# published assertion able to fail.
+
+proc gpui_event_payload_layout*(field: uint32): uint64
+  {.importc: "gpui_event_payload_layout".}
+  ## The Rust compiler's own answer for `GpuiEventPayload`'s layout:
+  ## 0 = size, 1 = align, 2..5 = offset of `kind`, `modifiers`, `key`,
+  ## `repeat`. See `GpuiEventPayload`.
+
+proc gpui_dispatch_event_with*(node: GpuiElement; event: cstring;
+                               payload: ptr GpuiEventPayload): uint32
+  {.importc: "gpui_dispatch_event_with".}
+  ## Dispatch with a payload. **Returns the number of listeners reached** —
+  ## which is what separates "a key that reached nothing" from "a key that
+  ## reached everything", two states a `void` dispatch cannot tell apart.
+
+proc gpui_dispatch_key_to_focus*(event: cstring;
+                                 payload: ptr GpuiEventPayload): uint32
+  {.importc: "gpui_dispatch_key_to_focus".}
+  ## Route a key to whatever element holds focus. Answers 0 when nothing
+  ## holds focus AND when no WINDOW holds focus — the second is the negative
+  ## twin PLAT-38 asks for.
+
+# --- the element store, read back ---
+
+proc gpui_last_event_key*(node: GpuiElement; buf: pointer; bufLen: uint64): uint64
+  {.importc: "gpui_last_event_key".}
+
+proc gpui_last_event_name*(node: GpuiElement; buf: pointer; bufLen: uint64): uint64
+  {.importc: "gpui_last_event_name".}
+
+proc gpui_last_event_modifiers*(node: GpuiElement): uint32
+  {.importc: "gpui_last_event_modifiers".}
+
+proc gpui_last_event_kind*(node: GpuiElement): uint32
+  {.importc: "gpui_last_event_kind".}
+
+proc gpui_last_event_repeat*(node: GpuiElement): uint8
+  {.importc: "gpui_last_event_repeat".}
+
+proc gpui_last_event_seq*(node: GpuiElement): uint64
+  {.importc: "gpui_last_event_seq".}
+  ## 0 means nothing ever arrived. That is the only way to distinguish
+  ## "nothing arrived" from "the same thing arrived again".
+
+proc gpui_event_delivery_count*(node: GpuiElement): uint64
+  {.importc: "gpui_event_delivery_count".}
+
+# --- focus ---
+
+proc gpui_set_focusable*(node: GpuiElement; focusable: uint8)
+  {.importc: "gpui_set_focusable".}
+
+proc gpui_is_focusable*(node: GpuiElement): uint8
+  {.importc: "gpui_is_focusable".}
+
+proc gpui_focus_element*(node: GpuiElement): uint8
+  {.importc: "gpui_focus_element".}
+  ## 1 if it took focus, 0 if REFUSED (not focusable, or outside an active
+  ## trap). A refusal is what makes a focus trap mean something.
+
+proc gpui_blur_element*(node: GpuiElement)
+  {.importc: "gpui_blur_element".}
+
+proc gpui_is_focused*(node: GpuiElement): uint8
+  {.importc: "gpui_is_focused".}
+
+proc gpui_focused_element*(): GpuiElement
+  {.importc: "gpui_focused_element".}
+
+proc gpui_focused_count*(): uint64
+  {.importc: "gpui_focused_count".}
+  ## **The focus partition law's instrument.** Counts every focused node in
+  ## the store, not the one the caller just focused.
+
+proc gpui_set_focus_trap*(node: GpuiElement; trap: uint8): uint8
+  {.importc: "gpui_set_focus_trap".}
+
+proc gpui_focus_trap_element*(): GpuiElement
+  {.importc: "gpui_focus_trap_element".}
+
+proc gpui_focusable_count*(): uint64
+  {.importc: "gpui_focusable_count".}
+
+proc gpui_focusable_at*(index: uint64): GpuiElement
+  {.importc: "gpui_focusable_at".}
+  ## The declared focus ORDER, readable from the Rust side. PLAT-35 filed
+  ## `PLAT35-VG4` because the order was *"declared by the leaf renderer and
+  ## enforced by nothing"*; an order only the caller can see is one no gate
+  ## can check.
+
+proc gpui_focus_next*(): uint8
+  {.importc: "gpui_focus_next".}
+
+proc gpui_focus_prev*(): uint8
+  {.importc: "gpui_focus_prev".}
 
 # ===========================================================================
 # Memory management

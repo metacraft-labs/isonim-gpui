@@ -55,6 +55,17 @@ pub fn active_window_id() -> u32 {
 pub struct NimRootView {
     /// Whether the repaint polling timer has been started.
     poll_started: bool,
+
+    /// **PLAT-38: the GPUI focus handle the root element tracks.**
+    ///
+    /// GPUI delivers key events only to the element tree that holds focus,
+    /// so without a handle a window could paint perfectly and receive no key
+    /// at all — which is the state `PLAT21-VG1` describes from the other
+    /// side. It is created LAZILY on the first `render` rather than in
+    /// `new()` because `new()` takes no context and is called from five
+    /// places including two test files; a constructor that grew a parameter
+    /// would put this milestone's diff across all of them for no gain.
+    focus_handle: Option<gpui::FocusHandle>,
 }
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
@@ -62,13 +73,14 @@ impl NimRootView {
     pub fn new() -> Self {
         NimRootView {
             poll_started: false,
+            focus_handle: None,
         }
     }
 }
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 impl Render for NimRootView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Check and clear the repaint flag (so we know the frame is current).
         let _ = window::take_repaint_request();
 
@@ -96,20 +108,99 @@ impl Render for NimRootView {
             .detach();
         }
 
+        // PLAT-38 — THE KEYBOARD PATH, and it has three parts.
+        //
+        // 1. A focus handle exists and the root element TRACKS it. GPUI
+        //    routes key events by focus, so without this the window paints
+        //    and receives nothing.
+        // 2. The window is told to focus it. A handle nothing focused is a
+        //    handle no key reaches, and the failure looks exactly like "the
+        //    key was never sent".
+        // 3. The shim's WINDOW-FOCUS state is kept in step with GPUI's, so
+        //    `input::deliver_key_to_focus` can refuse when the window does
+        //    not hold focus. That refusal is PLAT-38's negative twin, and it
+        //    is a real predicate rather than a constant precisely because
+        //    this line can set it either way.
+        let handle = self
+            .focus_handle
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        if !handle.is_focused(window) {
+            window.focus(&handle, cx);
+        }
+        window::notify_focus(active_window_id(), handle.is_focused(window));
+
         let tree = crate::lock_tree();
         let root_id = *crate::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
 
         if root_id.is_null() {
-            return div().size_full().child("No shadow tree root").into_any_element();
+            return with_keyboard(div().size_full().child("No shadow tree root"), &handle)
+                .into_any_element();
         }
 
         match crate::render_sync::build_render_plan(&tree, root_id) {
             Some(plan) => {
                 drop(tree); // release lock before building GPUI elements
-                render_plan_to_gpui(&plan).into_any_element()
+                render_root_to_gpui(&plan, &handle)
             }
-            None => div().size_full().child("Empty shadow tree").into_any_element(),
+            None => with_keyboard(div().size_full().child("Empty shadow tree"), &handle)
+                .into_any_element(),
         }
+    }
+}
+
+/// Attach the focus handle and the key listener to a root `Div`.
+///
+/// **ONE PLACE, and every root path goes through it** — the three fallback
+/// roots above and the real render plan below. A second attachment site would
+/// be a second chance for one of them to silently lose the keyboard, and the
+/// symptom (a window that paints and never responds) is indistinguishable
+/// from a compositor that sent nothing.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
+    el.track_focus(handle)
+        // A key context is what makes this element a keyboard dispatch
+        // target in GPUI's tree. Named for this shim rather than for any
+        // product, because the shim has no opinion about what the keys mean.
+        .key_context("IsonimGpuiRoot")
+        .on_key_down(move |event: &gpui::KeyDownEvent, _window, _cx| {
+            let ks = &event.keystroke;
+            // GPUI's own key spelling, passed through verbatim. See
+            // `input::modifier_bits` for why the shim does not rename it.
+            crate::input::deliver_key_to_focus(
+                "keydown",
+                Some((
+                    crate::input::GPUI_EVENT_KEY_DOWN,
+                    ks.key.clone(),
+                    crate::input::modifier_bits(&ks.modifiers),
+                    event.is_held,
+                )),
+            );
+        })
+}
+
+/// Build the ROOT of the render plan, with the keyboard attached.
+///
+/// It shares `render_plan_to_gpui`'s Div arm through `build_plan_div` rather
+/// than restating it; a root that was built by a second copy of that code
+/// would drift from every non-root element in the same tree.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn render_root_to_gpui(
+    plan: &crate::render_sync::RenderNode,
+    handle: &gpui::FocusHandle,
+) -> AnyElement {
+    use crate::tree::GpuiElementKind;
+    match plan.kind {
+        GpuiElementKind::Div | GpuiElementKind::TextContainer => {
+            with_keyboard(build_plan_div(plan), handle).into_any_element()
+        }
+        // An image, an SVG or a bare text node as the WHOLE root is not a
+        // shape any product here produces; it is wrapped rather than
+        // refused, and the wrapper is stated so a frame that gained a
+        // container is explainable rather than surprising.
+        _ => with_keyboard(div().size_full(), handle)
+            .child(render_plan_to_gpui(plan))
+            .into_any_element(),
     }
 }
 
@@ -166,35 +257,43 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
             el.child(label).into_any_element()
         }
         GpuiElementKind::Div | GpuiElementKind::TextContainer => {
-            let mut el = div();
-            el = apply_styles_to_div(el, &plan.styles);
-
-            // Add children
-            for child in &plan.children {
-                el = el.child(render_plan_to_gpui(child));
-            }
-
-            // If the node has direct text content, add it as a child
-            if let Some(ref text) = plan.text {
-                if !text.is_empty() {
-                    el = el.child(text.clone());
-                }
-            }
-
-            // Wire click events
-            if plan.has_click_handler {
-                let node_id = crate::tree::NodeId(plan.node_id);
-                el = el.on_mouse_up(
-                    MouseButton::Left,
-                    move |_event, _window, _cx| {
-                        dispatch_shadow_event(node_id, "click");
-                    },
-                );
-            }
-
-            el.into_any_element()
+            build_plan_div(plan).into_any_element()
         }
     }
+}
+
+/// The `Div | TextContainer` arm's body, as a `Div` rather than an erased
+/// `AnyElement`.
+///
+/// PLAT-38 split it out so the ROOT can attach a focus handle and a key
+/// listener to the SAME element every other node is built as — see
+/// `render_root_to_gpui`. Nothing about the body changed.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
+    let mut el = div();
+    el = apply_styles_to_div(el, &plan.styles);
+
+    // Add children
+    for child in &plan.children {
+        el = el.child(render_plan_to_gpui(child));
+    }
+
+    // If the node has direct text content, add it as a child
+    if let Some(ref text) = plan.text {
+        if !text.is_empty() {
+            el = el.child(text.clone());
+        }
+    }
+
+    // Wire click events
+    if plan.has_click_handler {
+        let node_id = crate::tree::NodeId(plan.node_id);
+        el = el.on_mouse_up(MouseButton::Left, move |_event, _window, _cx| {
+            dispatch_shadow_event(node_id, "click");
+        });
+    }
+
+    el
 }
 
 /// Apply GpuiStyles to a div builder.

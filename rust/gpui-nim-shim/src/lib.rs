@@ -40,6 +40,12 @@
 
 // Modules are pub so integration tests can access the shadow tree, render plan,
 // and window state.
+// PLAT-38: element focus and payload-carrying event delivery. Feature-less —
+// it is part of the shadow tree's contract, not of the GPUI backend, so the
+// exported symbol set does not depend on which features the cdylib was built
+// with (see `gpui_headless_unavailable.rs`'s module docs for what that rule
+// exists to prevent).
+pub mod input;
 pub mod render_sync;
 #[allow(dead_code)]
 pub mod tree;
@@ -86,9 +92,19 @@ pub static ROOT_NODE_ID: std::sync::LazyLock<Mutex<NodeId>> =
 /// `gpui_set_event_dispatcher`. When set, event listeners that have a
 /// `callback_id > 0` are dispatched through this function instead of
 /// calling a C function pointer directly.
-pub type EventDispatcher = extern "C" fn(callback_id: i32);
+///
+/// **PLAT-38 WIDENED THIS, AND THE SECOND PARAMETER IS THE WHOLE POINT OF
+/// THAT MILESTONE.** It used to be `extern "C" fn(callback_id: i32)`, so the
+/// only thing a dispatched event could tell its handler was *which handler it
+/// was* — a key could not be delivered, and the one binding that needed to
+/// encoded the key in the event NAME (`vockey:Down`) because the name was the
+/// only channel with any room in it. `payload` is null for an event that
+/// carries nothing (a click), and points at a caller-stack
+/// `GpuiEventPayload` for the duration of the call otherwise; a handler that
+/// needs it past the call must copy it.
+pub type EventDispatcher = extern "C" fn(callback_id: i32, payload: *const input::GpuiEventPayload);
 
-static EVENT_DISPATCHER: std::sync::LazyLock<Mutex<Option<EventDispatcher>>> =
+pub(crate) static EVENT_DISPATCHER: std::sync::LazyLock<Mutex<Option<EventDispatcher>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
 /// Lock the global tree, recovering from poison if needed.
@@ -110,7 +126,7 @@ pub struct GpuiElement {
 
 /// Helper: convert a raw C string pointer to a Rust &str.
 /// Returns "" if the pointer is null or not valid UTF-8.
-unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
+pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
     if ptr.is_null() {
         return "";
     }
@@ -122,7 +138,7 @@ unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
 
 /// Helper: allocate a GpuiElement handle on the heap for the given NodeId.
 /// Returns null if the id is NULL.
-fn node_id_to_handle(id: NodeId) -> *mut GpuiElement {
+pub(crate) fn node_id_to_handle(id: NodeId) -> *mut GpuiElement {
     if id.is_null() {
         return std::ptr::null_mut();
     }
@@ -130,7 +146,7 @@ fn node_id_to_handle(id: NodeId) -> *mut GpuiElement {
 }
 
 /// Helper: extract NodeId from a handle pointer. Returns NodeId::NULL if null.
-unsafe fn handle_to_node_id(handle: *mut GpuiElement) -> NodeId {
+pub(crate) unsafe fn handle_to_node_id(handle: *mut GpuiElement) -> NodeId {
     if handle.is_null() {
         NodeId::NULL
     } else {
@@ -325,7 +341,13 @@ pub extern "C" fn gpui_set_style(
 // ---------------------------------------------------------------------------
 
 /// C function pointer type for event callbacks from Nim.
-pub type EventCallback = extern "C" fn();
+///
+/// **PLAT-38 WIDENED THIS TOO.** It was `extern "C" fn()`. Widening only the
+/// dispatcher would have left the legacy direct-pointer path payload-free,
+/// so half the shim's event surface would still be unable to carry a key and
+/// a grep for `extern "C" fn()` would still find one. The parameter is null
+/// when the event carries nothing.
+pub type EventCallback = extern "C" fn(payload: *const input::GpuiEventPayload);
 
 /// Register a callback for `event` on `node`.
 /// The `handler` is a C function pointer that Nim will pass in.
@@ -355,7 +377,7 @@ pub extern "C" fn gpui_add_event_listener(
 }
 
 /// No-op function pointer used as placeholder for dispatcher-based listeners.
-extern "C" fn _noop_callback() {}
+extern "C" fn _noop_callback(_payload: *const input::GpuiEventPayload) {}
 
 /// Register a callback ID for `event` on `node`.
 /// The `callback_id` is dispatched via the global event dispatcher registered
@@ -520,6 +542,16 @@ pub extern "C" fn gpui_set_root_element(handle: *mut GpuiElement) {
 /// Trigger all event listeners for the given event on the given node.
 /// This is called by the GPUI event loop (M4+) when an event occurs,
 /// or can be called directly for testing.
+///
+/// **THE BODY MOVED IN PLAT-38, AND WHERE IT MOVED TO IS LOAD-BEARING.** This
+/// function and `render_sync::gpui_render::dispatch_shadow_event` used to be
+/// two byte-identical copies of one twenty-line routine — one reached from
+/// the C ABI, one reached from the real GPUI event handlers. PLAT-38's gate
+/// reads the element store after a key that entered *through the compositor*,
+/// which is the second copy, while every other case drives the first; two
+/// copies of one predicate is `Verification-Harness-Traps.md` §30, and here
+/// it would have meant the suite grading a different function from the one
+/// the compositor runs. Both now call `input::deliver`.
 #[no_mangle]
 pub extern "C" fn gpui_dispatch_event(node: *mut GpuiElement, event: *const c_char) {
     let node_id = unsafe { handle_to_node_id(node) };
@@ -527,38 +559,7 @@ pub extern "C" fn gpui_dispatch_event(node: *mut GpuiElement, event: *const c_ch
         return;
     }
     let event_str = unsafe { cstr_to_str(event) };
-
-    // Collect listeners while holding the tree lock, then dispatch after releasing.
-    // This avoids deadlock when callbacks modify the tree.
-    let listeners: Vec<(extern "C" fn(), i32)> = {
-        let tree = lock_tree();
-        if let Some(n) = tree.get(node_id) {
-            n.event_listeners
-                .get(event_str)
-                .map(|ls| ls.iter().map(|l| (l.callback, l.callback_id)).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    };
-
-    // Read the dispatcher once (outside the tree lock)
-    let dispatcher = {
-        EVENT_DISPATCHER
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-    };
-
-    for (cb, id) in listeners {
-        if id > 0 {
-            if let Some(dispatch) = dispatcher {
-                dispatch(id);
-            }
-        } else {
-            cb();
-        }
-    }
+    input::deliver(node_id, event_str, None);
 }
 
 /// Free a GpuiElement handle.
@@ -1128,13 +1129,53 @@ pub extern "C" fn gpui_verify_render_plan(root: *mut GpuiElement) -> u8 {
     }
 }
 
+/// Escape a string for inclusion inside a JSON string literal, per RFC 8259
+/// §7.
+///
+/// **THIS REPLACES FOUR HAND-WRITTEN `replace` CHAINS AND THE REASON IS A
+/// MEASUREMENT, NOT TIDINESS.** Those chains escaped `\` and `"` and nothing
+/// else. RFC 8259 §7 also forbids every unescaped code point below `U+0020`,
+/// so the moment a text node carried a newline — which is the normal case for
+/// a node holding a line of source, a docstring or a captured stdout line —
+/// `gpui_render_plan_json` emitted a document no conforming parser accepts.
+///
+/// Observed 2026-09-22 from a real `codetracer-gpui --plan-out` artefact: a
+/// 59 kB plan whose state pane carried Python's `builtins` docstring failed
+/// `json.load` at byte 39045 with *"Invalid control character"*. It had gone
+/// unnoticed because the consumer that mattered most, Nim's `std/json`, is
+/// LENIENT about control characters inside strings and parsed it happily —
+/// two parsers, one document, one verdict each, and the strict one was never
+/// asked. `test_render_plan_json_escaping` existed and tested quotes only.
+///
+/// The short escapes are used where RFC 8259 names one, and `\u00XX` for the
+/// rest of the C0 range. `DEL` (`U+007F`) is deliberately NOT escaped: it is
+/// legal unescaped JSON, and escaping it would make this function's output
+/// differ from `serde_json`'s for no reason.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Internal helper: serialize a RenderNode to a JSON string.
 fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
     fn node_to_string(plan: &render_sync::RenderNode) -> String {
         let kind = format!("{:?}", plan.kind);
         let tag = &plan.tag;
         let text = match &plan.text {
-            Some(t) => format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")),
+            Some(t) => format!("\"{}\"", json_escape(t)),
             None => "null".to_string(),
         };
 
@@ -1143,7 +1184,7 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         macro_rules! push_style {
             ($field:ident, $name:expr) => {
                 if let Some(ref v) = s.$field {
-                    style_entries.push(format!("\"{}\":\"{}\"", $name, v.replace('"', "\\\"")));
+                    style_entries.push(format!("\"{}\":\"{}\"", $name, json_escape(v)));
                 }
             };
         }
@@ -1181,7 +1222,7 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         let event_names: Vec<String> = plan
             .event_names
             .iter()
-            .map(|e| format!("\"{}\"", e))
+            .map(|e| format!("\"{}\"", json_escape(e)))
             .collect();
 
         let children: Vec<String> = plan.children.iter().map(node_to_string).collect();
@@ -1189,7 +1230,7 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         format!(
             "{{\"kind\":\"{}\",\"tag\":\"{}\",\"text\":{},\"has_click_handler\":{},\"has_input_handler\":{},\"event_names\":[{}],\"styles\":{},\"children\":[{}]}}",
             kind,
-            tag.replace('"', "\\\""),
+            json_escape(tag),
             text,
             plan.has_click_handler,
             plan.has_input_handler,
@@ -1585,7 +1626,7 @@ mod tests {
 
         static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 
-        extern "C" fn test_handler() {
+        extern "C" fn test_handler(_p: *const crate::input::GpuiEventPayload) {
             CALL_COUNT.fetch_add(1, Ordering::SeqCst);
         }
 
@@ -1615,7 +1656,7 @@ mod tests {
 
         static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 
-        extern "C" fn handler() {
+        extern "C" fn handler(_p: *const crate::input::GpuiEventPayload) {
             CALL_COUNT.fetch_add(1, Ordering::SeqCst);
         }
 
@@ -1641,10 +1682,10 @@ mod tests {
         static COUNT_A: AtomicU32 = AtomicU32::new(0);
         static COUNT_B: AtomicU32 = AtomicU32::new(0);
 
-        extern "C" fn handler_a() {
+        extern "C" fn handler_a(_p: *const crate::input::GpuiEventPayload) {
             COUNT_A.fetch_add(1, Ordering::SeqCst);
         }
-        extern "C" fn handler_b() {
+        extern "C" fn handler_b(_p: *const crate::input::GpuiEventPayload) {
             COUNT_B.fetch_add(1, Ordering::SeqCst);
         }
 
@@ -1799,7 +1840,7 @@ mod tests {
         gpui_set_text_content(std::ptr::null_mut(), tag.as_ptr());
         gpui_set_style(std::ptr::null_mut(), name.as_ptr(), value.as_ptr());
 
-        extern "C" fn noop() {}
+        extern "C" fn noop(_p: *const crate::input::GpuiEventPayload) {}
         gpui_add_event_listener(std::ptr::null_mut(), name.as_ptr(), noop);
 
         let fc = gpui_first_child(std::ptr::null_mut());
