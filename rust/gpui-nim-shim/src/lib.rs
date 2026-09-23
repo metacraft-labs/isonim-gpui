@@ -46,6 +46,8 @@
 // with (see `gpui_headless_unavailable.rs`'s module docs for what that rule
 // exists to prevent).
 pub mod input;
+// PLAT-42: frame timing. Feature-less for `input`'s reason.
+pub mod frame_stats;
 pub mod render_sync;
 #[allow(dead_code)]
 pub mod tree;
@@ -1217,6 +1219,9 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(cursor, "cursor");
         push_style!(display, "display");
         push_style!(position, "position");
+        push_style!(white_space, "white_space");
+        push_style!(text_overflow, "text_overflow");
+        push_style!(flex_shrink, "flex_shrink");
         let styles_json = format!("{{{}}}", style_entries.join(","));
 
         let event_names: Vec<String> = plan

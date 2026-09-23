@@ -85,6 +85,9 @@ pub struct GpuiStyles {
     pub cursor: Option<String>,
     pub display: Option<String>,
     pub position: Option<String>,
+    pub white_space: Option<String>,
+    pub text_overflow: Option<String>,
+    pub flex_shrink: Option<String>,
 }
 
 impl GpuiStyles {
@@ -147,6 +150,9 @@ impl GpuiStyles {
             "cursor" => self.cursor = Some(v),
             "display" => self.display = Some(v),
             "position" => self.position = Some(v),
+            "white-space" | "white_space" | "whitespace" => self.white_space = Some(v),
+            "text-overflow" | "text_overflow" => self.text_overflow = Some(v),
+            "flex-shrink" | "flex_shrink" => self.flex_shrink = Some(v),
             _ => {} // Ignore unknown properties
         }
     }

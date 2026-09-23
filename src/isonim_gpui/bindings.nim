@@ -33,8 +33,15 @@ elif defined(windows):
   else:
     const shimLib = "gpui_nim_shim.dll"
 else:
+  const gpuiShimPath {.strdefine.} = ""
+    ## `-d:gpuiShimPath=<file>` pins the shim this binary loads to one file,
+    ## instead of the shared `rust/target/debug` one. A window lane that needs
+    ## the WINDOWED shim builds its binary with this rather than swapping the
+    ## shared file under every other process that loads it.
   const localShimLib = shimTargetDir / "libgpui_nim_shim.so"
-  when fileExists(localShimLib):
+  when gpuiShimPath.len > 0:
+    const shimLib = gpuiShimPath
+  elif fileExists(localShimLib):
     const shimLib = localShimLib
   else:
     const shimLib = "libgpui_nim_shim.so"
@@ -188,6 +195,19 @@ proc gpui_dispatch_key_to_focus*(event: cstring;
   ## Route a key to whatever element holds focus. Answers 0 when nothing
   ## holds focus AND when no WINDOW holds focus — the second is the negative
   ## twin PLAT-38 asks for.
+
+# --- frame timing (PLAT-42) ---
+#
+# Render-path time per frame and key-to-frame latency, in ns, recorded by the
+# shim's `frame_stats` module. The render-path time EXCLUDES GPUI's own layout
+# and paint, which run after `render` returns; see that module's docs.
+
+proc gpui_frame_count*(): uint64 {.importc: "gpui_frame_count".}
+proc gpui_frame_ns*(index: uint64): uint64 {.importc: "gpui_frame_ns".}
+proc gpui_key_latency_count*(): uint64 {.importc: "gpui_key_latency_count".}
+proc gpui_key_latency_ns*(index: uint64): uint64
+  {.importc: "gpui_key_latency_ns".}
+proc gpui_frame_stats_reset*() {.importc: "gpui_frame_stats_reset".}
 
 # --- the element store, read back ---
 

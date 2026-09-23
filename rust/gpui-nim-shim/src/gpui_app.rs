@@ -138,10 +138,15 @@ impl Render for NimRootView {
                 .into_any_element();
         }
 
+        let started = std::time::Instant::now();
         match crate::render_sync::build_render_plan(&tree, root_id) {
             Some(plan) => {
                 drop(tree); // release lock before building GPUI elements
-                render_root_to_gpui(&plan, &handle)
+                let element = render_root_to_gpui(&plan, &handle);
+                // PLAT-42: the render-path half of the frame budget. GPUI's
+                // layout and paint follow and are not in this number.
+                crate::frame_stats::complete_frame(started.elapsed().as_nanos() as u64);
+                element
             }
             None => with_keyboard(div().size_full().child("Empty shadow tree"), &handle)
                 .into_any_element(),
@@ -165,13 +170,19 @@ fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
         .key_context("IsonimGpuiRoot")
         .on_key_down(move |event: &gpui::KeyDownEvent, _window, _cx| {
             let ks = &event.keystroke;
-            // GPUI's own key spelling, passed through verbatim. See
-            // `input::modifier_bits` for why the shim does not rename it.
+            // GPUI's own spelling — `key`, or, for a printable key typed with
+            // no command modifier, GPUI's own `key_char`. See
+            // `input::key_for_consumer` for why, and `input::modifier_bits`
+            // for why the shim invents no name of its own.
             crate::input::deliver_key_to_focus(
                 "keydown",
                 Some((
                     crate::input::GPUI_EVENT_KEY_DOWN,
-                    ks.key.clone(),
+                    crate::input::key_for_consumer(
+                        &ks.key,
+                        ks.key_char.as_deref(),
+                        ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform,
+                    ),
                     crate::input::modifier_bits(&ks.modifiers),
                     event.is_held,
                 )),
@@ -397,6 +408,65 @@ pub fn apply_styles_to_div(
     if let Some(ref cursor) = styles.cursor {
         if cursor == "pointer" {
             el = el.cursor_pointer();
+        }
+    }
+
+    // THE STYLES BELOW WERE PARSED INTO THE PLAN AND NEVER DRAWN until
+    // 2026-09-23. The render plan (`gpui_render_plan_json`) reported them, so a
+    // suite reading the plan saw a flex row and a dimmed line while the WINDOW
+    // stacked the row's children vertically and dimmed nothing. A window frame
+    // compared against the plan is what found it; the two must agree, so every
+    // style the plan carries that has a GPUI equivalent is applied here.
+
+    // `display: flex` with no direction is CSS's default, a ROW.
+    if let Some(ref display) = styles.display {
+        if display.trim() == "flex" && styles.flex_direction.is_none() {
+            el = el.flex().flex_row();
+        }
+    }
+
+    // Opacity, a number in [0, 1]; anything else is ignored rather than
+    // guessed at.
+    if let Some(ref opacity) = styles.opacity {
+        if let Ok(v) = opacity.trim().parse::<f32>() {
+            if (0.0..=1.0).contains(&v) {
+                el = el.opacity(v);
+            }
+        }
+    }
+
+    if let Some(ref overflow) = styles.overflow {
+        if overflow.trim() == "hidden" {
+            el = el.overflow_hidden();
+        }
+    }
+
+    // `white-space: nowrap` / `pre` keep a line on one row; `normal` wraps.
+    if let Some(ref ws) = styles.white_space {
+        match ws.trim() {
+            "nowrap" | "pre" => el = el.whitespace_nowrap(),
+            "normal" => el = el.whitespace_normal(),
+            _ => {}
+        }
+    }
+
+    if let Some(ref to) = styles.text_overflow {
+        if to.trim() == "ellipsis" {
+            el = el.text_ellipsis();
+        }
+    }
+
+    if let Some(ref shrink) = styles.flex_shrink {
+        if shrink.trim() == "0" {
+            el = el.flex_shrink_0();
+        }
+    }
+
+    // min-width, as a pixel value — what lets a flex child shrink below its
+    // content (`min-width: 0`) so an ellipsis can apply.
+    if let Some(ref mw) = styles.min_w {
+        if let Some(px_val) = parse_px(mw) {
+            el = el.min_w(px(px_val));
         }
     }
 

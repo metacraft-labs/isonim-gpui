@@ -199,6 +199,7 @@ fn test_render_plan_to_gpui_text_node() {
                 has_click_handler: false,
                 has_input_handler: false,
                 event_names: vec![],
+                attributes: Default::default(),
                 children: vec![],
             };
             let _element = render_plan_to_gpui(&plan);
@@ -236,6 +237,7 @@ fn test_render_plan_to_gpui_styled_div() {
                 has_click_handler: false,
                 has_input_handler: false,
                 event_names: vec![],
+                attributes: Default::default(),
                 children: vec![RenderNode {
                     node_id: 101,
                     kind: GpuiElementKind::TextNode,
@@ -245,6 +247,7 @@ fn test_render_plan_to_gpui_styled_div() {
                     has_click_handler: false,
                     has_input_handler: false,
                     event_names: vec![],
+                    attributes: Default::default(),
                     children: vec![],
                 }],
             };
@@ -275,6 +278,7 @@ fn test_render_plan_to_gpui_img_placeholder() {
                 has_click_handler: false,
                 has_input_handler: false,
                 event_names: vec![],
+                attributes: Default::default(),
                 children: vec![],
             };
             let _element = render_plan_to_gpui(&plan);
@@ -304,6 +308,7 @@ fn test_render_plan_to_gpui_svg_placeholder() {
                 has_click_handler: false,
                 has_input_handler: false,
                 event_names: vec![],
+                attributes: Default::default(),
                 children: vec![],
             };
             let _element = render_plan_to_gpui(&plan);
@@ -336,6 +341,7 @@ fn test_render_plan_to_gpui_text_container() {
                 has_click_handler: false,
                 has_input_handler: false,
                 event_names: vec![],
+                attributes: Default::default(),
                 children: vec![],
             };
             let _element = render_plan_to_gpui(&plan);
@@ -584,9 +590,70 @@ fn test_apply_styles_to_div_all_fields() {
             cursor: Some("pointer".to_string()),
             display: None,
             position: None,
+            white_space: None,
+            text_overflow: None,
+            flex_shrink: None,
         };
         let el = div();
         let _styled = apply_styles_to_div(el, &styles);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 13b: every style the RENDER PLAN reports that GPUI can draw is DRAWN.
+//
+// Until 2026-09-23 `display`, `opacity`, `overflow` and friends were parsed
+// into the plan (which suites read) and dropped by `apply_styles_to_div`
+// (which the window paints), so the plan claimed a flex row with a dimmed
+// line while the window stacked the children and dimmed nothing. Asserted on
+// the element's own `StyleRefinement`, i.e. what GPUI will lay out, not on
+// the `GpuiStyles` the case built. Negative half: a style left unset changes
+// nothing, and an out-of-range opacity is ignored rather than clamped.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn test_apply_styles_draws_what_the_plan_reports() {
+    use gpui::{Display, FlexDirection, Overflow, Styled, WhiteSpace};
+    run_gpui_test("test_apply_styles_draws_what_the_plan_reports", |_cx| {
+        let styles = GpuiStyles {
+            display: Some("flex".to_string()),
+            opacity: Some("0.5".to_string()),
+            overflow: Some("hidden".to_string()),
+            white_space: Some("nowrap".to_string()),
+            text_overflow: Some("ellipsis".to_string()),
+            flex_shrink: Some("0".to_string()),
+            ..Default::default()
+        };
+        let mut el = apply_styles_to_div(div(), &styles);
+        let st = el.style();
+        assert_eq!(st.display, Some(Display::Flex));
+        assert_eq!(st.flex_direction, Some(FlexDirection::Row));
+        assert_eq!(st.opacity, Some(0.5));
+        assert_eq!(st.overflow.x, Some(Overflow::Hidden));
+        assert_eq!(st.overflow.y, Some(Overflow::Hidden));
+        assert_eq!(st.text.white_space, Some(WhiteSpace::Nowrap));
+        assert!(st.text.text_overflow.is_some());
+        assert_eq!(st.flex_shrink, Some(0.0));
+
+        // An explicit direction wins over `display: flex`'s default row.
+        let col = GpuiStyles {
+            display: Some("flex".to_string()),
+            flex_direction: Some("column".to_string()),
+            ..Default::default()
+        };
+        let mut el = apply_styles_to_div(div(), &col);
+        assert_eq!(el.style().flex_direction, Some(FlexDirection::Column));
+
+        // Negative twin: nothing set, nothing drawn; a nonsense opacity is
+        // refused rather than guessed.
+        let mut bare = apply_styles_to_div(div(), &GpuiStyles::default());
+        assert_eq!(bare.style().display, None);
+        assert_eq!(bare.style().opacity, None);
+        assert_eq!(bare.style().text.white_space, None);
+        let odd = GpuiStyles { opacity: Some("7".to_string()), ..Default::default() };
+        let mut el = apply_styles_to_div(div(), &odd);
+        assert_eq!(el.style().opacity, None);
     });
 }
 

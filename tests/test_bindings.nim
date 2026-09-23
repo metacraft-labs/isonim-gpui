@@ -152,6 +152,16 @@ static:
   assert compiles(gpui_notify_focus(1.uint32, 1.uint8))
   assert compiles(gpui_reset_windows())
 
+  # --- PLAT-42: frame and key-latency statistics ---
+  #
+  # The per-frame render time and the key-to-frame latency the windowed
+  # shim records (`frame_stats.rs`); its behaviour is that module's unit test.
+  assert compiles(gpui_frame_count())
+  assert compiles(gpui_frame_ns(0.uint64))
+  assert compiles(gpui_key_latency_count())
+  assert compiles(gpui_key_latency_ns(0.uint64))
+  assert compiles(gpui_frame_stats_reset())
+
   # --- Element event dispatcher (the element-callback registry) ---
   var disp: proc(callbackId: int32; payload: ptr GpuiEventPayload) {.cdecl.}
   assert compiles(gpui_set_event_dispatcher(disp))

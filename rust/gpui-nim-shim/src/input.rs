@@ -646,7 +646,48 @@ pub fn deliver_key_to_focus(event: &str, payload: Option<(u32, String, u32, bool
     if target.is_null() {
         return 0;
     }
-    deliver(target, event, payload)
+    let reached = deliver(target, event, payload);
+    if reached > 0 && event == "keydown" {
+        // The host's handler has run (and mutated the tree); the next frame
+        // is the one that shows it.
+        crate::frame_stats::note_key();
+    }
+    reached
+}
+
+/// The key string a keystroke is delivered with: GPUI's `key`, or — for a
+/// single PRINTABLE key typed with no command modifier — GPUI's `key_char`,
+/// the character the keystroke actually produced.
+///
+/// **BOTH ARE GPUI'S OWN SPELLINGS; THE SHIM STILL INVENTS NONE.** `key` is
+/// the character printed on the key (`"q"` for Shift+q, and for q with Caps
+/// Lock on) and `key_char` is what the keystroke typed (`"Q"`). Delivering
+/// `key` alone lost every capital that arrived WITHOUT the Shift modifier —
+/// Caps Lock, an input method, a synthetic keyboard (`wtype` typing a
+/// keysym) — measured in PLAT-44's window lane, where `Q` was inserted as
+/// `q` and Kakoune's `C` (copy selection below) ran as `c` (change). With the
+/// Shift modifier the consumer's decoder already turned `q` + shift into
+/// `Q`; passing `"Q"` with or without shift decodes to the same `Q`, so no
+/// existing binding moves.
+///
+/// Kept to what cannot collide with a NAMED key: `key` must be one
+/// character (so `"space"`, `"f10"`, `"enter"` are never replaced — `key_char`
+/// for space is `" "`), `key_char` must be one printable ASCII character
+/// other than space (the consumer's vocabulary is ASCII), and a command
+/// modifier (control, alt, platform) keeps `key`, because a chord names the
+/// KEY (`Ctrl+s`, not `Ctrl+\u{13}`).
+pub fn key_for_consumer(key: &str, key_char: Option<&str>, command: bool) -> String {
+    if !command && key.chars().count() == 1 {
+        if let Some(c) = key_char {
+            let mut chars = c.chars();
+            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                if ch.is_ascii_graphic() {
+                    return c.to_string();
+                }
+            }
+        }
+    }
+    key.to_string()
 }
 
 /// The modifier bitmask for a GPUI `Modifiers`.
@@ -687,6 +728,27 @@ pub fn modifier_bits(m: &gpui::Modifiers) -> u32 {
 // a lint difference.
 #[allow(unused_unsafe)]
 mod tests {
+    #[test]
+    fn test_key_for_consumer_delivers_the_typed_character() {
+        use super::key_for_consumer;
+        // Shift+q, and q under Caps Lock / a keysym keyboard: both `Q`.
+        assert_eq!(key_for_consumer("q", Some("Q"), false), "Q");
+        // A shifted symbol: the typed character.
+        assert_eq!(key_for_consumer("7", Some("&"), false), "&");
+        // Unchanged: plain letters, named keys, chords, and no key_char.
+        assert_eq!(key_for_consumer("a", Some("a"), false), "a");
+        assert_eq!(key_for_consumer("space", Some(" "), false), "space");
+        assert_eq!(key_for_consumer("f10", None, false), "f10");
+        assert_eq!(key_for_consumer("enter", Some("\n"), false), "enter");
+        assert_eq!(key_for_consumer("s", Some("\u{13}"), true), "s");
+        assert_eq!(key_for_consumer("s", Some("s"), true), "s");
+        assert_eq!(key_for_consumer("q", None, false), "q");
+        // Non-ASCII typed characters keep the key (the consumer's vocabulary
+        // is ASCII), and so does a whitespace key_char on a one-char key.
+        assert_eq!(key_for_consumer("q", Some("ๆ"), false), "q");
+        assert_eq!(key_for_consumer("x", Some(" "), false), "x");
+    }
+
     use super::*;
     use crate::{
         gpui_append_child, gpui_create_element, gpui_reset_tree, gpui_set_root_element,
