@@ -57,6 +57,18 @@ DOC="$REPO_ROOT/docs/gpui-pin.md"
 MIN_MANIFEST_PINS=2
 MIN_LOCK_PINS=4
 
+# NAMED BY PREFIX, VERSIONED ON THEIR OWN. `gpui-pre-reqwest` is the
+# republication of zed's `reqwest` fork (its description: "higher level HTTP
+# client library zed-industries/request@…"), published at reqwest's own
+# version line (0.12.x), not in lockstep with the GPUI core. It entered the
+# lock with gpui-kit (2026-09-17) and the family scan below — which matches
+# the `gpui-pre` PREFIX — read it as a second resolved gpui-pre version and
+# went red on every run after. It is excluded BY NAME rather than by
+# loosening the prefix match, so a genuinely new `gpui-pre-*` crate still
+# has to be at the pin; and section 3 still refuses any package, this one
+# included, that provides a second GPUI core.
+INDEPENDENTLY_VERSIONED=("gpui-pre-reqwest")
+
 fail() {
 	echo "check_gpui_pin: $*" >&2
 	exit 1
@@ -111,8 +123,9 @@ echo "manifests: $manifest_count pin(s), all at $PIN"
 # --- 2. the lock --------------------------------------------------------
 # Every `[[package]]` whose name is in the gpui-pre family, and the version
 # recorded on the line after it.
-lock_pairs="$(awk '
-	/^name = "gpui-pre/ { want = 1; next }
+lock_pairs="$(awk -v skip="${INDEPENDENTLY_VERSIONED[*]}" '
+	BEGIN { n = split(skip, s, " "); for (i = 1; i <= n; i++) excluded["\"" s[i] "\""] = 1 }
+	/^name = "gpui-pre/ { want = !($3 in excluded); next }
 	want && /^version = / { gsub(/[">]/, "", $3); print $3; want = 0 }
 ' "$LOCK")"
 lock_total="$(printf '%s\n' "$lock_pairs" | grep -c . || true)"

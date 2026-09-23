@@ -157,7 +157,23 @@ BENCHMARKS=(
 #     rather than predicted into it — when the sibling is repaired this
 #     becomes 283 and the drift check will say so, which is the check
 #     doing its job rather than a number to pre-empt.
-EXPECTED_CASES=278
+#
+# PLAT-42, 2026-09-23, written LAST and from a run (trap 4c):
+#   155 rust unit  +  10 window-registry  +  15 cross-renderer
+# +  14 gui        +  31 render-integration  +  6 structural
+# +   5 gpui-reactive
+# +  26 input-focus
+# +   1 basic      +   1 bindings           + 23 renderer checkpoints
+# = 287
+#
+#   * rust 151 -> 155. Two are the render plan's element-attribute tests
+#     (`feat(plan): report element attributes`, which landed without moving
+#     this figure — the lane said so by drifting); one is `frame_stats`'s;
+#     one is `input::key_for_consumer`'s (the typed character delivered).
+#   * gpui-reactive 0 -> 5: the prediction above, fulfilled. The workspace's
+#     `../isonim` was fast-forwarded to its `dev`, which carries
+#     `NativeRootAccessor`, and the suite compiles and runs its five cases.
+EXPECTED_CASES=287
 
 total_cases=0
 failed_steps=()

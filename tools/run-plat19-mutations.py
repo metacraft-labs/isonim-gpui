@@ -458,12 +458,10 @@ ARMS: list[Arm] = [
         grader="lane",
         kills="CASE COUNT DRIFT",
         control="LANE RESULT: FAILED",
-        # RS-M14b: carried from 231/237 to 234/240 with `EXPECTED_CASES`.
-        # The delta is unchanged — removing this suite removes its 6 cases
-        # — but see the note on L2: this string was NOT re-derived from a
-        # mutation run, because the tool refuses to run at the current
-        # digests.
-        because="CASE COUNT DRIFT: the lane ran 234 cases, not 240.",
+        # RE-DERIVED 2026-09-23 (PLAT-42) by `--derive-because --only L1`
+        # against `EXPECTED_CASES = 287`: removing this suite removes its 6
+        # cases, as before.
+        because="CASE COUNT DRIFT: the lane ran 281 cases, not 287.",
     ),
     Arm(
         id="L2",
@@ -483,14 +481,10 @@ ARMS: list[Arm] = [
         # `ci/run-suite.sh --with-gpui` transcript (240 cases, 0 failing
         # steps).
         #
-        # NEITHER THIS NOR L1's `because` HAS BEEN RE-DERIVED BY RUNNING
-        # THE ARMS. The tool fails closed on digest drift, and the
-        # recorded digests are stale — `rust/Cargo.lock` and
-        # `rust/gpui-nim-shim/Cargo.toml` were ALREADY stale before
-        # RS-M14b, so the tool was refusing to run at HEAD too. Re-record
-        # only after re-running the arms; re-recording first would assert
-        # a validation nobody performed.
-        control="TOTAL CASES: 240   (expected 240)",
+        # RE-DERIVED 2026-09-23 (PLAT-42): `EXPECTED_CASES` is 287, and the
+        # arm was run (`--derive-because --only L2`) before this control
+        # was changed, so the control names a line the lane prints.
+        control="TOTAL CASES: 287   (expected 287)",
         because="- nim: tests/test_structural_comparison.nim (rc=1)",
     ),
     Arm(
@@ -541,7 +535,8 @@ ARMS: list[Arm] = [
         grader="check_pin",
         kills="exact",
         control="__rc_is_1__",
-        because='3 gpui-pre dependencies but only 2 exact ("=X.Y.Z") version requirements — every one must be pinned exactly',
+        # Re-derived 2026-09-23: gpui-kit added a fourth pinned manifest.
+        because='4 gpui-pre dependencies but only 3 exact ("=X.Y.Z") version requirements — every one must be pinned exactly',
     ),
     Arm(
         id="G4",
@@ -552,7 +547,8 @@ ARMS: list[Arm] = [
         replace='name = "gpui-pre-platform"\nversion = "0.3.4"',
         grader="check_pin",
         kills="Cargo.lock resolved MORE THAN ONE gpui-pre version",
-        control="manifests: 3 pin(s)",
+        # Re-derived 2026-09-23: gpui-kit added a fourth pinned manifest.
+        control="manifests: 4 pin(s)",
         because="Cargo.lock resolved MORE THAN ONE gpui-pre version:",
     ),
     Arm(
