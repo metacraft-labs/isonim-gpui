@@ -1225,10 +1225,24 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
             .map(|e| format!("\"{}\"", json_escape(e)))
             .collect();
 
+        // Public attributes, in the plan's own (sorted) order. Each key and
+        // value goes through `json_escape`: attribute values carry program
+        // text — `data-ct-values` holds inline variable values — and an
+        // unescaped newline there would make the whole plan invalid JSON for
+        // a strict parser, the defect `json_escape` itself was written for.
+        let attributes_json = format!(
+            "{{{}}}",
+            plan.attributes
+                .iter()
+                .map(|(k, v)| format!("\"{}\":\"{}\"", json_escape(k), json_escape(v)))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
         let children: Vec<String> = plan.children.iter().map(node_to_string).collect();
 
         format!(
-            "{{\"kind\":\"{}\",\"tag\":\"{}\",\"text\":{},\"has_click_handler\":{},\"has_input_handler\":{},\"event_names\":[{}],\"styles\":{},\"children\":[{}]}}",
+            "{{\"kind\":\"{}\",\"tag\":\"{}\",\"text\":{},\"has_click_handler\":{},\"has_input_handler\":{},\"event_names\":[{}],\"styles\":{},\"attributes\":{},\"children\":[{}]}}",
             kind,
             json_escape(tag),
             text,
@@ -1236,6 +1250,7 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
             plan.has_input_handler,
             event_names.join(","),
             styles_json,
+            attributes_json,
             children.join(","),
         )
     }

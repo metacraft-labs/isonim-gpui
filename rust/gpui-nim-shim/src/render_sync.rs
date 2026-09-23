@@ -32,6 +32,8 @@
 //! - `justify-content` -> `.justify_center()` etc.
 //! - `gap` -> `.gap()`
 
+use std::collections::BTreeMap;
+
 use crate::tree::{GpuiElementKind, Node, NodeId, NodeKind, Tree};
 
 /// Determines what GPUI element a shadow node should map to.
@@ -220,6 +222,23 @@ pub struct RenderNode {
     pub has_input_handler: bool,
     /// All event listener names attached to this node (for introspection/testing).
     pub event_names: Vec<String>,
+    /// The element's PUBLIC attributes — everything not prefixed `__`.
+    ///
+    /// **Added because the plan could not see what the product writes.** The
+    /// CodeTracer editor records its four debugger surfaces as attributes
+    /// (`data-ct-pointer`, `data-ct-mark`, `data-ct-values`) and every one of
+    /// them was absent from every captured plan: the element carried them and
+    /// the introspection surface dropped them, so no test reading the plan
+    /// could tell a row with an execution pointer from one without.
+    ///
+    /// All public attributes rather than a chosen few, so the plan does not
+    /// answer only the questions somebody thought to ask when it was written.
+    /// `__`-prefixed keys are internal (`__text_content` is already `text`).
+    ///
+    /// A `BTreeMap`, not the tree's `HashMap`: iteration order must be stable,
+    /// or two plans of one tree serialise differently and every digest and
+    /// byte-identity check built on the plan becomes a coin flip.
+    pub attributes: BTreeMap<String, String>,
     /// Children render nodes (recursive).
     pub children: Vec<RenderNode>,
 }
@@ -247,6 +266,12 @@ pub fn build_render_plan(tree: &Tree, root_id: NodeId) -> Option<RenderNode> {
     let has_click_handler = node.event_listeners.contains_key("click");
     let has_input_handler = node.event_listeners.contains_key("input");
     let event_names: Vec<String> = node.event_listeners.keys().cloned().collect();
+    let attributes: BTreeMap<String, String> = node
+        .attributes
+        .iter()
+        .filter(|(k, _)| !k.starts_with("__"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     let children: Vec<RenderNode> = node
         .children
@@ -263,6 +288,7 @@ pub fn build_render_plan(tree: &Tree, root_id: NodeId) -> Option<RenderNode> {
         has_click_handler,
         has_input_handler,
         event_names,
+        attributes,
         children,
     })
 }
@@ -597,6 +623,7 @@ mod tests {
             has_click_handler: false,
             has_input_handler: false,
             event_names: vec![],
+                attributes: BTreeMap::new(),
             children: vec![
                 RenderNode {
                     node_id: 2,
@@ -607,6 +634,7 @@ mod tests {
                     has_click_handler: false,
                     has_input_handler: false,
                     event_names: vec![],
+                attributes: BTreeMap::new(),
                     children: vec![],
                 },
                 RenderNode {
@@ -618,6 +646,7 @@ mod tests {
                     has_click_handler: false,
                     has_input_handler: false,
                     event_names: vec![],
+                attributes: BTreeMap::new(),
                     children: vec![RenderNode {
                         node_id: 4,
                         kind: GpuiElementKind::TextNode,
@@ -627,6 +656,7 @@ mod tests {
                         has_click_handler: false,
                         has_input_handler: false,
                         event_names: vec![],
+                attributes: BTreeMap::new(),
                         children: vec![],
                     }],
                 },
@@ -1529,6 +1559,50 @@ mod integration_tests {
             // wrong — which is why this compares against `raw` rather than
             // merely asserting that parsing succeeded.
             assert_eq!(json["text"], raw);
+            gpui_destroy_element(node);
+        }
+    }
+
+    /// **The plan reports the element's public attributes.**
+    ///
+    /// Written because it did not: the CodeTracer editor records its debugger
+    /// surfaces as `data-ct-*` attributes and not one of them appeared in any
+    /// captured plan, so the introspection surface could not distinguish a
+    /// row carrying an execution pointer from a row without one.
+    ///
+    /// Three properties, each of which a plausible implementation gets wrong:
+    /// a public attribute IS reported; an internal `__` one is NOT (it would
+    /// duplicate `text`); and a value carrying a newline round-trips, because
+    /// `data-ct-values` holds program values and `get_plan_json` parses with a
+    /// strict parser that rejects raw control characters.
+    #[test]
+    #[serial]
+    fn test_render_plan_reports_public_attributes() {
+        unsafe {
+            gpui_reset_tree();
+            let node = gpui_create_element(c("div").as_ptr());
+            gpui_set_attribute(node, c("data-ct-pointer").as_ptr(), c("execution").as_ptr());
+            gpui_set_attribute(node, c("data-ct-values").as_ptr(), c("x: 1\ny: 2").as_ptr());
+            let json = get_plan_json(node);
+            assert_eq!(json["attributes"]["data-ct-pointer"], "execution");
+            assert_eq!(json["attributes"]["data-ct-values"], "x: 1\ny: 2");
+            assert!(json["attributes"].get("__text_content").is_none());
+            gpui_destroy_element(node);
+        }
+    }
+
+    /// A node with no public attributes reports an EMPTY object, not a
+    /// missing key — so a reader can tell "none" from "not serialised", which
+    /// is the distinction whose absence hid the four surfaces in the first place.
+    #[test]
+    #[serial]
+    fn test_render_plan_attributes_empty_is_an_object() {
+        unsafe {
+            gpui_reset_tree();
+            let node = gpui_create_element(c("div").as_ptr());
+            let json = get_plan_json(node);
+            assert!(json["attributes"].is_object());
+            assert_eq!(json["attributes"].as_object().unwrap().len(), 0);
             gpui_destroy_element(node);
         }
     }
