@@ -28,3 +28,26 @@ publish = false
 gpui-component = "=0.6.4"
 gpui-base = "=0.6.4"
 gpui = { package = "gpui-pre", version = "=0.3.5" }
+
+# PLAT-42 — ONE FEATURE PER DECISION CELL (candidate x surface).
+#
+# A crate compiles or it does not, so a probe that put all eight cells in one
+# build would produce ONE verdict for eight questions. Each cell is a feature,
+# built on its own by `ci/test/plat42-candidate-probe.sh` in codetracer, and its
+# verdict is that build's exit status plus the private items rustc names.
+#
+#   b-*  candidate B: gpui-kit's editor UNMODIFIED + a host-drawn overlay. May use
+#        only public API; a compile error is the verdict "not reachable".
+#   a-*  candidate A: gpui-kit's editor through a maintained FORK. Written against
+#        the internals the surface actually needs; every private item rustc names
+#        is one entry on the fork bill (criterion K3).
+[features]
+b-pointer = []
+b-status = []
+b-values = []
+b-flow = []
+b-foldaware = []
+a-pointer = []
+a-status = []
+a-values = []
+a-flow = []
