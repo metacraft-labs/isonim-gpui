@@ -107,6 +107,7 @@
 
 import std/os
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 
 # ``ct_test_nim_unittest`` supplies ``buildNimUnittest.build(...)`` (the
 # per-test compile BUILD edge) and the ``edge.testBinary.run(...)`` UFCS
@@ -165,6 +166,10 @@ const testSpecs: seq[GpuiTestSpec] = @[
 ]
 
 package isonim_gpui:
+  devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
   defaultToolProvisioning "path"
 
   uses:
