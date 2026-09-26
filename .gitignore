@@ -1,5 +1,8 @@
 .direnv/
 nimcache/
+# Per-checkout nimcache (config.nims): every Nim compile in this checkout
+# keeps its intermediate files here, never in the shared ~/.cache/nim.
+.nimcache/
 target/
 result
 *.so
@@ -39,6 +42,7 @@ tests/test_gpui_reconciler_identity
 # `keymap/` directory from git. Prefer a longer explicit list to a clever glob.
 tests/test_input_focus
 tests/test_gui_keyboard
+tests/test_nimcache_is_worktree_local
 
 # Repro development environment cache
 .repro/
