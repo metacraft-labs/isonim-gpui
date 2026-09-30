@@ -593,6 +593,11 @@ fn test_apply_styles_to_div_all_fields() {
             white_space: None,
             text_overflow: None,
             flex_shrink: None,
+            // Every field added after this case was written (per-side
+            // borders, weight, placement, …) stays unset: the case asserts
+            // the fields above, and a new style field must not stop the
+            // test target from compiling.
+            ..Default::default()
         };
         let el = div();
         let _styled = apply_styles_to_div(el, &styles);
