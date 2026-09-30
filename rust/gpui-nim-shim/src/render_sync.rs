@@ -73,6 +73,12 @@ pub struct GpuiStyles {
     pub items: Option<String>,
     pub justify: Option<String>,
     pub border_width: Option<String>,
+    /// Per-side widths (`border-top-width`, ...), each overriding
+    /// `border_width` on its own side.
+    pub border_top_width: Option<String>,
+    pub border_right_width: Option<String>,
+    pub border_bottom_width: Option<String>,
+    pub border_left_width: Option<String>,
     pub border_color: Option<String>,
     pub shadow: Option<String>,
     pub opacity: Option<String>,
@@ -88,6 +94,21 @@ pub struct GpuiStyles {
     pub white_space: Option<String>,
     pub text_overflow: Option<String>,
     pub flex_shrink: Option<String>,
+    /// `flex-grow: 1` — the element takes the free space on its parent's
+    /// main axis (a row's band that must reach the parent's right edge).
+    pub flex_grow: Option<String>,
+    /// Per-side padding (`padding-left`, ...), each overriding `p` on its
+    /// own side.
+    pub padding_top: Option<String>,
+    pub padding_right: Option<String>,
+    pub padding_bottom: Option<String>,
+    pub padding_left: Option<String>,
+    /// The inset of a `position: absolute` element from its containing
+    /// block's edges, in pixels.
+    pub top: Option<String>,
+    pub right: Option<String>,
+    pub bottom: Option<String>,
+    pub left: Option<String>,
 }
 
 impl GpuiStyles {
@@ -138,6 +159,16 @@ impl GpuiStyles {
                 self.justify = Some(normalize_justification(value))
             }
             "border-width" | "border_width" | "border" => self.border_width = Some(v),
+            "border-top-width" | "border_top_width" => self.border_top_width = Some(v),
+            "border-right-width" | "border_right_width" => self.border_right_width = Some(v),
+            "border-bottom-width" | "border_bottom_width" => {
+                self.border_bottom_width = Some(v)
+            }
+            "border-left-width" | "border_left_width" => self.border_left_width = Some(v),
+            "top" => self.top = Some(v),
+            "right" => self.right = Some(v),
+            "bottom" => self.bottom = Some(v),
+            "left" => self.left = Some(v),
             "border-color" | "border_color" => self.border_color = Some(v),
             "shadow" | "box-shadow" | "box_shadow" => self.shadow = Some(v),
             "opacity" => self.opacity = Some(v),
@@ -153,6 +184,11 @@ impl GpuiStyles {
             "white-space" | "white_space" | "whitespace" => self.white_space = Some(v),
             "text-overflow" | "text_overflow" => self.text_overflow = Some(v),
             "flex-shrink" | "flex_shrink" => self.flex_shrink = Some(v),
+            "flex-grow" | "flex_grow" => self.flex_grow = Some(v),
+            "padding-top" | "padding_top" => self.padding_top = Some(v),
+            "padding-right" | "padding_right" => self.padding_right = Some(v),
+            "padding-bottom" | "padding_bottom" => self.padding_bottom = Some(v),
+            "padding-left" | "padding_left" => self.padding_left = Some(v),
             _ => {} // Ignore unknown properties
         }
     }
@@ -435,6 +471,36 @@ mod tests {
         assert_eq!(styles.gap.as_deref(), Some("10"));
         assert_eq!(styles.p.as_deref(), Some("5"));
         assert_eq!(styles.m.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn test_styles_per_side_and_placement_keys() {
+        // The keys the window draws since 2026-09-29: per-side borders and
+        // padding, absolute insets and a grow factor — each parsed into its
+        // own field, not dropped as unknown.
+        let mut node = Node::new_element("div");
+        for (k, v) in [
+            ("border-left-width", "3px"),
+            ("border-top-width", "1px"),
+            ("padding-left", "10px"),
+            ("padding-bottom", "2px"),
+            ("flex-grow", "1"),
+            ("position", "absolute"),
+            ("top", "30px"),
+            ("left", "40px"),
+        ] {
+            node.styles.insert(k.into(), v.into());
+        }
+        let styles = GpuiStyles::from_node(&node);
+        assert_eq!(styles.border_left_width.as_deref(), Some("3px"));
+        assert_eq!(styles.border_top_width.as_deref(), Some("1px"));
+        assert_eq!(styles.border_right_width, None);
+        assert_eq!(styles.padding_left.as_deref(), Some("10px"));
+        assert_eq!(styles.padding_bottom.as_deref(), Some("2px"));
+        assert_eq!(styles.padding_top, None);
+        assert_eq!(styles.flex_grow.as_deref(), Some("1"));
+        assert_eq!(styles.top.as_deref(), Some("30px"));
+        assert_eq!(styles.left.as_deref(), Some("40px"));
     }
 
     #[test]

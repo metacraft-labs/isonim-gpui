@@ -205,6 +205,26 @@ pub fn auto_quit_ms() -> u32 {
     AUTO_QUIT_MS.load(Ordering::Acquire)
 }
 
+/// The host's periodic callback: `(interval_ms, callback)`. Set by
+/// `gpui_set_tick` before or during a loop; an interval of 0 (or no
+/// callback) disarms it. Read by the loop's ticker on every period, so a
+/// host can disarm it from inside its own callback.
+pub type TickCallback = extern "C" fn();
+static TICK: Mutex<Option<(u32, TickCallback)>> = Mutex::new(None);
+
+/// Arm (`interval_ms > 0` and a callback) or disarm the host's tick.
+pub fn set_tick(interval_ms: u32, callback: Option<TickCallback>) {
+    *take_lock(&TICK) = match callback {
+        Some(cb) if interval_ms > 0 => Some((interval_ms, cb)),
+        _ => None,
+    };
+}
+
+/// The armed tick, if any.
+pub fn tick() -> Option<(u32, TickCallback)> {
+    *take_lock(&TICK)
+}
+
 /// Global window registry. For now we support a single window (the common case).
 /// The mutex protects concurrent access from the event loop thread and the Nim thread.
 static WINDOWS: std::sync::LazyLock<Mutex<Vec<WindowConfig>>> =
@@ -382,6 +402,7 @@ pub fn reset_windows() {
     // exactly the kind `reset_windows` exists to prevent.
     QUIT_REQUESTED.store(false, Ordering::Release);
     AUTO_QUIT_MS.store(0, Ordering::Release);
+    set_tick(0, None);
 }
 
 #[cfg(test)]
@@ -389,6 +410,28 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::sync::atomic::{AtomicU32 as TestAtomicU32, Ordering as TestOrdering};
+
+    extern "C" fn noop_tick() {}
+
+    #[test]
+    #[serial]
+    fn test_tick_arms_disarms_and_resets() {
+        reset_windows();
+        assert!(tick().is_none());
+        set_tick(250, Some(noop_tick));
+        assert_eq!(tick().map(|(ms, _)| ms), Some(250));
+        // An interval of 0 disarms, even with a callback.
+        set_tick(0, Some(noop_tick));
+        assert!(tick().is_none());
+        // No callback disarms, whatever the interval.
+        set_tick(250, Some(noop_tick));
+        set_tick(250, None);
+        assert!(tick().is_none());
+        // A reset leaves nothing armed for the next loop.
+        set_tick(100, Some(noop_tick));
+        reset_windows();
+        assert!(tick().is_none());
+    }
 
     #[test]
     #[serial]

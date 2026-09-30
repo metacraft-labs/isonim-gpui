@@ -71,6 +71,14 @@ const
   GpuiEventOther* = 0'u32
   GpuiEventKeyDown* = 1'u32
   GpuiEventKeyUp* = 2'u32
+  GpuiEventPointerDown* = 3'u32
+    ## The left button went down; the key is `"x,y"`, the window position.
+  GpuiEventPointerMove* = 4'u32
+    ## The pointer moved; the key is `"x,y"`.
+  GpuiEventPointerUp* = 5'u32
+    ## The left button came up; the key is `"x,y"`.
+  GpuiEventPointerWheel* = 6'u32
+    ## The wheel turned; the key is `"x,y,dx,dy"` (the delta in pixels).
 
   GpuiModControl* = 1'u32 shl 0
   GpuiModAlt* = 1'u32 shl 1
@@ -388,6 +396,15 @@ proc gpui_quit_after_ms*(ms: uint32)
 proc gpui_quit_requested*(): uint8
   {.importc: "gpui_quit_requested".}
   ## 1 if a quit is latched and not yet consumed. Observation only.
+
+type GpuiTickCallback* = proc() {.cdecl.}
+  ## A host's periodic callback (`gpui_set_tick`).
+
+proc gpui_set_tick*(interval_ms: uint32; callback: GpuiTickCallback)
+  {.importc: "gpui_set_tick".}
+  ## Run `callback` every `interval_ms` ms on the event loop's main thread,
+  ## then repaint; `0` or `nil` disarms. For state that moves without input
+  ## — a repository's working tree, re-read on a clock.
 
 proc gpui_on_resize*(window_id: uint32; callback: ResizeCallback)
   {.importc: "gpui_on_resize".}

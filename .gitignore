@@ -46,3 +46,8 @@ tests/test_nimcache_is_worktree_local
 
 # Repro development environment cache
 .repro/
+
+# The windowed border/weight/pointer suite and the virtual pointer it drives
+# (`scripts/build-virtual-pointer.sh` builds into build/).
+tests/test_gui_borders
+build/

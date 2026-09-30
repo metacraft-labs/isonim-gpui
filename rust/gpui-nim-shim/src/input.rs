@@ -69,6 +69,14 @@ pub const GPUI_EVENT_OTHER: u32 = 0;
 pub const GPUI_EVENT_KEY_DOWN: u32 = 1;
 /// A key coming up.
 pub const GPUI_EVENT_KEY_UP: u32 = 2;
+/// The left button went down; `key` is `"x,y"`, the window position.
+pub const GPUI_EVENT_POINTER_DOWN: u32 = 3;
+/// The pointer moved; `key` is `"x,y"`.
+pub const GPUI_EVENT_POINTER_MOVE: u32 = 4;
+/// The left button came up; `key` is `"x,y"`.
+pub const GPUI_EVENT_POINTER_UP: u32 = 5;
+/// The wheel turned; `key` is `"x,y,dx,dy"` (the delta in pixels).
+pub const GPUI_EVENT_POINTER_WHEEL: u32 = 6;
 
 /// Modifier bits. The five GPUI itself distinguishes (`gpui::Modifiers`), in
 /// the order that struct declares them, so the mapping is a transcription
@@ -263,6 +271,31 @@ pub fn deliver(node_id: NodeId, event: &str, payload: Option<(u32, String, u32, 
     // `key_c` must outlive the loop; naming it here makes that explicit to a
     // reader rather than leaving it to drop order.
     drop(key_c);
+    reached
+}
+
+/// Deliver a POINTER event: its window position (and a wheel's delta)
+/// spelled into the payload's `key` as `input.rs`'s `GPUI_EVENT_POINTER_*`
+/// kinds document. Positions are written with one decimal, which is finer
+/// than a logical pixel and stable across platforms' float formatting.
+pub fn deliver_pointer(
+    node_id: NodeId,
+    event: &str,
+    kind: u32,
+    x: f32,
+    y: f32,
+    delta: Option<(f32, f32)>,
+) -> u32 {
+    let key = match delta {
+        Some((dx, dy)) => format!("{:.1},{:.1},{:.1},{:.1}", x, y, dx, dy),
+        None => format!("{:.1},{:.1}", x, y),
+    };
+    let reached = deliver(node_id, event, Some((kind, key.clone(), 0, false)));
+    // `ISONIM_GPUI_TRACE_POINTER=1`: one line per pointer event and how many
+    // listeners it reached — for diagnosing a window lane's pointer path.
+    if std::env::var_os("ISONIM_GPUI_TRACE_POINTER").is_some() {
+        eprintln!("pointer {} {} node {} reached {}", event, key, node_id.0, reached);
+    }
     reached
 }
 

@@ -108,6 +108,13 @@
               # key that never reached the compositor would be a
               # different experiment wearing the same name.
               pkgs.wtype
+              # The POINTER twin of `wtype`: the wlr virtual-pointer XML,
+              # from which `scripts/build-virtual-pointer.sh` builds
+              # `tools/virtual_pointer.c` — a client that gives a headless
+              # sway a real pointer device, so a window's mouse listeners
+              # receive compositor-routed events (`tests/test_gui_borders.nim`).
+              pkgs.wlr-protocols
+              pkgs.wayland-scanner
               # weston is deliberately NOT here. `weston
               # --backend=headless-backend.so` advertises no `wl_seat`
               # and GPUI unwraps that `None` at startup, so it cannot run
@@ -118,6 +125,16 @@
               pkgs.ffmpeg-full
               pkgs.mpv
             ];
+
+          # THE FONTS A WINDOW RENDERS WITH, NAMED HERE rather than read from
+          # whatever the host's fontconfig lists. The host this shell was
+          # measured on resolved one face — DejaVu Sans Book — so a bold
+          # label rendered at regular weight and the window could not show
+          # the weight its render plan carried (`tests/test_gui_borders.nim`
+          # reads the stems). The full DejaVu family has the bold faces.
+          FONTCONFIG_FILE = pkgs.lib.optionalString isLinux (
+            pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }
+          );
 
           # Ensure the linker can find native libs at build time
           LD_LIBRARY_PATH = pkgs.lib.optionalString isLinux (

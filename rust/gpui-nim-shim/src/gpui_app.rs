@@ -19,9 +19,10 @@ use crate::window;
 // recursion in the compiler.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 use gpui::{
-    div, px, rgb, rgba, size, AnyElement, App, AppContext as _, Application, AsyncApp, Bounds,
-    Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, QuitMode,
-    Render, Rgba, Styled, WeakEntity, Window, WindowBounds, WindowOptions,
+    div, px, rgb, rgba, size, AbsoluteLength, AnyElement, App, AppContext as _, Application,
+    AsyncApp, Bounds, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, QuitMode, Render, Rgba, Styled, WeakEntity, Window, WindowBounds,
+    WindowOptions,
 };
 
 // RS-M14 Phase 2 (git pin): `Application::new()` from crates.io `gpui = "0.2"`
@@ -304,6 +305,78 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
         });
     }
 
+    el = wire_pointer_listeners(el, plan);
+    el
+}
+
+/// Wire the POINTER events a node listens for (`mousedown`, `mousemove`,
+/// `mouseup`, `wheel`) to GPUI's mouse listeners, each delivering the
+/// pointer's WINDOW position — what a consumer needs to hit-test a drag, a
+/// divider or a drop zone against its own layout.
+///
+/// The position travels in the payload's `key` as `"x,y"` (logical window
+/// pixels), and a wheel's as `"x,y,dx,dy"` (the delta in pixels, lines
+/// converted at the window's line height), under the `GPUI_EVENT_POINTER_*`
+/// kinds (`input.rs`). The payload's layout is unchanged, so every consumer
+/// built against the key-only ABI still reads it.
+///
+/// Only the left button presses and releases: a drag is a left-button
+/// gesture, and a listener for every button would hand a right-click to a
+/// consumer that asked for a drag. A move is reported whether or not a button
+/// is down; the consumer knows whether a gesture is in flight.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn wire_pointer_listeners(mut el: Div, plan: &crate::render_sync::RenderNode) -> Div {
+    let has = |name: &str| plan.event_names.iter().any(|n| n == name);
+    let node_id = crate::tree::NodeId(plan.node_id);
+    if has("mousedown") {
+        el = el.on_mouse_down(MouseButton::Left, move |event, _window, _cx| {
+            crate::input::deliver_pointer(
+                node_id,
+                "mousedown",
+                crate::input::GPUI_EVENT_POINTER_DOWN,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                None,
+            );
+        });
+    }
+    if has("mousemove") {
+        el = el.on_mouse_move(move |event, _window, _cx| {
+            crate::input::deliver_pointer(
+                node_id,
+                "mousemove",
+                crate::input::GPUI_EVENT_POINTER_MOVE,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                None,
+            );
+        });
+    }
+    if has("mouseup") {
+        el = el.on_mouse_up(MouseButton::Left, move |event, _window, _cx| {
+            crate::input::deliver_pointer(
+                node_id,
+                "mouseup",
+                crate::input::GPUI_EVENT_POINTER_UP,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                None,
+            );
+        });
+    }
+    if has("wheel") {
+        el = el.on_scroll_wheel(move |event, window, _cx| {
+            let delta = event.delta.pixel_delta(window.line_height());
+            crate::input::deliver_pointer(
+                node_id,
+                "wheel",
+                crate::input::GPUI_EVENT_POINTER_WHEEL,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                Some((f32::from(delta.x), f32::from(delta.y))),
+            );
+        });
+    }
     el
 }
 
@@ -352,6 +425,21 @@ pub fn apply_styles_to_div(
         if let Some(px_val) = parse_px(p) {
             el = el.p(px(px_val));
         }
+    }
+
+    // Per-side padding, after `p` so a side named on its own wins
+    // (2026-09-29: parsed into the plan as `padding_left` and never drawn).
+    if let Some(v) = styles.padding_top.as_deref().and_then(parse_px) {
+        el = el.pt(px(v));
+    }
+    if let Some(v) = styles.padding_right.as_deref().and_then(parse_px) {
+        el = el.pr(px(v));
+    }
+    if let Some(v) = styles.padding_bottom.as_deref().and_then(parse_px) {
+        el = el.pb(px(v));
+    }
+    if let Some(v) = styles.padding_left.as_deref().and_then(parse_px) {
+        el = el.pl(px(v));
     }
 
     // Margin
@@ -462,6 +550,16 @@ pub fn apply_styles_to_div(
         }
     }
 
+    // `flex-grow: N`, a non-negative grow factor: the element takes its
+    // share of the free space on its parent's main axis.
+    if let Some(ref grow) = styles.flex_grow {
+        if let Ok(g) = grow.trim().parse::<f32>() {
+            if g >= 0.0 {
+                el = el.flex_grow(g);
+            }
+        }
+    }
+
     // min-width, as a pixel value — what lets a flex child shrink below its
     // content (`min-width: 0`) so an ellipsis can apply.
     if let Some(ref mw) = styles.min_w {
@@ -470,7 +568,88 @@ pub fn apply_styles_to_div(
         }
     }
 
+    // BORDERS AND WEIGHT (2026-09-29). Both were parsed into the plan and
+    // never drawn — the plan said a pane was outlined and a tab was bold, the
+    // window showed neither. A width applies to every side unless a per-side
+    // width names that side; a width without a colour draws in GPUI's
+    // default border colour.
+    let all_sides = styles.border_width.as_deref().and_then(parse_px);
+    let side = |s: &Option<String>| s.as_deref().and_then(parse_px).or(all_sides);
+    let widths = [
+        side(&styles.border_top_width),
+        side(&styles.border_right_width),
+        side(&styles.border_bottom_width),
+        side(&styles.border_left_width),
+    ];
+    if widths.iter().any(|w| w.is_some()) {
+        let st = el.style();
+        if let Some(v) = widths[0] {
+            st.border_widths.top = Some(AbsoluteLength::Pixels(px(v)));
+        }
+        if let Some(v) = widths[1] {
+            st.border_widths.right = Some(AbsoluteLength::Pixels(px(v)));
+        }
+        if let Some(v) = widths[2] {
+            st.border_widths.bottom = Some(AbsoluteLength::Pixels(px(v)));
+        }
+        if let Some(v) = widths[3] {
+            st.border_widths.left = Some(AbsoluteLength::Pixels(px(v)));
+        }
+    }
+    if let Some(color) = styles.border_color.as_deref().and_then(parse_color) {
+        el = el.border_color(color);
+    }
+    // `font-family`: the face this element's text is set in.
+    if let Some(ref family) = styles.font_family {
+        let family = family.trim().trim_matches(|c| c == '"' || c == '\'');
+        if !family.is_empty() {
+            el = el.font_family(gpui::SharedString::from(family.to_string()));
+        }
+    }
+    // `font-size`, a pixel value: the text size of this element's text.
+    if let Some(ref size) = styles.text_size {
+        if let Some(px_val) = parse_px(size) {
+            el = el.text_size(px(px_val));
+        }
+    }
+    if let Some(ref weight) = styles.font_weight {
+        el = el.font_weight(parse_font_weight(weight));
+    }
+
+    // `position: absolute` with its insets: an element drawn over its
+    // siblings at a fixed place — a drop zone's translucent quad, a drag's
+    // ghost label — without taking a share of the flex layout.
+    if styles.position.as_deref().map(str::trim) == Some("absolute") {
+        el = el.absolute();
+        if let Some(v) = styles.top.as_deref().and_then(parse_px) {
+            el = el.top(px(v));
+        }
+        if let Some(v) = styles.left.as_deref().and_then(parse_px) {
+            el = el.left(px(v));
+        }
+        if let Some(v) = styles.right.as_deref().and_then(parse_px) {
+            el = el.right(px(v));
+        }
+        if let Some(v) = styles.bottom.as_deref().and_then(parse_px) {
+            el = el.bottom(px(v));
+        }
+    }
+
     el
+}
+
+/// A CSS `font-weight` as GPUI's: the keywords and the hundreds.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_font_weight(s: &str) -> FontWeight {
+    match s.trim() {
+        "bold" | "bolder" => FontWeight::BOLD,
+        "normal" => FontWeight::NORMAL,
+        "lighter" => FontWeight::LIGHT,
+        other => other
+            .parse::<f32>()
+            .map(FontWeight)
+            .unwrap_or(FontWeight::NORMAL),
+    }
 }
 
 /// Parse a pixel value from a CSS-like string.
@@ -487,6 +666,12 @@ pub fn parse_px(s: &str) -> Option<f32> {
 pub fn parse_color(s: &str) -> Option<Hsla> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix('#') {
+        // `#rrggbbaa`: a translucent fill (a drop zone's quad).
+        if hex.len() == 8 {
+            let v = u32::from_str_radix(hex, 16).ok()?;
+            let rgba_color: Rgba = rgba(v);
+            return Some(rgba_color.into());
+        }
         if hex.len() == 6 {
             let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
             let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
@@ -587,6 +772,7 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
         .expect("Failed to open GPUI window");
 
         spawn_shutdown_poller(cx, auto_quit_ms);
+        spawn_ticker(cx);
     });
 
     // The event loop has returned -- the user closed the window, or a
@@ -599,6 +785,7 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     // the next one.
     window::set_auto_quit_ms(0);
     window::clear_quit_request();
+    window::set_tick(0, None);
 
     ACTIVE_WINDOW_ID.store(0, std::sync::atomic::Ordering::Release);
 }
@@ -711,6 +898,33 @@ fn spawn_shutdown_poller(cx: &mut App, auto_quit_ms: u32) {
                 });
                 draining_since = Some(std::time::Instant::now());
             }
+        }
+    })
+    .detach();
+}
+
+/// How often the ticker looks for an armed tick while none is armed.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const TICK_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Run the host's tick (`gpui_set_tick`) inside the loop: wait its interval,
+/// call it on the main thread (`cx.update`, where GPUI requires app state to
+/// be touched), request a repaint. The interval is re-read every period, so
+/// the host can re-arm or disarm it at any time. The task ends with the loop.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn spawn_ticker(cx: &mut App) {
+    cx.spawn(async move |cx: &mut AsyncApp| loop {
+        let Some((interval_ms, _)) = window::tick() else {
+            cx.background_executor().timer(TICK_IDLE_POLL).await;
+            continue;
+        };
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(interval_ms as u64))
+            .await;
+        // Re-read: the tick may have been disarmed while we waited.
+        if let Some((_, callback)) = window::tick() {
+            cx.update(|_cx: &mut App| callback());
+            window::request_repaint();
         }
     })
     .detach();

@@ -14,7 +14,7 @@
 ## .bg(), .text_color(), .w(), .h(), .flex(), etc. The Rust shim
 ## translates the string-based style properties into these calls.
 
-import std/tables
+import std/[strutils, tables]
 import isonim_gpui/bindings
 
 # Re-export GpuiElement so users only need to import renderer.
@@ -264,6 +264,10 @@ type
     gekOther
     gekKeyDown
     gekKeyUp
+    gekPointerDown     ## `mousedown`: the left button, at `pointerOf`
+    gekPointerMove     ## `mousemove`
+    gekPointerUp       ## `mouseup`
+    gekWheel           ## `wheel`: `pointerOf` also carries the delta
 
   GpuiEvent* = object
     ## **What a handler is handed. PLAT-38's whole point.**
@@ -305,6 +309,10 @@ func toEventKind*(raw: uint32): GpuiEventKind =
   case raw
   of GpuiEventKeyDown: gekKeyDown
   of GpuiEventKeyUp: gekKeyUp
+  of GpuiEventPointerDown: gekPointerDown
+  of GpuiEventPointerMove: gekPointerMove
+  of GpuiEventPointerUp: gekPointerUp
+  of GpuiEventPointerWheel: gekWheel
   else: gekOther
 
 func fromEventKind*(k: GpuiEventKind): uint32 =
@@ -312,6 +320,36 @@ func fromEventKind*(k: GpuiEventKind): uint32 =
   of gekOther: GpuiEventOther
   of gekKeyDown: GpuiEventKeyDown
   of gekKeyUp: GpuiEventKeyUp
+  of gekPointerDown: GpuiEventPointerDown
+  of gekPointerMove: GpuiEventPointerMove
+  of gekPointerUp: GpuiEventPointerUp
+  of gekWheel: GpuiEventPointerWheel
+
+type
+  GpuiPointer* = object
+    ## A pointer event's window position (logical pixels) and, for a wheel,
+    ## its delta in pixels. `valid` is false for an event that is not a
+    ## pointer event or whose payload could not be read.
+    valid*: bool
+    x*, y*: float
+    dx*, dy*: float
+
+func pointerOf*(ev: GpuiEvent): GpuiPointer =
+  ## Decode the position the shim spelled into a pointer event's key
+  ## (`input.rs`, `deliver_pointer`): `"x,y"`, or `"x,y,dx,dy"` for a wheel.
+  if ev.kind notin {gekPointerDown, gekPointerMove, gekPointerUp, gekWheel}:
+    return GpuiPointer()
+  let parts = ev.key.split(',')
+  if parts.len != 2 and parts.len != 4:
+    return GpuiPointer()
+  try:
+    result = GpuiPointer(valid: true, x: parseFloat(parts[0]),
+                         y: parseFloat(parts[1]))
+    if parts.len == 4:
+      result.dx = parseFloat(parts[2])
+      result.dy = parseFloat(parts[3])
+  except ValueError:
+    return GpuiPointer()
 
 proc readPayload*(p: ptr GpuiEventPayload): GpuiEvent =
   ## Decode what the shim handed us. A nil pointer is the honest encoding of

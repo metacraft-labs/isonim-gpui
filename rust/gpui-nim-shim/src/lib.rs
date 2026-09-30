@@ -948,6 +948,18 @@ pub extern "C" fn gpui_quit_requested() -> u8 {
     u8::from(window::quit_requested())
 }
 
+/// Arm a PERIODIC callback into the host: `callback` runs every
+/// `interval_ms` milliseconds on the event loop's own (main) thread, from
+/// inside the loop, and a repaint is requested after it — so a host whose
+/// state moves without any input (a view of the file system, refreshed on a
+/// clock the way a web page's `setTimeout` would) can redraw. `0` or a null
+/// callback disarms it. Exists in every build; without `gpui-backend` there
+/// is no loop to tick, and the registration only round-trips.
+#[no_mangle]
+pub extern "C" fn gpui_set_tick(interval_ms: u32, callback: Option<window::TickCallback>) {
+    window::set_tick(interval_ms, callback);
+}
+
 /// Register a callback for window resize events.
 /// The callback receives (width: f64, height: f64).
 #[no_mangle]
@@ -1222,6 +1234,20 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(white_space, "white_space");
         push_style!(text_overflow, "text_overflow");
         push_style!(flex_shrink, "flex_shrink");
+        // 2026-09-29: the styles the window now draws, so the plan says so.
+        push_style!(flex_grow, "flex_grow");
+        push_style!(border_top_width, "border_top_width");
+        push_style!(border_right_width, "border_right_width");
+        push_style!(border_bottom_width, "border_bottom_width");
+        push_style!(border_left_width, "border_left_width");
+        push_style!(padding_top, "padding_top");
+        push_style!(padding_right, "padding_right");
+        push_style!(padding_bottom, "padding_bottom");
+        push_style!(padding_left, "padding_left");
+        push_style!(top, "top");
+        push_style!(right, "right");
+        push_style!(bottom, "bottom");
+        push_style!(left, "left");
         let styles_json = format!("{{{}}}", style_entries.join(","));
 
         let event_names: Vec<String> = plan

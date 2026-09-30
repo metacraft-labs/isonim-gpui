@@ -260,6 +260,22 @@ test-gui-x11:
 _run-gui-tests:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui -d:gpuiBackend --path:../isonim/src tests/test_gui.nim
 
+# The window draws the borders, the weight and the absolute placement the
+# render plan carries, and a real compositor pointer reaches an element with
+# its window position (`tests/test_gui_borders.nim`). Its own recipe for
+# `test-gui-keyboard`'s reason — one experiment per compositor — and built
+# into its OWN target directory, so the shared `target/debug` shim every
+# sibling links is never swapped for the windowed one.
+test-gui-borders *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    (cd rust && CARGO_TARGET_DIR=target/windowed cargo build --features gpui-backend) || exit $?
+    ./scripts/build-virtual-pointer.sh || exit $?
+    ./scripts/wayland-run-test.sh {{ARGS}} just _run-gui-borders
+
+_run-gui-borders:
+    LD_LIBRARY_PATH=rust/target/windowed/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui_borders -d:gpuiBackend -d:gpuiShimPath=rust/target/windowed/debug/libgpui_nim_shim.so --path:../isonim/src tests/test_gui_borders.nim
+
 # PLAT-38 — A REAL KEY, through the compositor's own `wl_seat`, into a
 # focused GPUI window, read back from the Rust-side element store.
 #

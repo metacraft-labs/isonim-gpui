@@ -141,6 +141,7 @@ static:
   assert compiles(gpui_quit())
   assert compiles(gpui_quit_after_ms(1000.uint32))
   assert compiles(gpui_quit_requested())
+  assert compiles(gpui_set_tick(5000'u32, nil))
 
   var rcb: ResizeCallback
   var fcb: FocusCallback

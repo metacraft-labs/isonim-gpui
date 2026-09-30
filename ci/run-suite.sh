@@ -173,7 +173,23 @@ BENCHMARKS=(
 #   * gpui-reactive 0 -> 5: the prediction above, fulfilled. The workspace's
 #     `../isonim` was fast-forwarded to its `dev`, which carries
 #     `NativeRootAccessor`, and the suite compiles and runs its five cases.
-EXPECTED_CASES=287
+# 2026-09-30, written LAST and from a run (trap 4c):
+#   157 rust unit  +  10 window-registry  +  15 cross-renderer
+# +  14 gui        +  31 render-integration  +  6 structural
+# +   5 gpui-reactive
+# +  27 input-focus
+# +   1 basic      +   1 bindings           + 23 renderer checkpoints
+# = 290
+#
+#   * rust 155 -> 157: `render_sync`'s per-side border/padding and
+#     absolute-placement keys (the window now draws them), and `window`'s
+#     host tick (`gpui_set_tick`: armed, disarmed, reset with the windows).
+#   * input-focus 26 -> 27: a pointer event decodes its window position,
+#     and a wheel its delta.
+#   The windowed border/weight/pointer/tick suite (`tests/test_gui_borders.nim`)
+#   needs a compositor and a virtual pointer and is NOT in this total; its
+#   home is `just test-gui-borders`.
+EXPECTED_CASES=290
 
 total_cases=0
 failed_steps=()

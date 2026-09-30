@@ -319,6 +319,22 @@ echo "$COMPOSITOR created socket: $SOCKET"
 
 export WAYLAND_DISPLAY="$SOCKET"
 
+# Sway's IPC socket, so a test can drive the compositor's own seat —
+# `swaymsg seat seat0 cursor set/press/release` is a real `wl_pointer` event,
+# routed to the surface under it exactly as a mouse's would be
+# (`tests/test_gui_borders.nim`). Sway names it `sway-ipc.<uid>.<pid>.sock`
+# in the runtime directory.
+if [[ "$COMPOSITOR" == "sway" ]]; then
+  for _ in {1..50}; do
+    _ipc="$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*."$COMPOSITOR_PID".sock 2>/dev/null | head -1)"
+    [[ -n "$_ipc" ]] && break
+    sleep 0.1
+  done
+  if [[ -n "${_ipc:-}" ]]; then
+    export SWAYSOCK="$_ipc"
+  fi
+fi
+
 cleanup() {
   local exit_code=$?
 
