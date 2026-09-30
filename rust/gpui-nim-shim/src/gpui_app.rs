@@ -19,7 +19,7 @@ use crate::window;
 // recursion in the compiler.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 use gpui::{
-    div, px, rgb, rgba, size, AbsoluteLength, AnyElement, App, AppContext as _, Application,
+    div, img, px, rgb, rgba, size, AbsoluteLength, AnyElement, App, AppContext as _, Application,
     AsyncApp, Bounds, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement,
     MouseButton, ParentElement, QuitMode, Render, Rgba, Styled, WeakEntity, Window, WindowBounds,
     WindowOptions,
@@ -229,6 +229,31 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
         GpuiElementKind::TextNode => {
             let text = plan.text.clone().unwrap_or_default();
             text.into_any_element()
+        }
+        GpuiElementKind::Img | GpuiElementKind::Svg
+            if plan.attributes.get("src").map_or(false, |s| !s.is_empty()) =>
+        {
+            // A PICTURE FROM A FILE: `src` names a raster image or an SVG
+            // document on disk, and GPUI's own `img()` loads it — a raster
+            // format it recognises is decoded, anything else is rendered by
+            // its SVG renderer (`ImageAssetLoader`). The element's `width`
+            // and `height` size it, like any other box. Until this arm an
+            // `img` was a grey placeholder with its alt text, so a front-end
+            // could not draw an icon at all (CodeTracer's GPUI debugger
+            // controls draw the desktop's SVG marks through it).
+            let src = plan.attributes.get("src").cloned().unwrap_or_default();
+            let mut el = img(std::path::PathBuf::from(src));
+            if let Some(ref w) = plan.styles.w {
+                if let Some(px_value) = parse_px(w) {
+                    el = el.w(px(px_value));
+                }
+            }
+            if let Some(ref h) = plan.styles.h {
+                if let Some(px_value) = parse_px(h) {
+                    el = el.h(px(px_value));
+                }
+            }
+            el.into_any_element()
         }
         GpuiElementKind::Img => {
             // Placeholder: render a colored rect with alt text label.
