@@ -159,7 +159,15 @@ pub fn take_repaint_request() -> bool {
 // Platform>` is `!Send` and `App` is only ever borrowed on the main
 // thread inside an update. The two flags below are that missing handle.
 // `launch_gpui_app` spawns one task inside the loop that reads them and
-// calls `cx.quit()` from the place GPUI requires it to be called from.
+// calls `gpui_app::stop_platform_loop` from the place GPUI requires it to
+// be called from.
+//
+// **AND `App::quit()` IS NOT THAT CALL ON EVERY PLATFORM.** The sentence
+// above is a statement about LINUX. `MacPlatform::quit` is
+// `-[NSApplication terminate:]`, which ends the process rather than
+// unwinding, so on macOS the poller stops `-[NSApplication run]` itself;
+// see `mac_event_loop.rs`. These two flags are unchanged by that and are
+// what makes one poller serve both.
 
 /// Set by `gpui_quit` (from any thread). The in-loop shutdown poller
 /// installed by `launch_gpui_app` consumes it and quits the app.
@@ -575,7 +583,7 @@ mod tests {
     // the poller then acts on them is a different claim, and the thing
     // that establishes it is the windowed pixel case in
     // `tests/test_gui.nim`: a process that returns from `gpui_launch`
-    // could not have done so without `cx.quit()` having run.
+    // could not have done so without `stop_platform_loop` having run.
 
     #[test]
     #[serial]

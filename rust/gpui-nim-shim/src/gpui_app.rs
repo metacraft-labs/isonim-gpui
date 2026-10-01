@@ -748,8 +748,11 @@ pub fn parse_color(s: &str) -> Option<Hsla> {
 ///
 /// The event loop is stopped through `window::QUIT_REQUESTED` /
 /// `window::AUTO_QUIT_MS`, which a task spawned inside the loop polls and
-/// turns into `cx.quit()`. See the "Shutdown" section of `window.rs` for
-/// why the shim needs its own flags rather than a handle to GPUI's `App`.
+/// turns into `stop_platform_loop` — `cx.quit()` off macOS, and
+/// `mac_event_loop::stop_event_loop()` on it, because `App::quit()` there
+/// is `-[NSApplication terminate:]` and this function would never return.
+/// See the "Shutdown" section of `window.rs` for why the shim needs its
+/// own flags rather than a handle to GPUI's `App`.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     // Record the active window so components can reference it.
@@ -771,6 +774,18 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     // that a pixel assertion is supposed to be immune to.
     let auto_quit_ms = window::auto_quit_ms();
     window::clear_quit_request();
+
+    // macOS: `-[NSApplication run]` sends `applicationDidFinishLaunching:`
+    // once per PROCESS, and that notification is the only thing that calls
+    // the launch closure `MacPlatform::run` parks in `state.finish_launching`.
+    // The second `gpui_launch` in a process would therefore open no window
+    // and spawn no shutdown poller — a hang, not a missed frame. Queued
+    // before the loop is entered so it runs inside it, after the delegate
+    // is installed. See `mac_event_loop.rs`.
+    #[cfg(target_os = "macos")]
+    if crate::mac_event_loop::begin_launch() {
+        crate::mac_event_loop::kick_relaunch();
+    }
 
     // RS-M14 Phase 2: pinned `gpui` requires an explicit platform implementation
     // (the old crates.io `Application::new()` constructor is gone). Use
@@ -800,6 +815,14 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
         spawn_ticker(cx);
     });
 
+    // macOS: `MacPlatform::run` nulls the platform pointer in the delegate
+    // it created but leaves that delegate registered as a notification
+    // observer, and it creates a new one per launch. Unregister it here so
+    // a later keyboard-layout or thermal notification cannot reach a
+    // delegate whose ivar is null. See `mac_event_loop.rs`.
+    #[cfg(target_os = "macos")]
+    crate::mac_event_loop::release_delegate_observers();
+
     // The event loop has returned -- the user closed the window, or a
     // quit was requested via `gpui_quit` / the auto-quit deadline.
     if window_id != 0 {
@@ -816,7 +839,7 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
 }
 
 /// How long the loop keeps running after the last window has been
-/// removed, before `cx.quit()` stops it.
+/// removed, before `stop_platform_loop` stops it.
 ///
 /// This is not politeness, it is the difference between a window that is
 /// gone and a window that merely thinks it is. `Drop for WaylandWindow`
@@ -868,6 +891,46 @@ const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_millis(150
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// End the platform event loop so `Application::run` — and with it
+/// `launch_gpui_app`, and with IT the `gpui_launch` FFI call — returns.
+///
+/// **This is not `App::quit()` everywhere, and that is the whole point.**
+/// `App::quit()` is `self.platform.quit()`, and the two platforms disagree
+/// about what that means: Linux stops the calloop `LoopSignal` and `run`
+/// returns, macOS calls `-[NSApplication terminate:]` and the process ends
+/// without unwinding. Every line after `Application::run(...)` below, and
+/// every line after `gpui_launch` in every consumer, is dead code under
+/// the second reading. See `mac_event_loop.rs` for the measurement, the
+/// three candidate routes and why this one was taken.
+///
+/// Must run inside an app update on the main thread; both callers are the
+/// shutdown poller, which runs on the foreground executor for exactly that
+/// reason.
+#[cfg(all(
+    any(feature = "gpui-backend", feature = "gpui-headless"),
+    not(target_os = "macos")
+))]
+fn stop_platform_loop(cx: &mut App) {
+    cx.quit();
+}
+
+#[cfg(all(
+    any(feature = "gpui-backend", feature = "gpui-headless"),
+    target_os = "macos"
+))]
+fn stop_platform_loop(_cx: &mut App) {
+    // A refusal here means `stop:` was armed and no event will wake the
+    // loop to read it, i.e. the process would hang rather than return.
+    // That is worth a line on stderr: the alternative is a silent hang
+    // whose only symptom is a lane timing out at its cap.
+    if !crate::mac_event_loop::stop_event_loop() {
+        eprintln!(
+            "gpui-nim-shim: could not stop the AppKit event loop \
+             (not on the main thread, or NSEvent refused the wake event)"
+        );
+    }
+}
+
 /// Spawn the task that owns this app's shutdown.
 ///
 /// It runs on the foreground executor (the same place `NimRootView`'s
@@ -904,7 +967,7 @@ fn spawn_shutdown_poller(cx: &mut App, auto_quit_ms: u32) {
 
             if let Some(since) = draining_since {
                 if since.elapsed() >= SHUTDOWN_DRAIN {
-                    cx.update(|cx: &mut App| cx.quit());
+                    cx.update(stop_platform_loop);
                     break;
                 }
                 continue;

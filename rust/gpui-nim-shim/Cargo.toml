@@ -23,6 +23,13 @@ gpui-backend = [
     "gpui_platform/runtime_shaders",
     "gpui_platform/x11",
     "gpui_platform/wayland",
+    # macOS-only, and inert on every other target: cargo resolves features
+    # platform-independently, so naming a target-gated optional dependency
+    # here is legal and simply activates nothing off macOS. See
+    # `src/mac_event_loop.rs` for why the shim needs AppKit directly.
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
 ]
 # RS-M14 Phase 2: enable the headless RGBA rendering path via Zed's
 # `HeadlessAppContext::with_platform` + `Window::render_to_image`. Coexists
@@ -39,6 +46,9 @@ gpui-backend = [
 # Metal renderer first instantiates — which is fine for our headless
 # rendering use case.
 gpui-headless = [
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
     "gpui/test-support",
     "gpui",
     "gpui_platform/test-support",
@@ -81,6 +91,26 @@ gpui-headless = [
 gpui = { package = "gpui-pre", version = "=0.3.5", optional = true }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.5", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+# macOS: AppKit, for the one thing GPUI does not give an embedder — a way
+# OUT of `-[NSApplication run]` that is not `terminate:`. The versions are
+# the ones `gpui-pre-macos` 0.3.5 already depends on, so this adds an edge
+# to the graph and no new crate to the lock; `NSEvent`/`NSGraphicsContext`
+# are the two features it does not itself enable, and `otherEventWithType:
+# …context:…` needs both. See `src/mac_event_loop.rs`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, optional = true, features = [
+    "NSApplication",
+    "NSEvent",
+    "NSGraphicsContext",
+    "NSResponder",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, optional = true, features = [
+    "NSGeometry",
+    "NSNotification",
+    "std",
+] }
 
 [dev-dependencies]
 serial_test = "3"

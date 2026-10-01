@@ -196,6 +196,28 @@ API contract. Re-read them on every pin bump. At 0.3.5 all three still hold:
 - `App::quit()` → `Platform::quit()`, and on Linux that is
   `self.inner.with_common(|common| common.signal.stop())` — the calloop
   `LoopSignal` (`gpui-pre-linux-0.3.5/src/linux/platform.rs:335`).
+- **macOS is the OPPOSITE of that line and the shim no longer uses
+  `App::quit()` there.** `MacPlatform::quit`
+  (`gpui-pre-macos-0.3.5/src/platform.rs:557`) dispatches
+  `-[NSApplication terminate:]` onto the main queue, which ENDS THE
+  PROCESS: `app.run()` never returns, `MacPlatform::run`'s `pool.drain()`
+  and ivar teardown are dead code, `Application::run` never returns, and
+  neither does `gpui_launch`. The audit in this section covered only the
+  Linux half until 2026-10-02, which is how an FFI call that is one-way on
+  one platform survived four milestones
+  (`issues/2026-09-29-gpui-launch-never-returns-on-macos.md`).
+  `gpui_app.rs`'s `stop_platform_loop` now calls `cx.quit()` off macOS and
+  `mac_event_loop::stop_event_loop()` on it (`-[NSApplication stop:]` plus
+  a posted `NSEventTypeApplicationDefined` event to wake the event wait).
+  **Re-read `MacPlatform::run` on every pin bump**: if it ever stops being
+  `[NSApp run]`, the stop will silently not land.
+- **macOS also sends `applicationDidFinishLaunching:` once per PROCESS**,
+  and `MacPlatform::run` parks the launch closure in
+  `state.finish_launching` for that notification to pick up (`:535`,
+  taken at `:1350`). A second `gpui_launch` would therefore open no
+  window, spawn no shutdown poller, and hang. `mac_event_loop::
+  kick_relaunch` delivers the selector itself for launches after the
+  first. Re-read those two line numbers with the one above.
 - `QuitMode::Explicit` still exists, and `QuitMode::Default` is still
   `LastWindowClosed` off macOS — so `launch_gpui_app` still has to set
   `Explicit` itself.

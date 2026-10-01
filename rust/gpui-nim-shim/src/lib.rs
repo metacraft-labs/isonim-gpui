@@ -61,6 +61,12 @@ pub mod window;
 // headless path too.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub mod gpui_app;
+// macOS only, and it is the reason `gpui_launch` returns at all on that
+// platform: `MacPlatform::quit` is `-[NSApplication terminate:]`, which
+// does not unwind. Read this module's header before touching the shutdown
+// poller. The file carries its own `#![cfg(…)]`, so the `mod` here is
+// unconditional and the module is empty off macOS.
+pub mod mac_event_loop;
 #[cfg(feature = "gpui-headless")]
 pub mod gpui_headless;
 // …and its feature-less counterpart, so the cdylib's EXPORTED SYMBOL SET

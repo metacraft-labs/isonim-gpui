@@ -190,23 +190,61 @@ plat42-gpui-kit-probe:
 #   headless     `--features gpui-headless`. `gpui_render_to_pixels` over
 #                `HeadlessAppContext` + `Window::render_to_image`. No
 #                compositor, and NOT a substitute for the windowed path.
+# THE THREE PLATFORM FACTS, SEPARATED FROM THE ONE CAPABILITY FACT. Until
+# 2026-10-02 this recipe hard-coded `.so`, `ldd` and `nm -D`, none of which
+# is valid on macOS, so it failed there at `cp` with a missing file —
+# reporting a MISSING ARTEFACT for what is only a different spelling. That is
+# the producer half of `codetracer-specs/issues/2026-09-29-gpui-window-
+# capture-lanes-are-wayland-only.md`, whose first suggested step is exactly
+# this: separate *"needs a compositor"* (a real capability gap on macOS) from
+# *"needs Linux"* (a one-line answer). The capability gap is untouched here
+# and still belongs to that issue; what is fixed is that the three shims and
+# their symbol tables can now be PRODUCED on macOS, which is what the
+# compositor-free `gpui-headless` pixel path needs in order to be measured at
+# all.
+#
+#   extension   `.so` / `.dylib`
+#   link closure `ldd` / `otool -L`
+#   symbol table `nm -D --defined-only` / `nm -gU`  (Mach-O has no `-D`, and
+#               `-gU` is "global, defined only"; the leading `_` that the
+#               Mach-O ABI prepends is stripped so the two platforms' symbol
+#               files are comparable line for line)
 plat37-shims:
     #!/usr/bin/env bash
     set -euo pipefail
     out="rust/target/plat37"
     mkdir -p "$out"
+    case "$(uname -s)" in
+      Darwin) dylib_ext="dylib" ;;
+      *)      dylib_ext="so" ;;
+    esac
+    link_closure() {
+      if [ "${dylib_ext}" = "dylib" ]; then
+        otool -L "$1"
+      else
+        env -u LD_LIBRARY_PATH ldd "$1"
+      fi
+    }
+    exported_gpui_symbols() {
+      if [ "${dylib_ext}" = "dylib" ]; then
+        nm -gU "$1" | awk '{print $NF}' | sed 's/^_//'
+      else
+        nm -D --defined-only "$1" | awk '{print $NF}'
+      fi
+    }
     for spec in "featureless:" "windowed:--features gpui-backend" "headless:--features gpui-headless"; do
       config="${spec%%:*}"
       flags="${spec#*:}"
       echo "=== ${config} ${flags:-(default)} ==="
       # shellcheck disable=SC2086  # the flag string must word-split
       (cd rust && cargo build ${flags})
-      cp rust/target/debug/libgpui_nim_shim.so "$out/libgpui_nim_shim.${config}.so"
-      ldd "$out/libgpui_nim_shim.${config}.so" > "$out/${config}.ldd.txt" 2>&1 || true
-      nm -D --defined-only "$out/libgpui_nim_shim.${config}.so" \
-        | awk '{print $NF}' | grep '^gpui_' | sort -u > "$out/${config}.symbols.txt"
-      echo "  $(wc -c <"$out/libgpui_nim_shim.${config}.so") bytes, \
-    $(wc -l <"$out/${config}.ldd.txt") ldd entries, \
+      staged="$out/libgpui_nim_shim.${config}.${dylib_ext}"
+      cp "rust/target/debug/libgpui_nim_shim.${dylib_ext}" "${staged}"
+      link_closure "${staged}" > "$out/${config}.links.txt" 2>&1 || true
+      exported_gpui_symbols "${staged}" | grep '^gpui_' | sort -u \
+        > "$out/${config}.symbols.txt"
+      echo "  $(wc -c <"${staged}") bytes, \
+    $(wc -l <"$out/${config}.links.txt") link entries, \
     $(wc -l <"$out/${config}.symbols.txt") gpui_ symbols"
     done
     # The default profile is left in `target/debug`, because that is the one
