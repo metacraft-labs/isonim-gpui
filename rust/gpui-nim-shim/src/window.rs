@@ -9,7 +9,7 @@
 //! actual GPUI window with event loop. Without the feature, the window state
 //! is maintained in-memory for testing and headless operation.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// C function pointer types for lifecycle callbacks.
@@ -220,12 +220,25 @@ pub fn auto_quit_ms() -> u32 {
 pub type TickCallback = extern "C" fn();
 static TICK: Mutex<Option<(u32, TickCallback)>> = Mutex::new(None);
 
-/// Arm (`interval_ms > 0` and a callback) or disarm the host's tick.
+/// Bumped by every `set_tick`: the loop's ticker watches it while it waits,
+/// so a re-arm takes effect at once instead of after the wait in flight (a
+/// host that armed a 5 s refresh and then needs a 300 ms deadline must not
+/// wait out the 5 s).
+static TICK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Arm (`interval_ms > 0` and a callback) or disarm the host's tick. The
+/// interval counts from THIS call: re-arming restarts the wait.
 pub fn set_tick(interval_ms: u32, callback: Option<TickCallback>) {
     *take_lock(&TICK) = match callback {
         Some(cb) if interval_ms > 0 => Some((interval_ms, cb)),
         _ => None,
     };
+    TICK_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// How many times the tick has been armed or disarmed.
+pub fn tick_generation() -> u64 {
+    TICK_GENERATION.load(Ordering::Acquire)
 }
 
 /// The armed tick, if any.
@@ -439,6 +452,23 @@ mod tests {
         set_tick(100, Some(noop_tick));
         reset_windows();
         assert!(tick().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_every_arming_moves_the_generation() {
+        // The ticker restarts its wait when this moves: every arm and every
+        // disarm must move it, or a re-arm would wait out the old interval.
+        reset_windows();
+        let g0 = tick_generation();
+        set_tick(5000, Some(noop_tick));
+        let g1 = tick_generation();
+        assert!(g1 > g0);
+        set_tick(300, Some(noop_tick));
+        let g2 = tick_generation();
+        assert!(g2 > g1);
+        set_tick(0, None);
+        assert!(tick_generation() > g2);
     }
 
     #[test]

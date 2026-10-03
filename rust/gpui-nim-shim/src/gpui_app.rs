@@ -991,25 +991,50 @@ fn spawn_shutdown_poller(cx: &mut App, auto_quit_ms: u32) {
     .detach();
 }
 
-/// How often the ticker looks for an armed tick while none is armed.
+/// How often the ticker looks for an armed tick while none is armed — the
+/// same slice as a re-arm's, so arming from idle is as prompt as re-arming.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
-const TICK_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+const TICK_IDLE_POLL: std::time::Duration = TICK_REARM_POLL;
+
+/// The longest the ticker sleeps before looking whether the host re-armed
+/// its tick: the latency a re-arm can add to a short deadline.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const TICK_REARM_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Run the host's tick (`gpui_set_tick`) inside the loop: wait its interval,
 /// call it on the main thread (`cx.update`, where GPUI requires app state to
-/// be touched), request a repaint. The interval is re-read every period, so
-/// the host can re-arm or disarm it at any time. The task ends with the loop.
+/// be touched), request a repaint. The wait is taken in slices of at most
+/// `TICK_REARM_POLL`, and a re-arm or disarm (`window::tick_generation`)
+/// restarts it — so a host that armed a long refresh can arm a short
+/// deadline and have it honoured, rather than waiting out the long one. The
+/// task ends with the loop.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 fn spawn_ticker(cx: &mut App) {
     cx.spawn(async move |cx: &mut AsyncApp| loop {
+        let generation = window::tick_generation();
         let Some((interval_ms, _)) = window::tick() else {
             cx.background_executor().timer(TICK_IDLE_POLL).await;
             continue;
         };
-        cx.background_executor()
-            .timer(std::time::Duration::from_millis(interval_ms as u64))
-            .await;
-        // Re-read: the tick may have been disarmed while we waited.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(interval_ms as u64);
+        let mut rearmed = false;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            cx.background_executor()
+                .timer((deadline - now).min(TICK_REARM_POLL))
+                .await;
+            if window::tick_generation() != generation {
+                rearmed = true;
+                break;
+            }
+        }
+        if rearmed {
+            continue;
+        }
         if let Some((_, callback)) = window::tick() {
             cx.update(|_cx: &mut App| callback());
             window::request_repaint();
