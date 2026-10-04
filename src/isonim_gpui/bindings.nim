@@ -79,6 +79,10 @@ const
     ## The left button came up; the key is `"x,y"`.
   GpuiEventPointerWheel* = 6'u32
     ## The wheel turned; the key is `"x,y,dx,dy"` (the delta in pixels).
+  GpuiEventPointerContext* = 7'u32
+    ## The RIGHT button went down (`contextmenu`); the key is `"x,y"`.
+  GpuiEventPointerAux* = 8'u32
+    ## The MIDDLE button went down (`auxdown`); the key is `"x,y"`.
 
   GpuiModControl* = 1'u32 shl 0
   GpuiModAlt* = 1'u32 shl 1
@@ -543,6 +547,13 @@ proc gpui_render_cancel*(token: cuint)
 # process-wide.
 proc gpui_bump_generation*(): uint64
   {.importc: "gpui_bump_generation".}
+
+# PLAT-50 (CodeTracer): the system clipboard, for a click that copies
+# (`clipboard.rs`): the text is taken by GPUI's platform clipboard on the next
+# frame; the last text written is readable back.
+proc gpui_write_clipboard*(text: cstring) {.importc: "gpui_write_clipboard".}
+proc gpui_clipboard_text*(buf: pointer; bufLen: uint64): uint64
+  {.importc: "gpui_clipboard_text".}
 
 {.pop.}
 

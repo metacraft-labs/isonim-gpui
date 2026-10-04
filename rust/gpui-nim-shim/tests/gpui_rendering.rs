@@ -875,3 +875,113 @@ fn test_empty_root_element_renders() {
         assert!(result.is_ok());
     });
 }
+
+// ---------------------------------------------------------------------------
+// The RIGHT and MIDDLE buttons reach their own listeners (CodeTracer PLAT-50)
+// ---------------------------------------------------------------------------
+//
+// A real GPUI press, simulated on a window that draws the shadow tree, goes
+// through `wire_pointer_listeners`: the left button to `mousedown` (kind
+// `GPUI_EVENT_POINTER_DOWN`), the right to `contextmenu`
+// (`GPUI_EVENT_POINTER_CONTEXT`), the middle to `auxdown`
+// (`GPUI_EVENT_POINTER_AUX`) — each with the modifiers held — and a right or
+// middle press never to the `mousedown` listener a left-button drag asks for.
+// CodeTracer's context menus and middle-click "Jump to line" depend on this.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static DOWNS: AtomicU32 = AtomicU32::new(0);
+static CONTEXTS: AtomicU32 = AtomicU32::new(0);
+static AUXES: AtomicU32 = AtomicU32::new(0);
+static LAST_KIND: AtomicU32 = AtomicU32::new(0);
+static LAST_MODS: AtomicU32 = AtomicU32::new(0);
+
+fn record(p: *const gpui_nim_shim::input::GpuiEventPayload) {
+    if !p.is_null() {
+        let payload = unsafe { &*p };
+        LAST_KIND.store(payload.kind, Ordering::SeqCst);
+        LAST_MODS.store(payload.modifiers, Ordering::SeqCst);
+    }
+}
+extern "C" fn on_down(p: *const gpui_nim_shim::input::GpuiEventPayload) {
+    DOWNS.fetch_add(1, Ordering::SeqCst);
+    record(p);
+}
+extern "C" fn on_context(p: *const gpui_nim_shim::input::GpuiEventPayload) {
+    CONTEXTS.fetch_add(1, Ordering::SeqCst);
+    record(p);
+}
+extern "C" fn on_aux(p: *const gpui_nim_shim::input::GpuiEventPayload) {
+    AUXES.fetch_add(1, Ordering::SeqCst);
+    record(p);
+}
+
+#[test]
+#[serial]
+fn test_right_and_middle_buttons_reach_their_listeners() {
+    run_gpui_test("test_right_and_middle_buttons_reach_their_listeners", |cx| {
+        reset_global_tree();
+        {
+            let mut tree = gpui_nim_shim::lock_tree();
+            let mut root = Node::new_element("root");
+            let root_id = root.id;
+            let mut target = Node::new_element("div");
+            let target_id = target.id;
+            target.styles.insert("width".to_string(), "200px".to_string());
+            target.styles.insert("height".to_string(), "100px".to_string());
+            target.set_text_content("row");
+            target.parent = root_id;
+            for (name, cb) in [
+                ("mousedown", on_down as gpui_nim_shim::EventCallback),
+                ("contextmenu", on_context as gpui_nim_shim::EventCallback),
+                ("auxdown", on_aux as gpui_nim_shim::EventCallback),
+            ] {
+                target
+                    .event_listeners
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(EventListener { callback: cb, callback_id: 0 });
+            }
+            root.children.push(target_id);
+            tree.insert(root);
+            tree.insert(target);
+            drop(tree);
+            *gpui_nim_shim::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner()) = root_id;
+        }
+        DOWNS.store(0, Ordering::SeqCst);
+        CONTEXTS.store(0, Ordering::SeqCst);
+        AUXES.store(0, Ordering::SeqCst);
+
+        let (_view, vcx) = cx.add_window_view(|_window, _cx| NimRootView::new());
+        vcx.run_until_parked();
+        let at = gpui::point(gpui::px(20.0), gpui::px(20.0));
+
+        // The right button, with Control held: `contextmenu`, nothing else.
+        vcx.simulate_mouse_down(at, gpui::MouseButton::Right,
+                                gpui::Modifiers { control: true, ..Default::default() });
+        vcx.run_until_parked();
+        assert_eq!(CONTEXTS.load(Ordering::SeqCst), 1, "the right button reached contextmenu");
+        assert_eq!(DOWNS.load(Ordering::SeqCst), 0, "a right press is not a mousedown");
+        assert_eq!(LAST_KIND.load(Ordering::SeqCst), gpui_nim_shim::input::GPUI_EVENT_POINTER_CONTEXT);
+        assert_eq!(LAST_MODS.load(Ordering::SeqCst), gpui_nim_shim::input::GPUI_MOD_CONTROL);
+        vcx.simulate_mouse_up(at, gpui::MouseButton::Right, gpui::Modifiers::default());
+
+        // The middle button: `auxdown`.
+        vcx.simulate_mouse_down(at, gpui::MouseButton::Middle, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert_eq!(AUXES.load(Ordering::SeqCst), 1, "the middle button reached auxdown");
+        assert_eq!(DOWNS.load(Ordering::SeqCst), 0, "a middle press is not a mousedown");
+        assert_eq!(LAST_KIND.load(Ordering::SeqCst), gpui_nim_shim::input::GPUI_EVENT_POINTER_AUX);
+        vcx.simulate_mouse_up(at, gpui::MouseButton::Middle, gpui::Modifiers::default());
+
+        // The left button: `mousedown`, the other two untouched.
+        vcx.simulate_mouse_down(at, gpui::MouseButton::Left,
+                                gpui::Modifiers { alt: true, ..Default::default() });
+        vcx.run_until_parked();
+        assert_eq!(DOWNS.load(Ordering::SeqCst), 1);
+        assert_eq!(LAST_KIND.load(Ordering::SeqCst), gpui_nim_shim::input::GPUI_EVENT_POINTER_DOWN);
+        assert_eq!(LAST_MODS.load(Ordering::SeqCst), gpui_nim_shim::input::GPUI_MOD_ALT);
+        assert_eq!(CONTEXTS.load(Ordering::SeqCst), 1);
+        assert_eq!(AUXES.load(Ordering::SeqCst), 1);
+    });
+}

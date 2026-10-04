@@ -77,6 +77,13 @@ pub const GPUI_EVENT_POINTER_MOVE: u32 = 4;
 pub const GPUI_EVENT_POINTER_UP: u32 = 5;
 /// The wheel turned; `key` is `"x,y,dx,dy"` (the delta in pixels).
 pub const GPUI_EVENT_POINTER_WHEEL: u32 = 6;
+/// The RIGHT button went down (a node listening for `contextmenu`); `key` is
+/// `"x,y"`. A kind of its own, so a consumer that asked for a left-button
+/// drag (`mousedown`) never receives a right-click as one.
+pub const GPUI_EVENT_POINTER_CONTEXT: u32 = 7;
+/// The MIDDLE button went down (a node listening for `auxdown`); `key` is
+/// `"x,y"`.
+pub const GPUI_EVENT_POINTER_AUX: u32 = 8;
 
 /// Modifier bits. The five GPUI itself distinguishes (`gpui::Modifiers`), in
 /// the order that struct declares them, so the mapping is a transcription
@@ -278,6 +285,10 @@ pub fn deliver(node_id: NodeId, event: &str, payload: Option<(u32, String, u32, 
 /// spelled into the payload's `key` as `input.rs`'s `GPUI_EVENT_POINTER_*`
 /// kinds document. Positions are written with one decimal, which is finer
 /// than a logical pixel and stable across platforms' float formatting.
+///
+/// `modifiers` are the `GPUI_MOD_*` bits held when the button changed (a
+/// press with Control is a different gesture to a consumer than a plain one —
+/// a source editor's Ctrl+click is "jump to line").
 pub fn deliver_pointer(
     node_id: NodeId,
     event: &str,
@@ -285,12 +296,13 @@ pub fn deliver_pointer(
     x: f32,
     y: f32,
     delta: Option<(f32, f32)>,
+    modifiers: u32,
 ) -> u32 {
     let key = match delta {
         Some((dx, dy)) => format!("{:.1},{:.1},{:.1},{:.1}", x, y, dx, dy),
         None => format!("{:.1},{:.1}", x, y),
     };
-    let reached = deliver(node_id, event, Some((kind, key.clone(), 0, false)));
+    let reached = deliver(node_id, event, Some((kind, key.clone(), modifiers, false)));
     // `ISONIM_GPUI_TRACE_POINTER=1`: one line per pointer event and how many
     // listeners it reached — for diagnosing a window lane's pointer path.
     if std::env::var_os("ISONIM_GPUI_TRACE_POINTER").is_some() {

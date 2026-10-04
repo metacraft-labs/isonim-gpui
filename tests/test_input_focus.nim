@@ -33,7 +33,7 @@ import std/[strutils, unittest]
 import isonim_gpui/bindings
 import isonim_gpui/renderer
 
-const ExpectedAssertions = 197
+const ExpectedAssertions = 203
   ## Asserted against the runtime tally below and printed as `CHECKS:`.
 
 var checkCount = 0
@@ -95,19 +95,26 @@ suite "PLAT-38 — the payload ABI":
     let el = r.createElement("div")
     var seen: seq[GpuiPointer] = @[]
     var kinds: seq[GpuiEventKind] = @[]
-    for name in ["mousedown", "mousemove", "mouseup", "wheel"]:
+    for name in ["mousedown", "mousemove", "mouseup", "wheel", "contextmenu",
+                 "auxdown"]:
       r.addEventListener(el, name, proc(ev: GpuiEvent) =
         kinds.add ev.kind
         seen.add pointerOf(ev))
     let cases = [("mousedown", GpuiEventPointerDown, "12.5,40.0"),
                  ("mousemove", GpuiEventPointerMove, "13.0,41.5"),
                  ("mouseup", GpuiEventPointerUp, "14.0,42.0"),
-                 ("wheel", GpuiEventPointerWheel, "15.0,43.0,0.0,-48.0")]
+                 ("wheel", GpuiEventPointerWheel, "15.0,43.0,0.0,-48.0"),
+                 # The right and middle buttons, each a kind of its own.
+                 ("contextmenu", GpuiEventPointerContext, "16.0,44.0"),
+                 ("auxdown", GpuiEventPointerAux, "17.0,45.0")]
     for (name, kind, key) in cases:
       var payload = GpuiEventPayload(kind: kind, modifiers: 0,
                                      key: key.cstring, repeat: 0)
       ck gpui_dispatch_event_with(el, name.cstring, addr payload) == 1
-    ck kinds == @[gekPointerDown, gekPointerMove, gekPointerUp, gekWheel]
+    ck kinds == @[gekPointerDown, gekPointerMove, gekPointerUp, gekWheel,
+                  gekContextMenu, gekAuxDown]
+    ck seen[4].valid and seen[4].x == 16.0 and seen[4].y == 44.0
+    ck seen[5].valid and seen[5].x == 17.0
     ck seen[0].valid and seen[0].x == 12.5 and seen[0].y == 40.0
     ck seen[3].valid and seen[3].dy == -48.0 and seen[3].x == 15.0
     # Not a pointer event, or a key that is not a position: not valid.

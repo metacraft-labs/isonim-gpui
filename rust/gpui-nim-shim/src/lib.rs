@@ -46,6 +46,9 @@
 // with (see `gpui_headless_unavailable.rs`'s module docs for what that rule
 // exists to prevent).
 pub mod input;
+// PLAT-50 (CodeTracer): the system clipboard, for a click that copies.
+// Feature-less for `input`'s reason.
+pub mod clipboard;
 // PLAT-42: frame timing. Feature-less for `input`'s reason.
 pub mod frame_stats;
 pub mod render_sync;

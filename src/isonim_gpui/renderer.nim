@@ -268,6 +268,8 @@ type
     gekPointerMove     ## `mousemove`
     gekPointerUp       ## `mouseup`
     gekWheel           ## `wheel`: `pointerOf` also carries the delta
+    gekContextMenu     ## `contextmenu`: the RIGHT button, at `pointerOf`
+    gekAuxDown         ## `auxdown`: the MIDDLE button, at `pointerOf`
 
   GpuiEvent* = object
     ## **What a handler is handed. PLAT-38's whole point.**
@@ -313,6 +315,8 @@ func toEventKind*(raw: uint32): GpuiEventKind =
   of GpuiEventPointerMove: gekPointerMove
   of GpuiEventPointerUp: gekPointerUp
   of GpuiEventPointerWheel: gekWheel
+  of GpuiEventPointerContext: gekContextMenu
+  of GpuiEventPointerAux: gekAuxDown
   else: gekOther
 
 func fromEventKind*(k: GpuiEventKind): uint32 =
@@ -324,6 +328,8 @@ func fromEventKind*(k: GpuiEventKind): uint32 =
   of gekPointerMove: GpuiEventPointerMove
   of gekPointerUp: GpuiEventPointerUp
   of gekWheel: GpuiEventPointerWheel
+  of gekContextMenu: GpuiEventPointerContext
+  of gekAuxDown: GpuiEventPointerAux
 
 type
   GpuiPointer* = object
@@ -337,7 +343,8 @@ type
 func pointerOf*(ev: GpuiEvent): GpuiPointer =
   ## Decode the position the shim spelled into a pointer event's key
   ## (`input.rs`, `deliver_pointer`): `"x,y"`, or `"x,y,dx,dy"` for a wheel.
-  if ev.kind notin {gekPointerDown, gekPointerMove, gekPointerUp, gekWheel}:
+  if ev.kind notin {gekPointerDown, gekPointerMove, gekPointerUp, gekWheel,
+                    gekContextMenu, gekAuxDown}:
     return GpuiPointer()
   let parts = ev.key.split(',')
   if parts.len != 2 and parts.len != 4:
@@ -493,6 +500,21 @@ proc textContent*(node: GpuiElement): string =
     return ""
   var buf = newString(int(needed) + 1)
   discard gpui_get_text_content(node, addr buf[0], uint64(buf.len))
+  buf.setLen(int(needed))
+  buf
+
+proc writeClipboard*(text: string) =
+  ## Copy `text` to the system clipboard (GPUI's platform clipboard takes it
+  ## on the window's next frame).
+  gpui_write_clipboard(text.cstring)
+
+proc clipboardText*(): string =
+  ## The text most recently copied with `writeClipboard`.
+  let needed = gpui_clipboard_text(nil, 0)
+  if needed == 0:
+    return ""
+  var buf = newString(int(needed) + 1)
+  discard gpui_clipboard_text(addr buf[0], uint64(buf.len))
   buf.setLen(int(needed))
   buf
 

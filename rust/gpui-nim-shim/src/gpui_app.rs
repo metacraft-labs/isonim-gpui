@@ -131,6 +131,12 @@ impl Render for NimRootView {
         }
         window::notify_focus(active_window_id(), handle.is_focused(window));
 
+        // PLAT-50 (CodeTracer): text a click copied goes to the platform
+        // clipboard here, where an `App` is in hand (`clipboard.rs`).
+        if let Some(text) = crate::clipboard::take_pending() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+
         let tree = crate::lock_tree();
         let root_id = *crate::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -345,10 +351,13 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
 /// kinds (`input.rs`). The payload's layout is unchanged, so every consumer
 /// built against the key-only ABI still reads it.
 ///
-/// Only the left button presses and releases: a drag is a left-button
-/// gesture, and a listener for every button would hand a right-click to a
-/// consumer that asked for a drag. A move is reported whether or not a button
-/// is down; the consumer knows whether a gesture is in flight.
+/// Only the left button presses and releases under `mousedown` / `mouseup`: a
+/// drag is a left-button gesture, and a listener for every button would hand a
+/// right-click to a consumer that asked for a drag. The RIGHT button's press
+/// is `contextmenu` and the MIDDLE button's `auxdown`, each under a kind of
+/// its own (`GPUI_EVENT_POINTER_CONTEXT` / `_AUX`), for a consumer that asks.
+/// A press carries the modifiers held. A move is reported whether or not a
+/// button is down; the consumer knows whether a gesture is in flight.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 fn wire_pointer_listeners(mut el: Div, plan: &crate::render_sync::RenderNode) -> Div {
     let has = |name: &str| plan.event_names.iter().any(|n| n == name);
@@ -362,6 +371,33 @@ fn wire_pointer_listeners(mut el: Div, plan: &crate::render_sync::RenderNode) ->
                 f32::from(event.position.x),
                 f32::from(event.position.y),
                 None,
+                crate::input::modifier_bits(&event.modifiers),
+            );
+        });
+    }
+    if has("contextmenu") {
+        el = el.on_mouse_down(MouseButton::Right, move |event, _window, _cx| {
+            crate::input::deliver_pointer(
+                node_id,
+                "contextmenu",
+                crate::input::GPUI_EVENT_POINTER_CONTEXT,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                None,
+                crate::input::modifier_bits(&event.modifiers),
+            );
+        });
+    }
+    if has("auxdown") {
+        el = el.on_mouse_down(MouseButton::Middle, move |event, _window, _cx| {
+            crate::input::deliver_pointer(
+                node_id,
+                "auxdown",
+                crate::input::GPUI_EVENT_POINTER_AUX,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                None,
+                crate::input::modifier_bits(&event.modifiers),
             );
         });
     }
@@ -374,6 +410,7 @@ fn wire_pointer_listeners(mut el: Div, plan: &crate::render_sync::RenderNode) ->
                 f32::from(event.position.x),
                 f32::from(event.position.y),
                 None,
+                crate::input::modifier_bits(&event.modifiers),
             );
         });
     }
@@ -386,6 +423,7 @@ fn wire_pointer_listeners(mut el: Div, plan: &crate::render_sync::RenderNode) ->
                 f32::from(event.position.x),
                 f32::from(event.position.y),
                 None,
+                crate::input::modifier_bits(&event.modifiers),
             );
         });
     }
@@ -399,6 +437,7 @@ fn wire_pointer_listeners(mut el: Div, plan: &crate::render_sync::RenderNode) ->
                 f32::from(event.position.x),
                 f32::from(event.position.y),
                 Some((f32::from(delta.x), f32::from(delta.y))),
+                crate::input::modifier_bits(&event.modifiers),
             );
         });
     }
