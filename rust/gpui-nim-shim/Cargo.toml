@@ -23,6 +23,12 @@ gpui-backend = [
     "gpui_platform/runtime_shaders",
     "gpui_platform/x11",
     "gpui_platform/wayland",
+    # macOS text. Without it `gpui_macos` installs a text system that draws
+    # nothing ("compiled without the `font-kit` feature, so no text will be
+    # rendered"): the window paints its pane grounds and no glyph on them.
+    # `gpui-headless` already enabled it, which is why an off-screen frame
+    # of the same scene read correctly while the window was blank.
+    "gpui_platform/font-kit",
     # macOS-only, and inert on every other target: cargo resolves features
     # platform-independently, so naming a target-gated optional dependency
     # here is legal and simply activates nothing off macOS. See
