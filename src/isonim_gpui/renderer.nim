@@ -270,6 +270,9 @@ type
     gekWheel           ## `wheel`: `pointerOf` also carries the delta
     gekContextMenu     ## `contextmenu`: the RIGHT button, at `pointerOf`
     gekAuxDown         ## `auxdown`: the MIDDLE button, at `pointerOf`
+    gekModifiers       ## `modifierschange`: the held modifiers changed (a
+                       ## modifier pressed or released ALONE); `modifiers` is
+                       ## the new set, `key` is empty
 
   GpuiEvent* = object
     ## **What a handler is handed. PLAT-38's whole point.**
@@ -317,6 +320,7 @@ func toEventKind*(raw: uint32): GpuiEventKind =
   of GpuiEventPointerWheel: gekWheel
   of GpuiEventPointerContext: gekContextMenu
   of GpuiEventPointerAux: gekAuxDown
+  of GpuiEventModifiers: gekModifiers
   else: gekOther
 
 func fromEventKind*(k: GpuiEventKind): uint32 =
@@ -330,6 +334,7 @@ func fromEventKind*(k: GpuiEventKind): uint32 =
   of gekWheel: GpuiEventPointerWheel
   of gekContextMenu: GpuiEventPointerContext
   of gekAuxDown: GpuiEventPointerAux
+  of gekModifiers: GpuiEventModifiers
 
 type
   GpuiPointer* = object

@@ -195,6 +195,19 @@ fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
                 )),
             );
         })
+        // A modifier on its own never reaches `on_key_down`; its changes are
+        // delivered as their own event, with the new set and no key.
+        .on_modifiers_changed(move |event: &gpui::ModifiersChangedEvent, _window, _cx| {
+            crate::input::deliver_key_to_focus(
+                "modifierschange",
+                Some((
+                    crate::input::GPUI_EVENT_MODIFIERS,
+                    String::new(),
+                    crate::input::modifier_bits(&event.modifiers),
+                    false,
+                )),
+            );
+        })
 }
 
 /// Build the ROOT of the render plan, with the keyboard attached.
@@ -678,6 +691,14 @@ pub fn apply_styles_to_div(
     }
     if let Some(ref weight) = styles.font_weight {
         el = el.font_weight(parse_font_weight(weight));
+    }
+    // `text-decoration: underline`: a menu's access key, a link.
+    if styles
+        .text_decoration
+        .as_deref()
+        .is_some_and(|d| d.split_whitespace().any(|w| w == "underline"))
+    {
+        el = el.underline();
     }
 
     // `position: absolute` with its insets: an element drawn over its

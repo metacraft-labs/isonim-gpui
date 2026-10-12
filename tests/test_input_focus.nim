@@ -33,7 +33,7 @@ import std/[strutils, unittest]
 import isonim_gpui/bindings
 import isonim_gpui/renderer
 
-const ExpectedAssertions = 203
+const ExpectedAssertions = 208
   ## Asserted against the runtime tally below and printed as `CHECKS:`.
 
 var checkCount = 0
@@ -120,6 +120,25 @@ suite "PLAT-38 — the payload ABI":
     # Not a pointer event, or a key that is not a position: not valid.
     ck not pointerOf(GpuiEvent(kind: gekKeyDown, key: "1,2")).valid
     ck not pointerOf(GpuiEvent(kind: gekPointerDown, key: "a")).valid
+
+  test "a modifier change is its own kind: the new set, and no key":
+    # A modifier pressed or released ALONE never produces a keydown; the shim
+    # delivers its change as `modifierschange` (`GPUI_EVENT_MODIFIERS`), which
+    # is what lets a consumer recognise Alt tapped on its own.
+    let el = r.createElement("div")
+    var got: seq[GpuiEvent] = @[]
+    r.addEventListener(el, "modifierschange", proc(ev: GpuiEvent) =
+      got.add ev)
+    for bits in [GpuiModAlt, 0'u32]:
+      var payload = GpuiEventPayload(kind: GpuiEventModifiers,
+                                     modifiers: bits, key: "".cstring,
+                                     repeat: 0)
+      discard gpui_dispatch_event_with(el, "modifierschange".cstring,
+                                       addr payload)
+    ck got.len == 2
+    ck got[0].kind == gekModifiers and got[0].modifiers == {gmAlt}
+    ck got[0].key == ""
+    ck got[1].kind == gekModifiers and got[1].modifiers == {}
 
   test "a nil payload decodes to an event that carries nothing":
     let ev = readPayload(nil)

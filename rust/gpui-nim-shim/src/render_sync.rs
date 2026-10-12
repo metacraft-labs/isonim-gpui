@@ -86,6 +86,8 @@ pub struct GpuiStyles {
     pub font_family: Option<String>,
     pub font_weight: Option<String>,
     pub font_style: Option<String>,
+    /// `text-decoration`: `underline` underlines the element's text.
+    pub text_decoration: Option<String>,
     pub line_height: Option<String>,
     pub letter_spacing: Option<String>,
     pub cursor: Option<String>,
@@ -176,6 +178,7 @@ impl GpuiStyles {
             "font-family" | "font_family" => self.font_family = Some(v),
             "font-weight" | "font_weight" => self.font_weight = Some(v),
             "font-style" | "font_style" => self.font_style = Some(v),
+            "text-decoration" | "text_decoration" => self.text_decoration = Some(v),
             "line-height" | "line_height" => self.line_height = Some(v),
             "letter-spacing" | "letter_spacing" => self.letter_spacing = Some(v),
             "cursor" => self.cursor = Some(v),
@@ -501,6 +504,21 @@ mod tests {
         assert_eq!(styles.flex_grow.as_deref(), Some("1"));
         assert_eq!(styles.top.as_deref(), Some("30px"));
         assert_eq!(styles.left.as_deref(), Some("40px"));
+    }
+
+    #[test]
+    fn test_styles_text_decoration() {
+        // A menu's access key is underlined (`text-decoration: underline`);
+        // the key is parsed into its own field, and an element that names no
+        // decoration has none.
+        let mut node = Node::new_element("span");
+        node.styles.insert("text-decoration".into(), "underline".into());
+        assert_eq!(
+            GpuiStyles::from_node(&node).text_decoration.as_deref(),
+            Some("underline")
+        );
+        let plain = Node::new_element("span");
+        assert_eq!(GpuiStyles::from_node(&plain).text_decoration, None);
     }
 
     #[test]

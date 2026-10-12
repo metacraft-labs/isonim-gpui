@@ -84,6 +84,12 @@ pub const GPUI_EVENT_POINTER_CONTEXT: u32 = 7;
 /// The MIDDLE button went down (a node listening for `auxdown`); `key` is
 /// `"x,y"`.
 pub const GPUI_EVENT_POINTER_AUX: u32 = 8;
+/// The held modifiers changed — a modifier key went down or up ON ITS OWN,
+/// which no keydown reports (`gpui::ModifiersChangedEvent`); `key` is empty
+/// and `modifiers` is the NEW set. Delivered as `modifierschange` to the
+/// focused element, like a key, so a consumer can recognise a modifier
+/// pressed and released alone (VS Code's "Alt focuses the menu bar").
+pub const GPUI_EVENT_MODIFIERS: u32 = 9;
 
 /// Modifier bits. The five GPUI itself distinguishes (`gpui::Modifiers`), in
 /// the order that struct declares them, so the mapping is a transcription

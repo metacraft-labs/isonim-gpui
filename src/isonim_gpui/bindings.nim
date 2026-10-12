@@ -83,6 +83,9 @@ const
     ## The RIGHT button went down (`contextmenu`); the key is `"x,y"`.
   GpuiEventPointerAux* = 8'u32
     ## The MIDDLE button went down (`auxdown`); the key is `"x,y"`.
+  GpuiEventModifiers* = 9'u32
+    ## The held modifiers changed (`modifierschange`) — a modifier pressed or
+    ## released on its own; the modifiers are the NEW set, the key is empty.
 
   GpuiModControl* = 1'u32 shl 0
   GpuiModAlt* = 1'u32 shl 1
