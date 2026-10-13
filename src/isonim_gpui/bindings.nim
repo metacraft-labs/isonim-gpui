@@ -112,6 +112,9 @@ type WindowResizeDispatcher* = proc(windowId: uint32; width: cdouble;
                                      height: cdouble) {.cdecl.}
 type WindowFocusDispatcher* = proc(windowId: uint32; focused: uint8) {.cdecl.}
 type WindowCloseDispatcher* = proc(windowId: uint32): uint8 {.cdecl.}
+type WindowStateDispatcher* = proc(windowId: uint32) {.cdecl.}
+  ## GWIN: the window's chrome state changed; read it back with the
+  ## `gpui_window_*` queries.
 
 {.push cdecl, dynlib: shimLib.}
 
@@ -447,6 +450,65 @@ proc gpui_notify_resize*(window_id: uint32; width, height: cdouble)
 
 proc gpui_notify_focus*(window_id: uint32; focused: uint8)
   {.importc: "gpui_notify_focus".}
+
+# --- GWIN: window chrome state ---
+
+proc gpui_window_decorations*(window_id: uint32): uint8
+  {.importc: "gpui_window_decorations".}
+  ## 0: the compositor draws the frame. 1: the application is expected to.
+
+proc gpui_window_tiling*(window_id: uint32): uint8
+  {.importc: "gpui_window_tiling".}
+  ## Tiled edges: top 1, right 2, bottom 4, left 8.
+
+proc gpui_window_controls*(window_id: uint32): uint8
+  {.importc: "gpui_window_controls".}
+  ## Supported controls: minimize 1, maximize 2, fullscreen 4, window menu 8.
+
+proc gpui_window_is_maximized*(window_id: uint32): uint8
+  {.importc: "gpui_window_is_maximized".}
+
+proc gpui_window_is_active*(window_id: uint32): uint8
+  {.importc: "gpui_window_is_active".}
+
+proc gpui_window_button_layout*(window_id: uint32): pointer
+  {.importc: "gpui_window_button_layout".}
+  ## GNOME `button-layout` syntax, `""` when unknown. Free with
+  ## `gpui_free_string`.
+
+proc gpui_set_window_state_dispatcher*(dispatcher: WindowStateDispatcher)
+  {.importc: "gpui_set_window_state_dispatcher".}
+
+proc gpui_on_window_state_id*(window_id: uint32): uint8
+  {.importc: "gpui_on_window_state_id".}
+
+proc gpui_notify_window_state*(window_id: uint32; decorations, tiling,
+                               controls, maximized, active: uint8;
+                               button_layout: cstring)
+  {.importc: "gpui_notify_window_state".}
+  ## Record a chrome state as if the window reported it (tests, bridging).
+
+# --- GWIN: identity, minimum size, initial state, title ---
+
+proc gpui_launch_window_id*(): uint32
+  {.importc: "gpui_launch_window_id".}
+  ## The window `gpui_launch` is opening: valid inside the root builder and
+  ## while the loop runs, 0 otherwise.
+
+proc gpui_set_app_id*(app_id: cstring)
+  {.importc: "gpui_set_app_id".}
+  ## Before `gpui_launch`.
+
+proc gpui_set_min_window_size*(width, height: cdouble)
+  {.importc: "gpui_set_min_window_size".}
+  ## Before `gpui_launch`. Non-positive clears it.
+
+proc gpui_set_initial_window_state*(maximized: uint8)
+  {.importc: "gpui_set_initial_window_state".}
+  ## Before `gpui_launch`.
+
+proc gpui_set_window_title*(window_id: uint32; title: cstring): uint8
+  {.importc: "gpui_set_window_title".}
 
 proc gpui_reset_windows*()
   {.importc: "gpui_reset_windows".}

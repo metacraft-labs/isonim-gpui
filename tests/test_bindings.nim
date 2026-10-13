@@ -153,6 +153,32 @@ static:
   assert compiles(gpui_notify_focus(1.uint32, 1.uint8))
   assert compiles(gpui_reset_windows())
 
+  # --- GWIN: window chrome state, identity, launch options ---
+  #
+  # Behaviour: `tests/test_window_environment.nim` and `window.rs`'s tests.
+  var sd: WindowStateDispatcher
+  assert compiles(gpui_window_decorations(1.uint32))
+  assert compiles(gpui_window_tiling(1.uint32))
+  assert compiles(gpui_window_controls(1.uint32))
+  assert compiles(gpui_window_is_maximized(1.uint32))
+  assert compiles(gpui_window_is_active(1.uint32))
+  assert compiles(gpui_window_button_layout(1.uint32))
+  assert compiles(gpui_set_window_state_dispatcher(sd))
+  assert compiles(gpui_on_window_state_id(1.uint32))
+  assert compiles(gpui_notify_window_state(1.uint32, 1.uint8, 0.uint8,
+                                           15.uint8, 0.uint8, 1.uint8,
+                                           ":close".cstring))
+  assert compiles(gpui_launch_window_id())
+  assert compiles(gpui_set_app_id("codetracer".cstring))
+  assert compiles(gpui_set_min_window_size(1050.0.cdouble, 600.0.cdouble))
+  assert compiles(gpui_set_initial_window_state(1.uint8))
+  assert compiles(gpui_set_window_title(1.uint32, "title".cstring))
+
+  # --- PLAT-50: the system clipboard (`clipboard.rs`) ---
+  var clip: array[16, char]
+  assert compiles(gpui_write_clipboard("text".cstring))
+  assert compiles(gpui_clipboard_text(addr clip[0], 16.uint64))
+
   # --- PLAT-42: frame and key-latency statistics ---
   #
   # The per-frame render time and the key-to-frame latency the windowed

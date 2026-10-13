@@ -69,9 +69,9 @@ pub mod gpui_app;
 // does not unwind. Read this module's header before touching the shutdown
 // poller. The file carries its own `#![cfg(…)]`, so the `mod` here is
 // unconditional and the module is empty off macOS.
-pub mod mac_event_loop;
 #[cfg(feature = "gpui-headless")]
 pub mod gpui_headless;
+pub mod mac_event_loop;
 // …and its feature-less counterpart, so the cdylib's EXPORTED SYMBOL SET
 // does not depend on which features it was built with. Without this a
 // plain `cargo build` produced 56 exports while `bindings.nim` imported
@@ -516,6 +516,16 @@ pub extern "C" fn gpui_launch(
 
     let root_handle = node_id_to_handle(root_id);
 
+    // GWIN: the window is registered BEFORE the root builder runs,
+    // so the application can find it (`gpui_launch_window_id`) and register
+    // its resize and window-state callbacks for the window being launched.
+    #[cfg(feature = "gpui-backend")]
+    let win_id = {
+        let id = window::create_window(title_str, width, height);
+        window::LAUNCH_WINDOW_ID.store(id, std::sync::atomic::Ordering::Release);
+        id
+    };
+
     // Call back to Nim so it can build the initial tree
     root_builder(root_handle);
 
@@ -523,8 +533,8 @@ pub extern "C" fn gpui_launch(
     // window with the shadow tree renderer as the root view.
     #[cfg(feature = "gpui-backend")]
     {
-        let win_id = window::create_window(title_str, width, height);
         gpui_app::launch_gpui_app(title_str, width, height, win_id);
+        window::LAUNCH_WINDOW_ID.store(0, std::sync::atomic::Ordering::Release);
     }
 
     // Without the feature, the function returns after building the shadow tree.
@@ -1062,6 +1072,133 @@ pub extern "C" fn gpui_notify_resize(window_id: u32, width: f64, height: f64) {
 #[no_mangle]
 pub extern "C" fn gpui_notify_focus(window_id: u32, focused: u8) {
     window::notify_focus(window_id, focused != 0);
+}
+
+// ---------------------------------------------------------------------------
+// GWIN — window chrome state
+// ---------------------------------------------------------------------------
+//
+// Sampled from the live GPUI window once per frame. Every query takes the
+// window id like `gpui_window_width`; an unknown id answers as a window
+// nothing has been sampled for (`ChromeState::default`).
+
+fn chrome_of(window_id: u32) -> window::ChromeState {
+    window::chrome_state(window_id).unwrap_or_default()
+}
+
+/// `0` the compositor draws the frame, `1` the application is expected to.
+#[no_mangle]
+pub extern "C" fn gpui_window_decorations(window_id: u32) -> u8 {
+    chrome_of(window_id).decorations
+}
+
+/// Tiled edges: top 1, right 2, bottom 4, left 8.
+#[no_mangle]
+pub extern "C" fn gpui_window_tiling(window_id: u32) -> u8 {
+    chrome_of(window_id).tiling
+}
+
+/// Supported controls: minimize 1, maximize 2, fullscreen 4, window menu 8.
+#[no_mangle]
+pub extern "C" fn gpui_window_controls(window_id: u32) -> u8 {
+    chrome_of(window_id).controls
+}
+
+#[no_mangle]
+pub extern "C" fn gpui_window_is_maximized(window_id: u32) -> u8 {
+    u8::from(chrome_of(window_id).maximized)
+}
+
+#[no_mangle]
+pub extern "C" fn gpui_window_is_active(window_id: u32) -> u8 {
+    u8::from(chrome_of(window_id).active)
+}
+
+/// The desktop's button layout in GNOME `button-layout` syntax
+/// (`"close:minimize,maximize"`), or `""` when the platform reports none.
+/// Free with `gpui_free_string`.
+#[no_mangle]
+pub extern "C" fn gpui_window_button_layout(window_id: u32) -> *mut c_char {
+    std::ffi::CString::new(chrome_of(window_id).button_layout)
+        .unwrap_or_default()
+        .into_raw()
+}
+
+/// Register the process-wide window-state dispatcher.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_state_dispatcher(dispatcher: window::WindowStateDispatcher) {
+    window::set_state_dispatcher(dispatcher);
+}
+
+/// Opt `window_id` into window-state delivery. Returns 1 if it exists.
+#[no_mangle]
+pub extern "C" fn gpui_on_window_state_id(window_id: u32) -> u8 {
+    u8::from(window::enable_state_dispatch(window_id))
+}
+
+/// Record a chrome state as if the window had reported it (for testing /
+/// event bridging, like `gpui_notify_resize`). `button_layout` may be null.
+#[no_mangle]
+pub extern "C" fn gpui_notify_window_state(
+    window_id: u32,
+    decorations: u8,
+    tiling: u8,
+    controls: u8,
+    maximized: u8,
+    active: u8,
+    button_layout: *const c_char,
+) {
+    let layout = unsafe { cstr_to_str(button_layout) }.to_string();
+    window::update_chrome_state(
+        window_id,
+        window::ChromeState {
+            decorations,
+            tiling,
+            controls,
+            maximized: maximized != 0,
+            active: active != 0,
+            button_layout: layout,
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GWIN — identity, minimum size, initial state, title
+// ---------------------------------------------------------------------------
+
+/// The registry id of the window `gpui_launch` is opening (valid inside the
+/// root builder and while the loop runs), 0 otherwise.
+#[no_mangle]
+pub extern "C" fn gpui_launch_window_id() -> u32 {
+    window::launch_window_id()
+}
+
+/// Before `gpui_launch`: the Wayland `app_id` / X11 `WM_CLASS`.
+#[no_mangle]
+pub extern "C" fn gpui_set_app_id(app_id: *const c_char) {
+    window::set_launch_app_id(unsafe { cstr_to_str(app_id) });
+}
+
+/// Before `gpui_launch`: the smallest content size. Non-positive clears it.
+#[no_mangle]
+pub extern "C" fn gpui_set_min_window_size(width: f64, height: f64) {
+    window::set_launch_min_size(width, height);
+}
+
+/// Before `gpui_launch`: `1` opens the window maximized (the launch size is
+/// then the restore size), `0` windowed and centred.
+#[no_mangle]
+pub extern "C" fn gpui_set_initial_window_state(maximized: u8) {
+    window::set_launch_maximized(maximized != 0);
+}
+
+/// Change a window's title; applied to the platform window on the next
+/// frame. Returns 1 if the window exists.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_title(window_id: u32, title: *const c_char) -> u8 {
+    u8::from(window::set_window_title(window_id, unsafe {
+        cstr_to_str(title)
+    }))
 }
 
 /// Reset all windows (for testing).

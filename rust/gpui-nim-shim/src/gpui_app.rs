@@ -20,9 +20,9 @@ use crate::window;
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 use gpui::{
     div, img, px, rgb, rgba, size, AbsoluteLength, AnyElement, App, AppContext as _, Application,
-    AsyncApp, Bounds, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, QuitMode, Render, Rgba, Styled, WeakEntity, Window, WindowBounds,
-    WindowOptions,
+    AsyncApp, Bounds, Context, Decorations, Div, FontWeight, Hsla, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, QuitMode, Render, Rgba, Styled, Subscription, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 
 // RS-M14 Phase 2 (git pin): `Application::new()` from crates.io `gpui = "0.2"`
@@ -67,6 +67,15 @@ pub struct NimRootView {
     /// places including two test files; a constructor that grew a parameter
     /// would put this milestone's diff across all of them for no gain.
     focus_handle: Option<gpui::FocusHandle>,
+
+    /// GWIN: observers that re-render when the window's chrome state
+    /// changes without a resize (the desktop's button layout, activation).
+    /// Kept alive here; dropping a `Subscription` unregisters it.
+    chrome_observers: Vec<Subscription>,
+
+    /// GWIN: set once GPUI has told the window the desktop's button
+    /// layout changed. See `desktop_button_layout`.
+    layout_reported: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
@@ -75,7 +84,111 @@ impl NimRootView {
         NimRootView {
             poll_started: false,
             focus_handle: None,
+            chrome_observers: Vec::new(),
+            layout_reported: std::rc::Rc::new(std::cell::Cell::new(false)),
         }
+    }
+
+    /// GWIN — keep the window registry in step with the live
+    /// platform window, before the frame is built so that whatever the
+    /// application does in its callbacks is in THIS frame:
+    ///
+    ///   * a title set with `gpui_set_window_title` reaches the platform;
+    ///   * the chrome state is sampled, and `gpui_on_window_state` fires if
+    ///     it changed;
+    ///   * a changed content size fires `gpui_on_resize`, so the
+    ///     application lays itself out for the size it is about to be
+    ///     drawn at. Until GWIN the shim never reported a resize at all.
+    ///
+    /// Only the launched window has a registry entry; the headless renderer
+    /// (`ACTIVE_WINDOW_ID == 0`) skips all of it.
+    fn sync_window_registry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let win_id = active_window_id();
+        if win_id == 0 {
+            return;
+        }
+        if self.chrome_observers.is_empty() {
+            // GPUI does not refresh the window when the button layout
+            // changes (`Window::button_layout_changed` only runs observers),
+            // and activation changes need a frame to be sampled in.
+            let reported = self.layout_reported.clone();
+            self.chrome_observers
+                .push(window.observe_button_layout_changed(move |window, _cx| {
+                    reported.set(true);
+                    window.refresh();
+                }));
+            self.chrome_observers
+                .push(cx.observe_window_activation(window, |_view, _window, cx| cx.notify()));
+        }
+        if let Some(title) = window::take_pending_title() {
+            window.set_window_title(&title);
+        }
+        window::update_chrome_state(
+            win_id,
+            sample_chrome_state(window, cx, self.layout_reported.get()),
+        );
+
+        let viewport = window.viewport_size();
+        let size = (f64::from(viewport.width), f64::from(viewport.height));
+        if window::window_size(win_id) != Some(size) {
+            window::notify_resize(win_id, size.0, size.1);
+        }
+    }
+}
+
+/// Read the platform's view of the window's frame (GWIN).
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn sample_chrome_state(window: &Window, cx: &App, layout_reported: bool) -> window::ChromeState {
+    let (decorations, tiling) = match window.window_decorations() {
+        Decorations::Server => (window::DECORATIONS_SERVER, 0),
+        Decorations::Client { tiling } => {
+            let mut bits = 0;
+            if tiling.top {
+                bits |= window::TILING_TOP;
+            }
+            if tiling.right {
+                bits |= window::TILING_RIGHT;
+            }
+            if tiling.bottom {
+                bits |= window::TILING_BOTTOM;
+            }
+            if tiling.left {
+                bits |= window::TILING_LEFT;
+            }
+            (window::DECORATIONS_CLIENT, bits)
+        }
+    };
+    let c = window.window_controls();
+    let mut controls = 0;
+    if c.minimize {
+        controls |= window::CONTROL_MINIMIZE;
+    }
+    if c.maximize {
+        controls |= window::CONTROL_MAXIMIZE;
+    }
+    if c.fullscreen {
+        controls |= window::CONTROL_FULLSCREEN;
+    }
+    if c.window_menu {
+        controls |= window::CONTROL_WINDOW_MENU;
+    }
+    let button_layout = cx
+        .button_layout()
+        .map(|layout| {
+            let ids = |side: &[Option<gpui::WindowButton>]| -> Vec<&'static str> {
+                side.iter().flatten().map(|b| b.id()).collect()
+            };
+            window::format_button_layout(&ids(&layout.left), &ids(&layout.right))
+        })
+        .map(|layout| window::desktop_button_layout(layout, layout_reported))
+        .unwrap_or_default();
+    window::ChromeState {
+        decorations,
+        tiling,
+        controls,
+        maximized: window.is_maximized(),
+        active: window.is_window_active(),
+        button_layout,
     }
 }
 
@@ -137,8 +250,12 @@ impl Render for NimRootView {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         }
 
+        self.sync_window_registry(window, cx);
+
         let tree = crate::lock_tree();
-        let root_id = *crate::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
+        let root_id = *crate::ROOT_NODE_ID
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         if root_id.is_null() {
             return with_keyboard(div().size_full().child("No shadow tree root"), &handle)
@@ -823,7 +940,22 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
         window::show_window(window_id);
     }
 
-    let _title_static: &'static str = Box::leak(title.to_string().into_boxed_str());
+    let title_owned = title.to_string();
+    let options = window::take_launch_options();
+    let decorations = match window::decorations_override(
+        std::env::var("ISONIM_GPUI_DECORATIONS").ok().as_deref(),
+    ) {
+        Ok(Some(window::DECORATIONS_CLIENT)) => Some(WindowDecorations::Client),
+        Ok(Some(_)) => Some(WindowDecorations::Server),
+        Ok(None) => None,
+        Err(value) => {
+            eprintln!(
+                "gpui-nim-shim: ignoring ISONIM_GPUI_DECORATIONS={value:?} \
+                 (expected \"client\" or \"server\")"
+            );
+            None
+        }
+    };
     let w = width as f32;
     let h = height as f32;
 
@@ -860,11 +992,26 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
         // a drain in between.
         cx.set_quit_mode(QuitMode::Explicit);
 
+        // GWIN: the title, identity, minimum size and initial state the
+        // application asked for. A maximized window keeps the launch size as
+        // its restore size.
+        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(
-                    Bounds::centered(None, size(px(w), px(h)), cx),
-                )),
+                window_bounds: Some(if options.maximized {
+                    WindowBounds::Maximized(bounds)
+                } else {
+                    WindowBounds::Windowed(bounds)
+                }),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title_owned.into()),
+                    ..Default::default()
+                }),
+                app_id: options.app_id,
+                window_min_size: options
+                    .min_size
+                    .map(|(mw, mh)| size(px(mw as f32), px(mh as f32))),
+                window_decorations: decorations,
                 ..Default::default()
             },
             |_, cx| cx.new(|_| NimRootView::new()),

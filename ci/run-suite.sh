@@ -90,6 +90,9 @@ UNITTEST_SUITES=(
 	# discriminating the moment the seam regresses, and this one is the
 	# only place `PLAT21-VG1`/`VG2`/`VG3` are asserted inside this repo.
 	tests/test_input_focus.nim
+	# GWIN-M1 (T3): window chrome state, the window-environment helper and
+	# the launch options through the real shim.
+	tests/test_window_environment.nim
 )
 ASSERT_SCRIPTS=(
 	tests/test_basic.nim
@@ -189,7 +192,29 @@ BENCHMARKS=(
 #   The windowed border/weight/pointer/tick suite (`tests/test_gui_borders.nim`)
 #   needs a compositor and a virtual pointer and is NOT in this total; its
 #   home is `just test-gui-borders`.
-EXPECTED_CASES=290
+# GWIN-M1, 2026-10-13, written LAST and from a run (trap 4c):
+#   167 rust unit  +  10 window-registry  +  15 cross-renderer
+# +  14 gui        +  31 render-integration  +  6 structural
+# +   5 gpui-reactive
+# +  28 input-focus
+# +  17 window-environment
+# +   1 basic      +   1 bindings           + 23 renderer checkpoints
+# = 318
+#
+#   * rust 157 -> 167. Seven are GWIN-M1's `window` tests (chrome state
+#     and its dispatch, the default state, the button-layout syntax, GPUI's
+#     fallback layout not passed off as the desktop's, the decorations
+#     override, the launch options, the run-time title). The
+#     other three landed since 2026-09-30 without moving this figure:
+#     `clipboard`'s `write_keeps_the_text_and_one_pending_copy` (76b2a2c),
+#     `render_sync`'s `test_styles_text_decoration` (a76a77d) and
+#     `window`'s `test_every_arming_moves_the_generation` (11b2faa).
+#   * input-focus 27 -> 28: a76a77d's modifier-change event kind.
+#   * window-environment is new: GWIN-M1's T3 suite.
+#   * bindings stays one checkpoint, but it was RED before this change:
+#     76b2a2c declared `gpui_write_clipboard` / `gpui_clipboard_text` and
+#     `test_bindings` never exercised them. Both are now covered there.
+EXPECTED_CASES=318
 
 total_cases=0
 failed_steps=()

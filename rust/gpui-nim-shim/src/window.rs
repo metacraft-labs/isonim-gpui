@@ -35,9 +35,16 @@ pub type WindowResizeDispatcher = extern "C" fn(window_id: u32, width: f64, heig
 pub type WindowFocusDispatcher = extern "C" fn(window_id: u32, focused: u8);
 pub type WindowCloseDispatcher = extern "C" fn(window_id: u32) -> u8;
 
+/// GWIN — called with the window's id when its chrome state
+/// ([`ChromeState`]) changed between two frames. The consumer reads the new
+/// values back through the `gpui_window_*` queries; passing them all as
+/// arguments would make every future field an ABI break.
+pub type WindowStateDispatcher = extern "C" fn(window_id: u32);
+
 static RESIZE_DISPATCHER: Mutex<Option<WindowResizeDispatcher>> = Mutex::new(None);
 static FOCUS_DISPATCHER: Mutex<Option<WindowFocusDispatcher>> = Mutex::new(None);
 static CLOSE_DISPATCHER: Mutex<Option<WindowCloseDispatcher>> = Mutex::new(None);
+static STATE_DISPATCHER: Mutex<Option<WindowStateDispatcher>> = Mutex::new(None);
 
 fn take_lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     match m.lock() {
@@ -56,6 +63,10 @@ pub fn set_focus_dispatcher(d: WindowFocusDispatcher) {
 
 pub fn set_close_dispatcher(d: WindowCloseDispatcher) {
     *take_lock(&CLOSE_DISPATCHER) = Some(d);
+}
+
+pub fn set_state_dispatcher(d: WindowStateDispatcher) {
+    *take_lock(&STATE_DISPATCHER) = Some(d);
 }
 
 /// Unique window identifier (simple incrementing counter).
@@ -100,6 +111,12 @@ pub struct WindowConfig {
     pub dispatch_resize: bool,
     pub dispatch_focus: bool,
     pub dispatch_close: bool,
+    /// GWIN: this window opted into `gpui_on_window_state` delivery.
+    pub dispatch_state: bool,
+
+    /// GWIN: what the platform last said about this window's frame,
+    /// sampled by `NimRootView::render` once per frame.
+    pub chrome: ChromeState,
 }
 
 impl WindowConfig {
@@ -117,8 +134,227 @@ impl WindowConfig {
             dispatch_resize: false,
             dispatch_focus: false,
             dispatch_close: false,
+            dispatch_state: false,
+            chrome: ChromeState::default(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// GWIN — window chrome state
+// ---------------------------------------------------------------------------
+//
+// The decoration mode, tiling, supported controls, maximized/active state and
+// the desktop's button layout, as GPUI reports them for the live window. An
+// application needs them to decide whether to draw a title bar and which
+// buttons to put where (`isonim_gpui/window_environment`). The values are plain integers and a string so this module
+// stays independent of the `gpui` crate and testable without a window.
+
+/// `gpui_window_decorations`: the compositor draws the frame.
+pub const DECORATIONS_SERVER: u8 = 0;
+/// `gpui_window_decorations`: the application is expected to draw it.
+pub const DECORATIONS_CLIENT: u8 = 1;
+
+/// `gpui_window_tiling` bits (GPUI's `Tiling`).
+pub const TILING_TOP: u8 = 1;
+pub const TILING_RIGHT: u8 = 2;
+pub const TILING_BOTTOM: u8 = 4;
+pub const TILING_LEFT: u8 = 8;
+
+/// `gpui_window_controls` bits (GPUI's `WindowControls`).
+pub const CONTROL_MINIMIZE: u8 = 1;
+pub const CONTROL_MAXIMIZE: u8 = 2;
+pub const CONTROL_FULLSCREEN: u8 = 4;
+pub const CONTROL_WINDOW_MENU: u8 = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChromeState {
+    pub decorations: u8,
+    pub tiling: u8,
+    pub controls: u8,
+    pub maximized: bool,
+    pub active: bool,
+    /// GNOME `button-layout` syntax (`"close:minimize,maximize"`): the
+    /// buttons left of the colon go on the left. Empty when the platform
+    /// reports no preference.
+    pub button_layout: String,
+}
+
+impl Default for ChromeState {
+    /// What is assumed before the first frame has been sampled: server-side
+    /// decorations, and every control available, which is GPUI's own
+    /// assumption (`WindowControls::default`, "we can do anything, unless
+    /// told otherwise").
+    fn default() -> Self {
+        ChromeState {
+            decorations: DECORATIONS_SERVER,
+            tiling: 0,
+            controls: CONTROL_MINIMIZE
+                | CONTROL_MAXIMIZE
+                | CONTROL_FULLSCREEN
+                | CONTROL_WINDOW_MENU,
+            maximized: false,
+            active: false,
+            button_layout: String::new(),
+        }
+    }
+}
+
+/// Format a button layout in GNOME's `button-layout` syntax, the one
+/// `gtk-decoration-layout` uses and GPUI parses
+/// (`WindowButtonLayout::parse`). The names are GPUI's `WindowButton::id`.
+pub fn format_button_layout(left: &[&str], right: &[&str]) -> String {
+    format!("{}:{}", left.join(","), right.join(","))
+}
+
+/// GPUI's own Linux fallback layout (`WindowButtonLayout::linux_default`)
+/// in `format_button_layout` syntax.
+pub const GPUI_FALLBACK_BUTTON_LAYOUT: &str = ":minimize,maximize,close";
+
+/// The layout to REPORT as the desktop's, given what GPUI returned.
+///
+/// GPUI on Linux always answers `button_layout()`: it starts from its own
+/// fallback and replaces it when the settings portal delivers the desktop's
+/// `button-layout` (`gpui-pre-linux` `platform.rs:187`,
+/// `xdg_desktop_portal.rs:100`). Its API cannot say which of the two it is
+/// returning, and on a desktop with no settings portal the fallback is all
+/// it will ever return. Measured on GNOME 2026-10-13: the first frame
+/// reports the fallback, the next one the configured `:close`.
+///
+/// So a layout counts as the desktop's only when it is known to be: GPUI
+/// announced a change (`reported`), or the value differs from the fallback.
+/// Otherwise `""` — "no preference known" — and the helper falls back to
+/// the platform convention and SAYS so (`psPlatformDefault`) instead of
+/// passing a guess off as a configuration. A desktop configured to exactly
+/// the fallback, whose portal answered before the window opened, therefore
+/// reads as the default; the placement is the same either way.
+pub fn desktop_button_layout(gpui_layout: String, reported: bool) -> String {
+    if reported || gpui_layout != GPUI_FALLBACK_BUTTON_LAYOUT {
+        gpui_layout
+    } else {
+        String::new()
+    }
+}
+
+/// Opt `id` into `gpui_on_window_state` delivery.
+pub fn enable_state_dispatch(id: u32) -> bool {
+    with_window_mut(id, |w| w.dispatch_state = true).is_some()
+}
+
+/// The last sampled chrome state of window `id`.
+pub fn chrome_state(id: u32) -> Option<ChromeState> {
+    with_window(id, |w| w.chrome.clone())
+}
+
+/// Record a newly sampled chrome state. When it differs from the previous
+/// one and the window opted in, the state dispatcher runs — after the
+/// registry lock is released, so a handler may query the window it was
+/// called for. Returns whether anything changed.
+pub fn update_chrome_state(id: u32, state: ChromeState) -> bool {
+    let Some((changed, dispatched)) = with_window_mut(id, |w| {
+        let changed = w.chrome != state;
+        w.chrome = state;
+        (changed, w.dispatch_state)
+    }) else {
+        return false;
+    };
+    if changed && dispatched {
+        if let Some(d) = *take_lock(&STATE_DISPATCHER) {
+            d(id);
+        }
+    }
+    changed
+}
+
+// ---------------------------------------------------------------------------
+// GWIN — launch options, the run-time title, the launched window
+// ---------------------------------------------------------------------------
+
+/// Window properties an application sets BEFORE `gpui_launch`. They are
+/// consumed (and reset) by the launch, so one launch's options never leak
+/// into the next.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LaunchOptions {
+    /// Wayland `app_id` / X11 `WM_CLASS`; should match the app's `.desktop`.
+    pub app_id: Option<String>,
+    /// The smallest content size the application can lay out.
+    pub min_size: Option<(f64, f64)>,
+    /// Open maximized; the launch size is then the restore size.
+    pub maximized: bool,
+}
+
+static LAUNCH_OPTIONS: Mutex<LaunchOptions> = Mutex::new(LaunchOptions {
+    app_id: None,
+    min_size: None,
+    maximized: false,
+});
+
+pub fn set_launch_app_id(app_id: &str) {
+    take_lock(&LAUNCH_OPTIONS).app_id = if app_id.is_empty() {
+        None
+    } else {
+        Some(app_id.to_string())
+    };
+}
+
+/// Non-positive or non-finite dimensions clear the minimum.
+pub fn set_launch_min_size(width: f64, height: f64) {
+    let valid = width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0;
+    take_lock(&LAUNCH_OPTIONS).min_size = if valid { Some((width, height)) } else { None };
+}
+
+pub fn set_launch_maximized(maximized: bool) {
+    take_lock(&LAUNCH_OPTIONS).maximized = maximized;
+}
+
+/// Hand the options to the launch and reset them.
+pub fn take_launch_options() -> LaunchOptions {
+    std::mem::take(&mut *take_lock(&LAUNCH_OPTIONS))
+}
+
+/// The decoration mode requested at window open. GPUI asks for
+/// server-side decorations by default and the compositor decides;
+/// `ISONIM_GPUI_DECORATIONS=client|server` overrides the request (tests
+/// use it to reach the client-side path on a compositor that would draw
+/// the frame itself). Returns `Ok(None)` for "no override" and `Err` with
+/// the offending value for anything else, which the caller reports and
+/// ignores rather than guessing what was meant.
+pub fn decorations_override(value: Option<&str>) -> Result<Option<u8>, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some("client") => Ok(Some(DECORATIONS_CLIENT)),
+        Some("server") => Ok(Some(DECORATIONS_SERVER)),
+        Some(other) => Err(other.to_string()),
+    }
+}
+
+/// A title set while the window is open, waiting for the next frame to
+/// hand it to the platform (`Window::set_window_title` needs the window,
+/// which only the render path holds).
+static PENDING_TITLE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Change window `id`'s title. Returns false if there is no such window.
+pub fn set_window_title(id: u32, title: &str) -> bool {
+    let found = with_window_mut(id, |w| w.title = title.to_string()).is_some();
+    if found {
+        *take_lock(&PENDING_TITLE) = Some(title.to_string());
+        request_repaint();
+    }
+    found
+}
+
+pub fn take_pending_title() -> Option<String> {
+    take_lock(&PENDING_TITLE).take()
+}
+
+/// The registry id of the window `gpui_launch` is opening, from just before
+/// it calls the application's root builder until the loop returns; 0 at
+/// any other time. This is how an application registers resize and state
+/// callbacks for the window it is launching.
+pub static LAUNCH_WINDOW_ID: AtomicU32 = AtomicU32::new(0);
+
+pub fn launch_window_id() -> u32 {
+    LAUNCH_WINDOW_ID.load(Ordering::Acquire)
 }
 
 /// Global repaint flag. When set to true, the GPUI event loop (if running)
@@ -424,6 +660,8 @@ pub fn reset_windows() {
     QUIT_REQUESTED.store(false, Ordering::Release);
     AUTO_QUIT_MS.store(0, Ordering::Release);
     set_tick(0, None);
+    *take_lock(&LAUNCH_OPTIONS) = LaunchOptions::default();
+    *take_lock(&PENDING_TITLE) = None;
 }
 
 #[cfg(test)]
@@ -801,5 +1039,144 @@ mod tests {
         assert_eq!(window_size(999), None);
         assert!(!show_window(999));
         assert!(!close_window(999));
+    }
+
+    // ---- GWIN ------------------------------------------------
+
+    static STATE_CALLS: TestAtomicU32 = TestAtomicU32::new(0);
+    static STATE_LAST_ID: TestAtomicU32 = TestAtomicU32::new(0);
+    extern "C" fn record_state(id: u32) {
+        STATE_CALLS.fetch_add(1, TestOrdering::SeqCst);
+        STATE_LAST_ID.store(id, TestOrdering::SeqCst);
+        // The handler may query the window it was called for: the registry
+        // lock is released before dispatch. A deadlock here hangs the test.
+        let _ = chrome_state(id);
+    }
+
+    fn client_state() -> ChromeState {
+        ChromeState {
+            decorations: DECORATIONS_CLIENT,
+            tiling: TILING_TOP | TILING_LEFT,
+            controls: CONTROL_MAXIMIZE,
+            maximized: true,
+            active: true,
+            button_layout: format_button_layout(&["close"], &[]),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_chrome_state_dispatches_only_on_change_and_only_when_opted_in() {
+        reset_windows();
+        set_state_dispatcher(record_state);
+        STATE_CALLS.store(0, TestOrdering::SeqCst);
+        let a = create_window("A", 10.0, 10.0);
+        let b = create_window("B", 10.0, 10.0);
+        assert!(enable_state_dispatch(a));
+
+        // Not opted in: recorded, not delivered.
+        assert!(update_chrome_state(b, client_state()));
+        assert_eq!(STATE_CALLS.load(TestOrdering::SeqCst), 0);
+        assert_eq!(chrome_state(b), Some(client_state()));
+
+        // Opted in: one delivery per change, none for a repeat.
+        assert!(update_chrome_state(a, client_state()));
+        assert!(!update_chrome_state(a, client_state()));
+        assert_eq!(STATE_CALLS.load(TestOrdering::SeqCst), 1);
+        assert_eq!(STATE_LAST_ID.load(TestOrdering::SeqCst), a);
+
+        let mut restored = client_state();
+        restored.maximized = false;
+        assert!(update_chrome_state(a, restored));
+        assert_eq!(STATE_CALLS.load(TestOrdering::SeqCst), 2);
+
+        // Unknown windows change nothing and deliver nothing.
+        assert!(!update_chrome_state(999, client_state()));
+        assert!(!enable_state_dispatch(999));
+        assert_eq!(STATE_CALLS.load(TestOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_chrome_state_default_is_server_with_every_control() {
+        reset_windows();
+        let id = create_window("D", 10.0, 10.0);
+        let s = chrome_state(id).unwrap();
+        assert_eq!(s.decorations, DECORATIONS_SERVER);
+        assert_eq!(s.controls, 15);
+        assert_eq!(s.button_layout, "");
+    }
+
+    #[test]
+    fn test_format_button_layout_is_gnome_syntax() {
+        assert_eq!(
+            format_button_layout(&[], &["minimize", "maximize", "close"]),
+            ":minimize,maximize,close"
+        );
+        assert_eq!(
+            format_button_layout(&["close"], &["minimize"]),
+            "close:minimize"
+        );
+    }
+
+    #[test]
+    fn test_decorations_override_parses_and_refuses() {
+        assert_eq!(decorations_override(None), Ok(None));
+        assert_eq!(decorations_override(Some(" ")), Ok(None));
+        assert_eq!(
+            decorations_override(Some("client")),
+            Ok(Some(DECORATIONS_CLIENT))
+        );
+        assert_eq!(
+            decorations_override(Some("server")),
+            Ok(Some(DECORATIONS_SERVER))
+        );
+        assert_eq!(decorations_override(Some("csd")), Err("csd".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_launch_options_are_consumed_once() {
+        reset_windows();
+        set_launch_app_id("codetracer");
+        set_launch_min_size(1050.0, 600.0);
+        set_launch_maximized(true);
+        let first = take_launch_options();
+        assert_eq!(first.app_id.as_deref(), Some("codetracer"));
+        assert_eq!(first.min_size, Some((1050.0, 600.0)));
+        assert!(first.maximized);
+        assert_eq!(take_launch_options(), LaunchOptions::default());
+
+        // Invalid minimums clear rather than store garbage; "" clears the id.
+        set_launch_min_size(-1.0, 600.0);
+        set_launch_app_id("");
+        assert_eq!(take_launch_options(), LaunchOptions::default());
+        set_launch_min_size(f64::NAN, 1.0);
+        assert_eq!(take_launch_options().min_size, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_window_title_is_recorded_and_latched() {
+        reset_windows();
+        let id = create_window("Old", 10.0, 10.0);
+        assert!(set_window_title(id, "New"));
+        assert_eq!(with_window(id, |w| w.title.clone()).as_deref(), Some("New"));
+        assert_eq!(take_pending_title().as_deref(), Some("New"));
+        assert_eq!(take_pending_title(), None);
+        assert!(!set_window_title(999, "Nobody"));
+        assert_eq!(take_pending_title(), None);
+    }
+
+    #[test]
+    fn test_gpui_fallback_layout_is_not_reported_as_the_desktops() {
+        let fallback = GPUI_FALLBACK_BUTTON_LAYOUT.to_string();
+        assert_eq!(desktop_button_layout(fallback.clone(), false), "");
+        assert_eq!(desktop_button_layout(fallback.clone(), true), fallback);
+        assert_eq!(desktop_button_layout(":close".to_string(), false), ":close");
+        assert_eq!(
+            GPUI_FALLBACK_BUTTON_LAYOUT,
+            format_button_layout(&[], &["minimize", "maximize", "close"])
+        );
     }
 }

@@ -65,6 +65,7 @@ var
   resizeCallbacks: Table[uint32, proc(width, height: float)]
   focusCallbacks: Table[uint32, proc(focused: bool)]
   closeCallbacks: Table[uint32, proc(): bool]
+  stateCallbacks: Table[uint32, proc()]
   windowDispatchersRegistered = false
 
 proc resizeDispatcher(windowId: uint32; w, h: cdouble) {.cdecl.} =
@@ -82,11 +83,16 @@ proc closeDispatcher(windowId: uint32): uint8 {.cdecl.} =
   elif cb(): 1'u8
   else: 0'u8
 
+proc stateDispatcher(windowId: uint32) {.cdecl.} =
+  let cb = stateCallbacks.getOrDefault(windowId)
+  if cb != nil: cb()
+
 proc ensureWindowDispatchers() =
   if not windowDispatchersRegistered:
     gpui_set_window_resize_dispatcher(resizeDispatcher)
     gpui_set_window_focus_dispatcher(focusDispatcher)
     gpui_set_window_close_dispatcher(closeDispatcher)
+    gpui_set_window_state_dispatcher(stateDispatcher)
     windowDispatchersRegistered = true
 
 proc windowCallbackCount*(): int =
@@ -100,12 +106,15 @@ proc windowCallbackCount*(): int =
     if id notin ids: ids.add id
   for id in closeCallbacks.keys:
     if id notin ids: ids.add id
+  for id in stateCallbacks.keys:
+    if id notin ids: ids.add id
   ids.len
 
 proc releaseWindowCallbacks(windowId: uint32) =
   resizeCallbacks.del(windowId)
   focusCallbacks.del(windowId)
   closeCallbacks.del(windowId)
+  stateCallbacks.del(windowId)
 
 # ===========================================================================
 # Window API
@@ -174,6 +183,82 @@ proc onClose*(win: GpuiWindow; callback: proc(): bool) =
   closeCallbacks[win.id] = callback
   discard gpui_on_close_id(win.id)
 
+# ===========================================================================
+# GWIN — window chrome state, identity and launch options
+# (GWIN-M1)
+# ===========================================================================
+
+type
+  WindowControl* = enum
+    ## A window operation the platform may or may not support.
+    wcMinimize, wcMaximize, wcFullscreen, wcWindowMenu
+
+  WindowEdge* = enum
+    weTop, weRight, weBottom, weLeft
+
+proc launchWindow*(): GpuiWindow =
+  ## The window `gpui_launch` is opening. Valid inside the root builder and
+  ## while the event loop runs; `id == 0` at any other time. Register
+  ## `onResize` / `onWindowState` on it from the root builder.
+  GpuiWindow(id: gpui_launch_window_id())
+
+proc clientDecorated*(win: GpuiWindow): bool =
+  ## Whether the application is expected to draw the title bar and frame
+  ## (the compositor draws nothing — GNOME/Wayland).
+  gpui_window_decorations(win.id) == 1
+
+proc tiledEdges*(win: GpuiWindow): set[WindowEdge] =
+  let bits = gpui_window_tiling(win.id)
+  for edge in WindowEdge:
+    if (bits and (1'u8 shl ord(edge))) != 0: result.incl edge
+
+proc supportedControls*(win: GpuiWindow): set[WindowControl] =
+  let bits = gpui_window_controls(win.id)
+  for c in WindowControl:
+    if (bits and (1'u8 shl ord(c))) != 0: result.incl c
+
+proc isMaximized*(win: GpuiWindow): bool =
+  gpui_window_is_maximized(win.id) != 0
+
+proc isActive*(win: GpuiWindow): bool =
+  gpui_window_is_active(win.id) != 0
+
+proc buttonLayout*(win: GpuiWindow): string =
+  ## The desktop's configured button layout in GNOME `button-layout`
+  ## syntax, `""` when the platform reports none. See
+  ## `window_environment.windowEnvironment` for the parsed, resolved form.
+  let p = gpui_window_button_layout(win.id)
+  if p != nil:
+    result = $cast[cstring](p)
+    gpui_free_string(p)
+
+proc onWindowState*(win: GpuiWindow; callback: proc()) =
+  ## Called when any of `clientDecorated`, `tiledEdges`,
+  ## `supportedControls`, `isMaximized`, `isActive` or `buttonLayout`
+  ## changed — for example to swap a maximize icon for a restore icon.
+  ensureWindowDispatchers()
+  stateCallbacks[win.id] = callback
+  discard gpui_on_window_state_id(win.id)
+
+proc setTitle*(win: GpuiWindow; title: string): bool =
+  ## Change the window's title; the platform sees it on the next frame.
+  gpui_set_window_title(win.id, title.cstring) != 0
+
+proc setAppId*(appId: string) =
+  ## Before `gpui_launch`: the Wayland `app_id` / X11 `WM_CLASS`. Match the
+  ## application's `.desktop` file name so the desktop associates them.
+  gpui_set_app_id(appId.cstring)
+
+proc setMinWindowSize*(width, height: float) =
+  ## Before `gpui_launch`: the smallest content size the app can lay out.
+  gpui_set_min_window_size(width.cdouble, height.cdouble)
+
+proc setInitialWindowState*(maximized: bool) =
+  ## Before `gpui_launch`: open maximized (the launch size is then the
+  ## restore size) or windowed and centred. The policy is the
+  ## application's; the renderer only carries it out.
+  gpui_set_initial_window_state(uint8(maximized))
+
 proc requestRepaint*() =
   ## Request a repaint of the active window. Call this after modifying
   ## the shadow tree to trigger a re-render on the next frame.
@@ -193,6 +278,7 @@ proc resetWindows*() =
   resizeCallbacks.clear()
   focusCallbacks.clear()
   closeCallbacks.clear()
+  stateCallbacks.clear()
   # Re-register the dispatchers so they are always set after a reset,
   # mirroring `renderer.resetCallbacks`.
   windowDispatchersRegistered = false
