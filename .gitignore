@@ -42,6 +42,7 @@ tests/test_gpui_reconciler_identity
 # `keymap/` directory from git. Prefer a longer explicit list to a clever glob.
 tests/test_input_focus
 tests/test_gui_keyboard
+tests/test_window_environment
 tests/test_nimcache_is_worktree_local
 
 # Repro development environment cache
