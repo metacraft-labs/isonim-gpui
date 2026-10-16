@@ -105,6 +105,84 @@ pub fn disarm_move() {
     MOVE_ARMED.with(|c| c.set(false));
 }
 
+/// Whether any element of the tree under `root` declares a drag region —
+/// the application has a title bar of its own, and the renderer draws none.
+pub fn tree_declares_drag_region(tree: &crate::tree::Tree, root: crate::tree::NodeId) -> bool {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let Some(node) = tree.get(id) else { continue };
+        if node
+            .attributes
+            .get(REGION_ATTRIBUTE)
+            .and_then(|v| parse_region(v))
+            == Some(Region::Drag)
+        {
+            return true;
+        }
+        stack.extend(node.children.iter().copied());
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// The fallback title bar's buttons
+// ---------------------------------------------------------------------------
+//
+// The same policy as `isonim_gpui/window_environment.resolveWindowEnvironment`
+// (which applications use for their OWN title bars), restated here because the
+// renderer draws the fallback bar with no application code involved. The two
+// are tested over the same cases.
+
+/// The fallback title bar's height in logical pixels.
+pub const FALLBACK_BAR_HEIGHT: f32 = 32.0;
+
+/// The buttons for the left and right ends of a title bar: the desktop's
+/// configured layout (GNOME `button-layout` syntax, as `window::ChromeState`
+/// carries it), or the platform convention when there is none, less the
+/// buttons whose operation the platform does not support. Close always is.
+pub fn title_bar_buttons(layout: &str, controls: u8, macos: bool) -> (Vec<Region>, Vec<Region>) {
+    use crate::window::{CONTROL_MAXIMIZE, CONTROL_MINIMIZE};
+    let supported = |r: Region| match r {
+        Region::Minimize => controls & CONTROL_MINIMIZE != 0,
+        Region::Maximize => controls & CONTROL_MAXIMIZE != 0,
+        _ => true,
+    };
+    let (left, right) = match layout.split_once(':') {
+        Some((l, r)) => {
+            let mut seen = Vec::new();
+            let mut side = |text: &str| -> Vec<Region> {
+                text.split(',')
+                    .filter_map(|n| match n.trim() {
+                        "minimize" => Some(Region::Minimize),
+                        "maximize" => Some(Region::Maximize),
+                        "close" => Some(Region::Close),
+                        _ => None,
+                    })
+                    .filter(|r| {
+                        let first = !seen.contains(r);
+                        seen.push(*r);
+                        first
+                    })
+                    .collect()
+            };
+            let l = side(l);
+            (l, side(r))
+        }
+        None if macos => (
+            vec![Region::Close, Region::Minimize, Region::Maximize],
+            vec![],
+        ),
+        None => (
+            vec![],
+            vec![Region::Minimize, Region::Maximize, Region::Close],
+        ),
+    };
+    (
+        left.into_iter().filter(|r| supported(*r)).collect(),
+        right.into_iter().filter(|r| supported(*r)).collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +227,60 @@ mod tests {
         arm_move();
         disarm_move();
         assert!(!take_move());
+    }
+
+    // The same cases as tests/test_window_environment.nim's
+    // resolveWindowEnvironment suite.
+    const ALL: u8 = 15;
+    use Region::{Close, Maximize, Minimize};
+
+    #[test]
+    fn title_bar_buttons_follow_the_configured_layout() {
+        assert_eq!(
+            title_bar_buttons(":minimize,maximize,close", ALL, false),
+            (vec![], vec![Minimize, Maximize, Close])
+        );
+        assert_eq!(
+            title_bar_buttons("close,minimize,maximize:", ALL, false),
+            (vec![Close, Minimize, Maximize], vec![])
+        );
+        assert_eq!(
+            title_bar_buttons("appmenu:close", ALL, false),
+            (vec![], vec![Close])
+        );
+        assert_eq!(
+            title_bar_buttons("icon,close:spacer,close,maximize,maximize", ALL, false),
+            (vec![Close], vec![Maximize])
+        );
+        assert_eq!(title_bar_buttons(":", ALL, false), (vec![], vec![]));
+    }
+
+    #[test]
+    fn title_bar_buttons_drop_what_the_platform_cannot_do() {
+        // sway: maximize and fullscreen only.
+        assert_eq!(
+            title_bar_buttons(":minimize,maximize,close", 2 | 4, false),
+            (vec![], vec![Maximize, Close])
+        );
+        assert_eq!(
+            title_bar_buttons(":minimize,maximize,close", 0, false),
+            (vec![], vec![Close])
+        );
+    }
+
+    #[test]
+    fn title_bar_buttons_default_to_the_platform_convention() {
+        assert_eq!(
+            title_bar_buttons("", ALL, false),
+            (vec![], vec![Minimize, Maximize, Close])
+        );
+        assert_eq!(
+            title_bar_buttons("close,minimize", ALL, false),
+            (vec![], vec![Minimize, Maximize, Close])
+        );
+        assert_eq!(
+            title_bar_buttons("", ALL, true),
+            (vec![Close, Minimize, Maximize], vec![])
+        );
     }
 }

@@ -97,6 +97,11 @@ pub struct NimRootView {
     /// undone.
     launch_size: Option<(f32, f32)>,
     launch_size_honoured: bool,
+
+    /// GWIN: the fallback title bar's height this frame — `regions::
+    /// FALLBACK_BAR_HEIGHT` while the application draws the decorations, is
+    /// not fullscreen and declares no drag region of its own; 0 otherwise.
+    title_bar: f32,
 }
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
@@ -111,6 +116,7 @@ impl NimRootView {
             decorations_rerequested: false,
             launch_size: None,
             launch_size_honoured: false,
+            title_bar: 0.0,
         }
     }
 
@@ -199,14 +205,25 @@ impl NimRootView {
                 }
             }
         }
+        let client = chrome.decorations == window::DECORATIONS_CLIENT;
+        let has_drag_region = {
+            let tree = crate::lock_tree();
+            let root = *crate::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
+            crate::regions::tree_declares_drag_region(&tree, root)
+        };
+        self.title_bar = if client && !window.is_fullscreen() && !has_drag_region {
+            crate::regions::FALLBACK_BAR_HEIGHT
+        } else {
+            0.0
+        };
         let (ox, oy) = self.frame.content_origin();
-        window::set_content_origin(ox, oy);
+        window::set_content_origin(ox, oy + self.title_bar);
         window::update_chrome_state(win_id, chrome);
 
-        // The application is told its CONTENT size, which is the window
-        // the compositor reports.
+        // The application is told its CONTENT size: the window the
+        // compositor reports, less the fallback title bar if one is drawn.
         let (cw, ch) = self.frame.content_size();
-        let size = (cw as f64, ch as f64);
+        let size = (cw as f64, (ch - self.title_bar).max(0.0) as f64);
         if window::window_size(win_id) != Some(size) {
             window::notify_resize(win_id, size.0, size.1);
         }
@@ -343,10 +360,26 @@ impl Render for NimRootView {
         match crate::render_sync::build_render_plan(&tree, root_id) {
             Some(plan) => {
                 drop(tree); // release lock before building GPUI elements
-                let element = if self.frame.is_framed() {
+                let element = if self.frame.is_framed() || self.title_bar > 0.0 {
+                    let title_bar = (self.title_bar > 0.0).then(|| {
+                        let win_id = active_window_id();
+                        let chrome = window::chrome_state(win_id).unwrap_or_default();
+                        FallbackTitleBar {
+                            height: self.title_bar,
+                            title: window::with_window(win_id, |w| w.title.clone())
+                                .unwrap_or_default(),
+                            buttons: crate::regions::title_bar_buttons(
+                                &chrome.button_layout,
+                                chrome.controls,
+                                cfg!(target_os = "macos"),
+                            ),
+                            maximized: chrome.maximized,
+                        }
+                    });
                     frame_client_window(
                         render_plan_to_gpui(&plan),
                         &self.frame,
+                        title_bar,
                         FrameColors::of(&plan, window.is_window_active()),
                         &handle,
                     )
@@ -452,6 +485,8 @@ pub fn render_root_to_gpui(
 pub struct FrameColors {
     pub border: Hsla,
     pub shadow: Hsla,
+    pub title_bar: Hsla,
+    pub title_text: Hsla,
 }
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
@@ -471,6 +506,8 @@ impl FrameColors {
         FrameColors {
             border: pick("data-isonim-window-border", "#00000040"),
             shadow,
+            title_bar: pick("data-isonim-titlebar-background", "#303030"),
+            title_text: pick("data-isonim-titlebar-foreground", "#e6e6e6"),
         }
     }
 }
@@ -486,6 +523,7 @@ impl FrameColors {
 pub fn frame_client_window(
     content: AnyElement,
     frame: &crate::frame::FrameGeometry,
+    title_bar: Option<FallbackTitleBar>,
     colors: FrameColors,
     handle: &gpui::FocusHandle,
 ) -> AnyElement {
@@ -505,7 +543,14 @@ pub fn frame_client_window(
         .shadow(vec![BoxShadow::new(px(0.), px(0.), colors.shadow)
             .blur_radius(px(crate::frame::FRAME_INSET / 2.0))])
         .overflow_hidden()
-        .child(div().w(px(cw)).h(px(ch)).child(content));
+        .flex()
+        .flex_col();
+    let bar_h = title_bar.as_ref().map_or(0.0, |b| b.height);
+    let body = match title_bar {
+        Some(bar) => body.child(fallback_title_bar(bar, cw, &colors)),
+        None => body,
+    }
+    .child(div().w(px(cw)).h(px((ch - bar_h).max(0.0))).child(content));
     let mut backdrop = div()
         .size_full()
         .pl(px(side(frame.left)))
@@ -680,44 +725,145 @@ fn wire_window_region(el: Div, plan: &crate::render_sync::RenderNode) -> Div {
             .on_mouse_down(MouseButton::Right, |_e, _w, _cx| regions::claim())
     };
     match region {
-        Some(Region::Drag) => el
-            .on_mouse_down(MouseButton::Left, |event, window, _cx| {
-                if regions::claimed() || !window::client_decorated() {
-                    return;
-                }
-                if event.click_count >= 2 {
-                    regions::disarm_move();
-                    window.zoom_window();
-                } else {
-                    regions::arm_move();
-                }
-            })
-            .on_mouse_move(|event, window, _cx| {
-                if event.pressed_button == Some(MouseButton::Left) && regions::take_move() {
-                    window.start_window_move();
-                }
-            })
-            .on_mouse_up(MouseButton::Left, |_e, _w, _cx| regions::disarm_move())
-            .on_mouse_down(MouseButton::Right, |event, window, _cx| {
-                if !regions::claimed() && window::client_decorated() {
-                    window.show_window_menu(event.position);
-                }
-            }),
-        Some(button @ (Region::Minimize | Region::Maximize | Region::Close)) => claim(el)
-            .on_mouse_up(MouseButton::Left, move |_e, window, _cx| {
-                let op = match button {
-                    Region::Minimize => window::WindowOp::Minimize,
-                    Region::Maximize => window::WindowOp::ToggleMaximize,
-                    _ => window::WindowOp::Close,
-                };
-                perform_window_op(op, window, active_window_id());
-            }),
+        Some(Region::Drag) => drag_region(el),
+        Some(button @ (Region::Minimize | Region::Maximize | Region::Close)) => {
+            window_button(el, button)
+        }
         Some(Region::NoDrag) => claim(el),
         None if regions::is_pointer_listener(plan.has_click_handler, &plan.event_names) => {
             claim(el)
         }
         None => el,
     }
+}
+
+/// A drag region's behaviour (`regions.rs`): a move on the first motion
+/// after a left press, maximize on a double-click, the window menu on a
+/// right press — unless an element in front claimed the press, or the
+/// compositor draws the decorations.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn drag_region(el: Div) -> Div {
+    use crate::regions;
+    el.on_mouse_down(MouseButton::Left, |event, window, _cx| {
+        if regions::claimed() || !window::client_decorated() {
+            return;
+        }
+        if event.click_count >= 2 {
+            regions::disarm_move();
+            window.zoom_window();
+        } else {
+            regions::arm_move();
+        }
+    })
+    .on_mouse_move(|event, window, _cx| {
+        if event.pressed_button == Some(MouseButton::Left) && regions::take_move() {
+            window.start_window_move();
+        }
+    })
+    .on_mouse_up(MouseButton::Left, |_e, _w, _cx| regions::disarm_move())
+    .on_mouse_down(MouseButton::Right, |event, window, _cx| {
+        if !regions::claimed() && window::client_decorated() {
+            window.show_window_menu(event.position);
+        }
+    })
+}
+
+/// A window button's behaviour: it claims the press and acts on the click.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn window_button(el: Div, button: crate::regions::Region) -> Div {
+    use crate::regions::{self, Region};
+    el.on_mouse_down(MouseButton::Left, |_e, _w, _cx| regions::claim())
+        .on_mouse_down(MouseButton::Right, |_e, _w, _cx| regions::claim())
+        .on_mouse_up(MouseButton::Left, move |_e, window, _cx| {
+            let op = match button {
+                Region::Minimize => window::WindowOp::Minimize,
+                Region::Maximize => window::WindowOp::ToggleMaximize,
+                _ => window::WindowOp::Close,
+            };
+            perform_window_op(op, window, active_window_id());
+        })
+}
+
+/// The title bar the renderer draws for an application that declares none
+/// of its own (GWIN): the window's title, and the buttons the platform
+/// supports where the desktop wants them.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct FallbackTitleBar {
+    pub height: f32,
+    pub title: String,
+    pub buttons: (Vec<crate::regions::Region>, Vec<crate::regions::Region>),
+    pub maximized: bool,
+}
+
+/// The fallback title bar's button size, gap, and margin from the bar's ends.
+pub const FALLBACK_BUTTON: f32 = 24.0;
+pub const FALLBACK_BUTTON_GAP: f32 = 6.0;
+pub const FALLBACK_BUTTON_MARGIN: f32 = 6.0;
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn fallback_title_bar(bar: FallbackTitleBar, width: f32, colors: &FrameColors) -> Div {
+    use crate::regions::Region;
+    let fg = colors.title_text;
+    let maximized = bar.maximized;
+    let glyph = move |r: Region| -> AnyElement {
+        match r {
+            // Drawn rather than typed, so that no font has to carry them.
+            Region::Minimize => div().w(px(10.)).h(px(1.5)).bg(fg).into_any_element(),
+            Region::Maximize => {
+                let side = if maximized { 8. } else { 10. };
+                div()
+                    .w(px(side))
+                    .h(px(side))
+                    .border_1()
+                    .border_color(fg)
+                    .into_any_element()
+            }
+            _ => div().text_color(fg).child("×").into_any_element(),
+        }
+    };
+    let button = move |r: Region| {
+        window_button(
+            div()
+                .w(px(FALLBACK_BUTTON))
+                .h(px(FALLBACK_BUTTON))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(FALLBACK_BUTTON / 2.0))
+                .bg(gpui::hsla(0., 0., 1., 0.08))
+                .child(glyph(r)),
+            r,
+        )
+    };
+    let side = move |buttons: &[Region]| {
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(FALLBACK_BUTTON_GAP))
+            .children(buttons.iter().map(|r| button(*r)))
+    };
+    drag_region(
+        div()
+            .w(px(width))
+            .h(px(bar.height))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px(px(FALLBACK_BUTTON_MARGIN))
+            .bg(colors.title_bar)
+            .text_color(fg)
+            .child(side(&bar.buttons.0))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .justify_center()
+                    .overflow_hidden()
+                    .child(bar.title),
+            )
+            .child(side(&bar.buttons.1)),
+    )
 }
 
 /// Carry out a window operation on the platform window. `Close` asks the

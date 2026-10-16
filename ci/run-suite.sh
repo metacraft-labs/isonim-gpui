@@ -226,7 +226,12 @@ BENCHMARKS=(
 #   * rust 173 -> 178: `regions`' four (the attribute's values, pointer
 #     listeners as implicitly no-drag, a claim lasting one press, one press
 #     arming one move) and `window`'s queue of window operations.
-EXPECTED_CASES=329
+# GWIN-M4, 2026-10-16, written LAST and from a run (trap 4c): 332.
+#   * rust 178 -> 181: `regions`' fallback-title-bar button policy — a
+#     configured layout followed, unsupported operations dropped, the
+#     platform convention when none is configured (the cases
+#     `test_window_environment.nim` runs against the Nim helper).
+EXPECTED_CASES=332
 
 total_cases=0
 failed_steps=()

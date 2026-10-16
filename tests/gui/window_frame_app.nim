@@ -13,6 +13,8 @@
 ##   GWIN_QUIT_MS   quit after this many milliseconds (default 120000)
 ##   GWIN_BORDER    the frame's border colour (`data-isonim-window-border`),
 ##                  so a suite can find the border on a black desktop
+##   GWIN_TITLEBAR_BG  the renderer's fallback title bar colour
+##                  (`data-isonim-titlebar-background`)
 ##   GWIN_REGIONS   `1`: also draw a title bar out of window regions — see
 ##                  `buildTitleBar` — and act on keys: m minimize, x toggle
 ##                  maximize, f toggle fullscreen, q close, v refuse the next
@@ -130,6 +132,8 @@ proc build(root: GpuiElement) {.cdecl.} =
   r.setStyle(root, "height", "100%")
   let border = getEnv("GWIN_BORDER")
   if border.len > 0: r.setAttribute(root, "data-isonim-window-border", border)
+  let barColor = getEnv("GWIN_TITLEBAR_BG")
+  if barColor.len > 0: r.setAttribute(root, "data-isonim-titlebar-background", barColor)
   r.addEventListener(root, "mousedown", proc(ev: GpuiEvent) =
     let p = pointerOf(ev)
     if p.valid: emit(%*{"event": "press", "x": p.x, "y": p.y}))

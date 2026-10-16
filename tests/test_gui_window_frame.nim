@@ -40,6 +40,9 @@ const
   AppId = "isonim-gpui-frame-test"
   Border = (255'u8, 0'u8, 0'u8)
   Content = (0x33'u8, 0x66'u8, 0x99'u8)
+  Bar = (0x00'u8, 0x80'u8, 0x00'u8)
+  BarH = 32       ## the renderer's fallback title bar (`regions::FALLBACK_BAR_HEIGHT`)
+  BarButton = 24  ## its buttons, 6px from the bar's ends and from each other
 
 let appBin = getEnv("GWIN_APP")
 let appLibs = getEnv("GWIN_APP_LD_LIBRARY_PATH")
@@ -64,21 +67,23 @@ proc lastOf(kind: string): JsonNode =
 proc launch(decorations = "client") =
   discard t.spawn(@[appBin], extraEnv = [
     ("GWIN_REPORT", report), ("GWIN_BORDER", "#ff0000ff"),
+    ("GWIN_TITLEBAR_BG", "#008000ff"),
     ("ISONIM_GPUI_DECORATIONS", decorations), ("LD_LIBRARY_PATH", appLibs)])
 
 proc contentSize(): (int, int) =
   let r = lastOf("resize")
   if r.kind == JNull: (-1, -1) else: (int(r["w"].getFloat), int(r["h"].getFloat))
 
-proc settledWindow(csd: bool): EnvWindow =
+proc settledWindow(csd: bool; bar = 0): EnvWindow =
   ## The window once the app reports the decoration mode `csd` and the
-  ## content size it was told matches the window sway reports.
+  ## content size it was told matches the window sway reports, less `bar`
+  ## (the fallback title bar's height, where the renderer draws one).
   t.waitUntil("the app reporting csd=" & $csd & " at the compositor's size",
     proc(): bool =
       let s = lastOf("state")
       if s.kind == JNull or s["csd"].getBool != csd: return false
       let (found, w) = t.findWindow(AppId)
-      found and contentSize() == (w.rect.w, w.rect.h))
+      found and contentSize() == (w.rect.w, w.rect.h - bar))
   result = t.window(AppId)
   discard t.captureSettled(result.rect)
 
@@ -95,14 +100,17 @@ suite "GWIN — the client-side frame on sway":
     t.stop()
     removeFile(report)
 
-  test "the compositor's window is the application's content":
-    let w = settledWindow(csd = true)
-    # The launch size is the CONTENT's: the frame's band is added around it.
+  test "the compositor's window is the fallback title bar and the content":
+    # The app declares no title bar of its own, so the renderer draws one.
+    let w = settledWindow(csd = true, bar = BarH)
+    # The launch size is the window's, frame band aside.
     check (w.rect.w, w.rect.h) == (640, 400)
     let img = t.captureSettled(Rect(x: w.rect.x - 8, y: w.rect.y - 8,
                                     w: w.rect.w + 16, h: w.rect.h + 16))
-    # The content's colour starts exactly at the window's edge...
-    check img.pixel(8, 8) == Content
+    # The bar starts exactly at the window's edge, the content below it...
+    check img.pixel(8 + w.rect.w div 2, 8) == Bar
+    check img.pixel(8 + w.rect.w div 2, 8 + BarH - 1) == Bar
+    check img.pixel(8, 8 + BarH) == Content
     check img.pixel(8 + w.rect.w - 1, 8 + w.rect.h - 1) == Content
     # ...and the border lies just outside it, in the frame's band.
     check img.pixel(7, 8 + w.rect.h div 2) == Border
@@ -111,8 +119,8 @@ suite "GWIN — the client-side frame on sway":
     check img.pixel(8 + w.rect.w div 2, 8 + w.rect.h) == Border
 
   test "a press reaches the application in content coordinates":
-    let w = settledWindow(csd = true)
-    t.click((w.rect.x + 50, w.rect.y + 40))
+    let w = settledWindow(csd = true, bar = BarH)
+    t.click((w.rect.x + 50, w.rect.y + BarH + 40))
     t.waitUntil("the press reported", proc(): bool = events("press").len > 0)
     let p = lastOf("press")
     check int(p["x"].getFloat) == 50
@@ -134,9 +142,9 @@ suite "GWIN — the client-side frame on sway":
       ("top-left", 0.0, 0.0, -d, -d, -d, -d, d, d),
       ("top-right", 1.0, 0.0, d, -d, 0, -d, d, d),
       ("bottom-left", 0.0, 1.0, -d, d, -d, 0, d, d)]
-    var w = settledWindow(csd = true)
+    var w = settledWindow(csd = true, bar = BarH)
     t.command("[app_id=" & AppId & "] move position 300 200")
-    w = settledWindow(csd = true)
+    w = settledWindow(csd = true, bar = BarH)
     for c in cases:
       let gx = w.rect.x + (if c.gx == 0.0: 2 elif c.gx == 1.0: w.rect.w - 3
                            else: w.rect.w div 2)
@@ -149,23 +157,64 @@ suite "GWIN — the client-side frame on sway":
       let before = w.rect
       t.waitUntil(c.name & " resized", proc(): bool =
         t.window(AppId).rect != before)
-      w = settledWindow(csd = true)
+      w = settledWindow(csd = true, bar = BarH)
       checkpoint c.name & ": " & $before & " -> " & $w.rect
       check w.rect.x - before.x == c.ex
       check w.rect.y - before.y == c.ey
       check w.rect.w - before.w == c.ew
       check w.rect.h - before.h == c.eh
-      check contentSize() == (w.rect.w, w.rect.h)
+      check contentSize() == (w.rect.w, w.rect.h - BarH)
 
   test "a press in the middle of the content does not resize":
-    let w = settledWindow(csd = true)
+    let w = settledWindow(csd = true, bar = BarH)
     let c = w.rect.center
     t.drag(c, c + (40, 40))
     t.waitUntil("the press reported", proc(): bool = events("press").len > 0)
     check t.window(AppId).rect == w.rect
 
-  test "a fullscreen window has no frame":
-    discard settledWindow(csd = true)
+  test "a drag on the fallback title bar moves the window":
+    var w = settledWindow(csd = true, bar = BarH)
+    t.command("[app_id=" & AppId & "] move position 200 150")
+    w = settledWindow(csd = true, bar = BarH)
+    let src = (w.rect.x + w.rect.w div 2, w.rect.y + BarH div 2)
+    t.pointerMove(src[0], src[1])
+    t.press()
+    sleep(150)
+    t.pointerMove(src[0] + 1, src[1])
+    sleep(150)
+    t.drag(src + (1, 0), src + (120, 70), steps = 10, stepMs = 30,
+           releaseHoldMs = 250, pressHoldMs = -1)
+    t.waitUntil("the window moved", proc(): bool = t.window(AppId).rect.x != w.rect.x)
+    check t.window(AppId).rect ==
+          Rect(x: w.rect.x + 119, y: w.rect.y + 70, w: w.rect.w, h: w.rect.h)
+
+  test "the fallback title bar's close button is where the desktop wants it":
+    # Two layouts, close alone on each side; a click at the other end closes
+    # nothing, a click on the button does. The button's centre is 6 + 12px
+    # from its end of the bar.
+    let ends = [("close:", true), (":close", false)]
+    for i, (layout, onLeft) in ends:
+      if i > 0:
+        # The previous layout's app closed; a fresh one for this layout.
+        removeFile(report)
+        launch()
+      let w = settledWindow(csd = true, bar = BarH)
+      t.configure("buttonLayout", layout)
+      t.waitUntil("the app told the layout " & layout, proc(): bool =
+        let s = lastOf("state")
+        s.kind != JNull and s["layout"].getStr == layout)
+      sleep(300)
+      let left = (w.rect.x + 6 + BarButton div 2, w.rect.y + BarH div 2)
+      let right = (w.rect.x + w.rect.w - 6 - BarButton div 2, w.rect.y + BarH div 2)
+      t.click(if onLeft: right else: left)
+      sleep(400)
+      check t.findWindow(AppId)[0]
+      t.click(if onLeft: left else: right)
+      t.waitUntil("closed by the " & (if onLeft: "left" else: "right") & " button",
+        proc(): bool = not t.findWindow(AppId)[0])
+
+  test "a fullscreen window has no frame and no title bar":
+    discard settledWindow(csd = true, bar = BarH)
     t.command("[app_id=" & AppId & "] fullscreen enable")
     t.waitUntil("the app told it is tiled on every edge", proc(): bool =
       let s = lastOf("state")
@@ -276,6 +325,11 @@ suite "GWIN — window regions on sway":
     t.waitUntil("the window moved", proc(): bool = t.window(AppId).rect.x != w.rect.x)
     let after = t.window(AppId)
     check after.rect == Rect(x: w.rect.x + 119, y: w.rect.y + 70, w: w.rect.w, h: w.rect.h)
+
+  test "an application with its own title bar gets no fallback one":
+    let w = settledWindow(csd = true)
+    let img = t.captureSettled(w.rect)
+    check img.pixel(40, 5) == (0x22'u8, 0x44'u8, 0x66'u8)   # the app's own strip
 
   test "a drag that starts on a no-drag child of the title bar does not move it":
     let w = settledWindow(csd = true)
