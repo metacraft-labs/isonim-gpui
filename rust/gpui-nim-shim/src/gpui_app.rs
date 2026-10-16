@@ -246,6 +246,24 @@ impl NimRootView {
     }
 }
 
+/// Hand the application's registered font files (`window::add_font_file`) to
+/// GPUI's text system. A file GPUI cannot parse is reported, not fatal: the
+/// family it would have provided falls back to the platform's face.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn register_fonts(cx: &mut App) {
+    let fonts = window::fonts();
+    if fonts.is_empty() {
+        return;
+    }
+    let owned: Vec<std::borrow::Cow<'static, [u8]>> = fonts
+        .iter()
+        .map(|f| std::borrow::Cow::Owned(f.as_ref().clone()))
+        .collect();
+    if let Err(e) = cx.text_system().add_fonts(owned) {
+        eprintln!("gpui-nim-shim: registering {} font file(s) failed: {e}", fonts.len());
+    }
+}
+
 /// Read the platform's view of the window's frame (GWIN).
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 fn sample_chrome_state(window: &Window, cx: &App, layout_reported: bool) -> window::ChromeState {
@@ -1238,6 +1256,11 @@ pub fn apply_styles_to_div(
             el = el.text_size(px(px_val));
         }
     }
+    // `line-height`: a pixel value is the line box's height; a bare number
+    // is, as in CSS, a multiple of the font size.
+    if let Some(lh) = styles.line_height.as_deref().and_then(parse_line_height) {
+        el = el.line_height(lh);
+    }
     if let Some(ref weight) = styles.font_weight {
         el = el.font_weight(parse_font_weight(weight));
     }
@@ -1292,6 +1315,19 @@ pub fn parse_px(s: &str) -> Option<f32> {
     let s = s.trim();
     let num_str = s.strip_suffix("px").unwrap_or(s);
     num_str.parse::<f32>().ok()
+}
+
+/// Parse a CSS `line-height`: `22px` is absolute, a bare `1.4` is relative
+/// to the font size. `normal` and anything unparsable leave GPUI's default.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_line_height(s: &str) -> Option<gpui::DefiniteLength> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix("px") {
+        let v = n.trim().parse::<f32>().ok().filter(|v| *v > 0.0)?;
+        return Some(px(v).into());
+    }
+    let v = s.parse::<f32>().ok().filter(|v| *v > 0.0)?;
+    Some(gpui::relative(v))
 }
 
 /// Parse a color from a CSS-like string.
@@ -1425,6 +1461,7 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
         // the same user-visible rule (last window gone => app quits) with
         // a drain in between.
         cx.set_quit_mode(QuitMode::Explicit);
+        register_fonts(cx);
 
         // GWIN: the title, identity, minimum size and initial state the
         // application asked for. A maximized window keeps the launch size as
@@ -1716,7 +1753,7 @@ mod tests {
     // Do NOT use `use super::*` here because it would bring gpui traits
     // (re-exported via use statements) that include a `test` proc macro
     // which shadows `#[test]` and causes infinite macro recursion.
-    use super::{active_window_id, launch_gpui_app};
+    use super::{active_window_id, launch_gpui_app, parse_line_height};
 
     #[test]
     fn test_launch_gpui_app_exists() {
@@ -1727,5 +1764,21 @@ mod tests {
     #[test]
     fn test_active_window_id_default() {
         assert_eq!(active_window_id(), 0);
+    }
+
+    #[test]
+    fn test_line_height_is_absolute_in_px_and_relative_bare() {
+        assert_eq!(
+            parse_line_height("22px"),
+            Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(
+                gpui::px(22.0)
+            )))
+        );
+        assert_eq!(
+            parse_line_height(" 1.5 "),
+            Some(gpui::DefiniteLength::Fraction(1.5))
+        );
+        assert_eq!(parse_line_height("normal"), None);
+        assert_eq!(parse_line_height("0px"), None);
     }
 }

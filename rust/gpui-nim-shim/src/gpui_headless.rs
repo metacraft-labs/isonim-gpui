@@ -284,6 +284,7 @@ fn render_to_rgba(width: u32, height: u32, scale: f32) -> Result<Vec<u8>, ErrorC
 
     let window: AnyWindowHandle = cx
         .open_window(window_size, |_, cx: &mut App| {
+            crate::gpui_app::register_fonts(cx);
             cx.new(|_| NimRootView::new())
         })
         .map_err(|_| ErrorCode::WindowOpenFailed)?
@@ -709,6 +710,7 @@ fn render_via_cached(
         let new_window: AnyWindowHandle = entry
             .cx
             .open_window(window_size, |_, cx: &mut App| {
+                crate::gpui_app::register_fonts(cx);
                 cx.new(|_| NimRootView::new())
             })
             .map_err(|_| ErrorCode::WindowOpenFailed)?

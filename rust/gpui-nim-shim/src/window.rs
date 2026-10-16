@@ -421,6 +421,29 @@ pub fn requested_decorations() -> Option<u8> {
     }
 }
 
+/// Font files an application registers before launching (`gpui_add_font_file`),
+/// handed to GPUI's text system by every launch — windowed and headless — so
+/// a family the application names in `font-family` is drawn in that face
+/// rather than in the platform's fallback. Kept, not consumed: a process that
+/// launches more than once registers them with each app.
+static FONTS: Mutex<Vec<std::sync::Arc<Vec<u8>>>> = Mutex::new(Vec::new());
+
+/// Read a font file (TrueType or OpenType) and keep it for every launch.
+/// Errors: the file cannot be read, or it is empty.
+pub fn add_font_file(path: &str) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    if bytes.is_empty() {
+        return Err(format!("{path}: empty"));
+    }
+    take_lock(&FONTS).push(std::sync::Arc::new(bytes));
+    Ok(())
+}
+
+/// The registered fonts' bytes, in registration order.
+pub fn fonts() -> Vec<std::sync::Arc<Vec<u8>>> {
+    take_lock(&FONTS).clone()
+}
+
 /// The registry id of the window `gpui_launch` is opening, from just before
 /// it calls the application's root builder until the loop returns; 0 at
 /// any other time. This is how an application registers resize and state
@@ -1291,5 +1314,22 @@ mod tests {
         reset_windows();
         assert!(take_window_ops().is_empty());
         assert!(!client_decorated());
+    }
+
+    #[test]
+    #[serial]
+    fn test_font_files_are_kept_and_bad_ones_refused() {
+        let before = fonts().len();
+        let dir = std::env::temp_dir().join(format!("gwin-font-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.ttf");
+        std::fs::write(&good, b"not really a font, but bytes").unwrap();
+        let empty = dir.join("empty.ttf");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(add_font_file(good.to_str().unwrap()).is_ok());
+        assert!(add_font_file(empty.to_str().unwrap()).is_err());
+        assert!(add_font_file(dir.join("missing.ttf").to_str().unwrap()).is_err());
+        assert_eq!(fonts().len(), before + 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

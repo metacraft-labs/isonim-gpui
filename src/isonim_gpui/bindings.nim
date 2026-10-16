@@ -490,6 +490,11 @@ proc gpui_notify_window_state*(window_id: uint32; decorations, tiling,
 
 # --- GWIN: identity, minimum size, initial state, title ---
 
+proc gpui_add_font_file*(path: cstring): uint8
+  {.importc: "gpui_add_font_file".}
+  ## Before `gpui_launch`: register a TrueType/OpenType file so `font-family`
+  ## can name its family. 1 on success, 0 if unreadable.
+
 proc gpui_launch_window_id*(): uint32
   {.importc: "gpui_launch_window_id".}
   ## The window `gpui_launch` is opening: valid inside the root builder and

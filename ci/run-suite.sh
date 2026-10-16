@@ -231,7 +231,7 @@ BENCHMARKS=(
 #     configured layout followed, unsupported operations dropped, the
 #     platform convention when none is configured (the cases
 #     `test_window_environment.nim` runs against the Nim helper).
-EXPECTED_CASES=332
+EXPECTED_CASES=333
 
 total_cases=0
 failed_steps=()

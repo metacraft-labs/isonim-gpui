@@ -1168,6 +1168,20 @@ pub extern "C" fn gpui_notify_window_state(
 // GWIN — identity, minimum size, initial state, title
 // ---------------------------------------------------------------------------
 
+/// Register a font file (TrueType/OpenType) for every launch of this process,
+/// so `font-family` can name its family. Returns 1 on success, 0 if the file
+/// cannot be read (the reason is printed to stderr). Call before `gpui_launch`.
+#[no_mangle]
+pub extern "C" fn gpui_add_font_file(path: *const c_char) -> u8 {
+    match window::add_font_file(unsafe { cstr_to_str(path) }) {
+        Ok(()) => 1,
+        Err(e) => {
+            eprintln!("gpui-nim-shim: gpui_add_font_file: {e}");
+            0
+        }
+    }
+}
+
 /// The registry id of the window `gpui_launch` is opening (valid inside the
 /// root builder and while the loop runs), 0 otherwise.
 #[no_mangle]

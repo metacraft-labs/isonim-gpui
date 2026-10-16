@@ -244,6 +244,13 @@ proc setTitle*(win: GpuiWindow; title: string): bool =
   ## Change the window's title; the platform sees it on the next frame.
   gpui_set_window_title(win.id, title.cstring) != 0
 
+proc addFontFile*(path: string): bool =
+  ## Before `gpui_launch`: register a TrueType/OpenType font file for every
+  ## launch of this process, so a `font-family` style can name its family
+  ## (otherwise the platform's fallback face is drawn). False if the file
+  ## cannot be read.
+  gpui_add_font_file(path.cstring) != 0
+
 proc setAppId*(appId: string) =
   ## Before `gpui_launch`: the Wayland `app_id` / X11 `WM_CLASS`. Match the
   ## application's `.desktop` file name so the desktop associates them.

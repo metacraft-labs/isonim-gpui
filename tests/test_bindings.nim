@@ -169,6 +169,7 @@ static:
                                            15.uint8, 0.uint8, 1.uint8,
                                            ":close".cstring))
   assert compiles(gpui_launch_window_id())
+  assert compiles(gpui_add_font_file("font.ttf".cstring))
   assert compiles(gpui_set_app_id("codetracer".cstring))
   assert compiles(gpui_set_min_window_size(1050.0.cdouble, 600.0.cdouble))
   assert compiles(gpui_set_initial_window_state(1.uint8))
