@@ -34,7 +34,7 @@
 
 import std/[json, os, osproc, strutils, unittest]
 import gui_assert/desktop_env
-import gui_assert/desktop_env/sway
+import gui_assert/desktop_env/[gnome, sway]
 
 const
   AppId = "isonim-gpui-frame-test"
@@ -50,8 +50,29 @@ if appBin.len == 0 or not fileExists(appBin):
   quit("test_gui_window_frame: GWIN_APP must name the built window_frame_app " &
        "(run `just test-gui-window-frame`)", 2)
 
-var t: SwayTarget
+var t: TargetEnvironment
 var report: string
+
+let targetName = getEnv("GUIENV_TARGET", "sway")
+
+proc newTarget(): TargetEnvironment =
+  ## The suite runs unchanged on every target; `GUIENV_TARGET` picks one.
+  ## On sway the app is floated by rule, which is what lets sway grant it
+  ## client-side decorations at all; GNOME floats every window.
+  case targetName
+  of "sway": newSwayTarget(1280, 800, floatingAppIds = @[AppId])
+  of "gnome": newGnomeTarget(1280, 800)
+  else: quit("GUIENV_TARGET must be sway or gnome, not " & targetName, 2)
+
+proc applies(fact: string): bool =
+  ## Whether a suite that needs `fact` to hold runs on this target. One that
+  ## does not is reported as not applicable here, by name — never as passing.
+  let t0 = newTarget()
+  t0.start()
+  defer: t0.stop()
+  result = t0.boolFact(fact)
+  if not result:
+    echo "NOT APPLICABLE on ", targetName, ": ", fact, " is false"
 
 proc events(kind: string): seq[JsonNode] =
   if not fileExists(report): return
@@ -87,10 +108,10 @@ proc settledWindow(csd: bool; bar = 0): EnvWindow =
   result = t.window(AppId)
   discard t.captureSettled(result.rect)
 
-suite "GWIN — the client-side frame on sway":
+suite "GWIN — the client-side frame on " & targetName:
 
   setup:
-    t = newSwayTarget(1280, 800, floatingAppIds = @[AppId])
+    t = newTarget()
     t.start()
     report = getTempDir() / ("gwin-frame-" & $getCurrentProcessId() & ".jsonl")
     removeFile(report)
@@ -143,7 +164,7 @@ suite "GWIN — the client-side frame on sway":
       ("top-right", 1.0, 0.0, d, -d, 0, -d, d, d),
       ("bottom-left", 0.0, 1.0, -d, d, -d, 0, d, d)]
     var w = settledWindow(csd = true, bar = BarH)
-    t.command("[app_id=" & AppId & "] move position 300 200")
+    t.placeWindow(w, 300, 200)
     w = settledWindow(csd = true, bar = BarH)
     for c in cases:
       let gx = w.rect.x + (if c.gx == 0.0: 2 elif c.gx == 1.0: w.rect.w - 3
@@ -174,7 +195,7 @@ suite "GWIN — the client-side frame on sway":
 
   test "a drag on the fallback title bar moves the window":
     var w = settledWindow(csd = true, bar = BarH)
-    t.command("[app_id=" & AppId & "] move position 200 150")
+    t.placeWindow(w, 200, 150)
     w = settledWindow(csd = true, bar = BarH)
     let src = (w.rect.x + w.rect.w div 2, w.rect.y + BarH div 2)
     t.pointerMove(src[0], src[1])
@@ -185,8 +206,12 @@ suite "GWIN — the client-side frame on sway":
     t.drag(src + (1, 0), src + (120, 70), steps = 10, stepMs = 30,
            releaseHoldMs = 250, pressHoldMs = -1)
     t.waitUntil("the window moved", proc(): bool = t.window(AppId).rect.x != w.rect.x)
-    check t.window(AppId).rect ==
-          Rect(x: w.rect.x + 119, y: w.rect.y + 70, w: w.rect.w, h: w.rect.h)
+    let after = t.window(AppId).rect
+    # 119 or 120: the move starts on a 1px arming motion, and a compositor
+    # anchors its move grab either at that motion (sway) or at the press
+    # (Mutter), which is a difference between them, not between runs.
+    check after.x - w.rect.x in [119, 120]
+    check (after.y - w.rect.y, after.w, after.h) == (70, w.rect.w, w.rect.h)
 
   test "the fallback title bar's close button is where the desktop wants it":
     # Two layouts, close alone on each side; a click at the other end closes
@@ -215,12 +240,12 @@ suite "GWIN — the client-side frame on sway":
 
   test "a fullscreen window has no frame and no title bar":
     discard settledWindow(csd = true, bar = BarH)
-    t.command("[app_id=" & AppId & "] fullscreen enable")
+    t.setFullscreen(t.window(AppId), true)
     t.waitUntil("the app told it is tiled on every edge", proc(): bool =
       let s = lastOf("state")
       s.kind != JNull and s["tiling"].getInt == 15)
     t.waitUntil("the content filling the output", proc(): bool =
-      contentSize() == (1280, 800))
+      contentSize() == (1280, 800) and t.window(AppId).rect == Rect(x: 0, y: 0, w: 1280, h: 800))
     let w = t.window(AppId)
     check w.rect == Rect(x: 0, y: 0, w: 1280, h: 800)
     let img = t.captureSettled(Rect(x: 0, y: 0, w: 1280, h: 800))
@@ -229,10 +254,11 @@ suite "GWIN — the client-side frame on sway":
     check img.pixel(1279, 400) == Content
     check img.pixel(640, 0) == Content
 
-suite "GWIN — no frame where the compositor decorates":
+if applies("decorations.serverAvailable"):
+ suite "GWIN — no frame where the compositor decorates":
 
   setup:
-    t = newSwayTarget(1280, 800, floatingAppIds = @[AppId])
+    t = newTarget()
     t.start()
     report = getTempDir() / ("gwin-frame-" & $getCurrentProcessId() & ".jsonl")
     removeFile(report)
@@ -304,10 +330,10 @@ proc moveDrag(src: (int, int); delta: (int, int)) =
   t.drag(src + (1, 0), src + delta, steps = 10, stepMs = 30,
          releaseHoldMs = 250, pressHoldMs = -1)
 
-suite "GWIN — window regions on sway":
+suite "GWIN — window regions on " & targetName:
 
   setup:
-    t = newSwayTarget(1280, 800, floatingAppIds = @[AppId])
+    t = newTarget()
     t.start()
     report = getTempDir() / ("gwin-regions-" & $getCurrentProcessId() & ".jsonl")
     removeFile(report)
@@ -319,12 +345,14 @@ suite "GWIN — window regions on sway":
 
   test "a drag on the title bar moves the window, and only that":
     var w = settledWindow(csd = true)
-    t.command("[app_id=" & AppId & "] move position 200 150")
+    t.placeWindow(w, 200, 150)
     w = settledWindow(csd = true)
     moveDrag((w.rect.x + 40, w.rect.y + TitleBarH div 2), (120, 70))
     t.waitUntil("the window moved", proc(): bool = t.window(AppId).rect.x != w.rect.x)
-    let after = t.window(AppId)
-    check after.rect == Rect(x: w.rect.x + 119, y: w.rect.y + 70, w: w.rect.w, h: w.rect.h)
+    let after = t.window(AppId).rect
+    # See "a drag on the fallback title bar": 119 or 120 by the compositor.
+    check after.x - w.rect.x in [119, 120]
+    check (after.y - w.rect.y, after.w, after.h) == (70, w.rect.w, w.rect.h)
 
   test "an application with its own title bar gets no fallback one":
     let w = settledWindow(csd = true)
@@ -375,13 +403,39 @@ suite "GWIN — window regions on sway":
       t.waitUntil("maximized", proc(): bool =
         let s = lastOf("state")
         s.kind != JNull and s["maximized"].getBool)
+      # A maximized window has no frame: the compositor's window is the
+      # content. A second double-click on its title bar restores it.
+      t.waitUntil("the content filling the maximized window", proc(): bool =
+        let m = t.window(AppId)
+        wsMaximized in m.states and contentSize() == (m.rect.w, m.rect.h))
+      let m = t.window(AppId)
+      sleep(800)   # past the double-click interval: a new gesture, not clicks 3 and 4
+      t.doubleClick((m.rect.x + 40, m.rect.y + TitleBarH div 2))
+      # Restored to the size it had, not grown by the frame's band.
+      t.waitUntil("restored to " & $w.rect.w & "x" & $w.rect.h, proc(): bool =
+        let s = lastOf("state")
+        let r = t.window(AppId).rect
+        s.kind != JNull and not s["maximized"].getBool and
+          (r.w, r.h) == (w.rect.w, w.rect.h))
     else:
       sleep(500)
       check t.window(AppId).rect == w.rect
       check not lastOf("state")["maximized"].getBool
 
+  test "the minimize button minimizes where the compositor allows it":
+    let w = settledWindow(csd = true)
+    if not t.boolFact("window.canMinimize"):
+      check "minimize" notin buttonOrder()
+    else:
+      t.configure("buttonLayout", ":minimize,maximize,close")
+      t.waitUntil("a minimize button", proc(): bool = "minimize" in buttonOrder())
+      t.click(buttonCenter(t.window(AppId), "minimize"))
+      if t.boolFact("window.reportsMinimized"):
+        t.waitUntil("minimized", proc(): bool = wsMinimized in t.window(AppId).states)
+
   test "the close button asks onClose, and closes when it agrees":
     let w = settledWindow(csd = true)
+    t.focusWindow(w)
     t.keys("v")   # refuse the next close
     sleep(200)
     t.click(buttonCenter(w, "close"))
@@ -396,6 +450,7 @@ suite "GWIN — window regions on sway":
 
   test "keys toggle fullscreen and close through the imperative operations":
     let w = settledWindow(csd = true)
+    t.focusWindow(w)
     t.requireFacts("window.canFullscreen")
     if t.boolFact("window.canFullscreen"):
       t.keys("f")
@@ -410,10 +465,11 @@ suite "GWIN — window regions on sway":
     check app.peekExitCode == 0
     check events("close-allowed").len == 1
 
-suite "GWIN — window regions where the compositor decorates":
+if applies("decorations.serverAvailable"):
+ suite "GWIN — window regions where the compositor decorates":
 
   setup:
-    t = newSwayTarget(1280, 800, floatingAppIds = @[AppId])
+    t = newTarget()
     t.start()
     report = getTempDir() / ("gwin-regions-" & $getCurrentProcessId() & ".jsonl")
     removeFile(report)

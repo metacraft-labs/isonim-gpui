@@ -6,8 +6,11 @@
 #      pinned to it; the shell's LD_LIBRARY_PATH (the GPU and Wayland
 #      libraries the shim links) is recorded.
 #   2. In GuiAssert's dev shell (`$GUI_ASSERT_DIR`, default ../GuiAssert),
-#      which pins sway and its session stack: `tests/test_gui_window_frame.nim`,
-#      which spawns the app with that library path.
+#      which pins the compositors and their session stack:
+#      `tests/test_gui_window_frame.nim`, which spawns the app with that
+#      library path, once per target in `$GUIENV_TARGETS` (default
+#      `sway gnome`: headless sway, then headless GNOME Shell). The suite is
+#      the same on each; its expectations come from each target's facts.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 guiassert="$(cd "${GUI_ASSERT_DIR:-$root/../GuiAssert}" && pwd)"
@@ -24,8 +27,15 @@ libs="$root/build/window-frame-app.ld-path"
 		--nimcache:'$root/nimcache/window_frame_app' \
 		-o:'$root/build/window_frame_app' tests/gui/window_frame_app.nim
 	printf '%s' \"\$LD_LIBRARY_PATH\" > '$libs'")
-(cd "$guiassert" && GWIN_APP="$root/build/window_frame_app" \
-	GWIN_APP_LD_LIBRARY_PATH="$(cat "$libs")" nix develop --command \
-	nim c -r --hints:off --warnings:off --path:src \
+(cd "$guiassert" && nix develop --command \
+	nim c --hints:off --warnings:off --path:src \
 	--nimcache:"$root/nimcache/test_gui_window_frame" \
 	-o:"$root/build/test_gui_window_frame" "$root/tests/test_gui_window_frame.nim")
+status=0
+for target in ${GUIENV_TARGETS:-sway gnome}; do
+	echo "=== window-frame suite on $target"
+	(cd "$guiassert" && GUIENV_TARGET="$target" GWIN_APP="$root/build/window_frame_app" \
+		GWIN_APP_LD_LIBRARY_PATH="$(cat "$libs")" nix develop --command \
+		"$root/build/test_gui_window_frame") || status=1
+done
+exit $status

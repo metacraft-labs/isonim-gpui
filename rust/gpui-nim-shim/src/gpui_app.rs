@@ -87,16 +87,21 @@ pub struct NimRootView {
     /// has floated it.
     decorations_rerequested: bool,
 
-    /// GWIN: the content size `gpui_launch` asked for, and whether it has
-    /// been honoured under client-side decorations. GPUI opens a window
-    /// whose WHOLE size — band included — is the launch size, so once the
-    /// window is framed its content is smaller by the band than the
-    /// application asked for (measured on GNOME: 620x380 for 640x400). On
-    /// the first framed frame once the window is active, the window is
-    /// grown by the band, once; a resize the user makes later is never
-    /// undone.
-    launch_size: Option<(f32, f32)>,
-    launch_size_honoured: bool,
+    /// GWIN: the launch size is the CONTENT's. GPUI opens a window whose
+    /// whole size, band included, is the size it is given, so a window that
+    /// is to draw its own decorations is created larger by the band (see
+    /// `launch_gpui_app`), before the compositor has seen any size. When the
+    /// compositor then grants server-side decorations instead, the first
+    /// frame shrinks it back — still before the first commit. This holds the
+    /// launch size; `None` once that first frame has run, or when nothing
+    /// was added. It is pending until the decoration mode is known (see
+    /// `sync_window_registry`).
+    ///
+    /// Correcting the size any later does not work: measured on headless
+    /// GNOME Shell 49, a resize after the window was mapped changed GPUI's
+    /// surface (660x420) while Mutter kept the geometry it had mapped
+    /// (620x380), and the content overran the frame.
+    pub launch_inflated: Option<(f32, f32)>,
 
     /// GWIN: the fallback title bar's height this frame — `regions::
     /// FALLBACK_BAR_HEIGHT` while the application draws the decorations, is
@@ -114,8 +119,7 @@ impl NimRootView {
             layout_reported: std::rc::Rc::new(std::cell::Cell::new(false)),
             frame: crate::frame::FrameGeometry::new(false, 0, false, 0.0, 0.0),
             decorations_rerequested: false,
-            launch_size: None,
-            launch_size_honoured: false,
+            launch_inflated: None,
             title_bar: 0.0,
         }
     }
@@ -162,13 +166,21 @@ impl NimRootView {
         if let Some(title) = window::take_pending_title() {
             window.set_window_title(&title);
         }
-        if self.launch_size.is_none() {
-            // Before the first notification the registry still holds the
-            // size the window was created with.
-            self.launch_size =
-                window::window_size(win_id).map(|(w, h)| (w as f32, h as f32));
-        }
         let chrome = sample_chrome_state(window, cx, self.layout_reported.get());
+        // Pending until the decoration mode is known: GPUI's first frames
+        // show its provisional client mode, and a compositor's answer comes a
+        // frame or more later (measured on sway: one frame).
+        if let Some((lw, lh)) = self.launch_inflated {
+            if chrome.decorations == window::DECORATIONS_SERVER {
+                // The band added at creation is not needed after all.
+                self.launch_inflated = None;
+                window.resize(size(px(lw), px(lh)));
+            } else if chrome.active {
+                // Mapped, focused and still client-decorated: the mode is
+                // settled and the band is in use.
+                self.launch_inflated = None;
+            }
+        }
         if !self.decorations_rerequested
             && window::requested_decorations() == Some(window::DECORATIONS_CLIENT)
             && chrome.decorations == window::DECORATIONS_SERVER
@@ -189,22 +201,20 @@ impl NimRootView {
             f32::from(viewport.width),
             f32::from(viewport.height),
         );
-        window.set_client_inset(px(self.frame.client_inset()));
+        // The band GPUI reserves is constant under client-side decorations:
+        // GPUI itself leaves it out on tiled edges (a maximized window is
+        // tiled on all four), and it computes a restored window's geometry
+        // from the inset in force at that moment. An inset dropped to 0 while
+        // maximized made each maximize-restore cycle grow the window by the
+        // band (measured on GNOME: 640x400 restored as 660x420).
+        window.set_client_inset(px(
+            if chrome.decorations == window::DECORATIONS_CLIENT {
+                crate::frame::FRAME_INSET
+            } else {
+                0.0
+            },
+        ));
         window::set_client_decorated(chrome.decorations == window::DECORATIONS_CLIENT);
-        // Once ACTIVE: the compositor's configure that activates the window
-        // carries the size it knew at map time, and a resize made before it
-        // is overwritten by it (measured on GNOME: grown to 640x400, then
-        // configured back to 620x380).
-        if self.frame.is_framed() && chrome.active && !self.launch_size_honoured {
-            self.launch_size_honoured = true;
-            if let Some((lw, lh)) = self.launch_size {
-                let (cw, ch) = self.frame.content_size();
-                if chrome.tiling == 0 && !chrome.maximized && (cw < lw || ch < lh) {
-                    let f = &self.frame;
-                    window.resize(size(px(lw + f.left + f.right), px(lh + f.top + f.bottom)));
-                }
-            }
-        }
         let client = chrome.decorations == window::DECORATIONS_CLIENT;
         let has_drag_region = {
             let tree = crate::lock_tree();
@@ -748,7 +758,11 @@ fn drag_region(el: Div) -> Div {
         if regions::claimed() || !window::client_decorated() {
             return;
         }
-        if event.click_count >= 2 {
+        // Exactly the second click: a quick third and fourth click must not
+        // toggle maximize again (measured on GNOME: a double-click soon after
+        // another arrived as counts 3 and 4, and maximized-then-restored in
+        // one gesture).
+        if event.click_count == 2 {
             regions::disarm_move();
             window.zoom_window();
         } else {
@@ -1410,6 +1424,7 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
         // application asked for. A maximized window keeps the launch size as
         // its restore size.
         let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
+        let maximized = options.maximized;
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(if options.maximized {
@@ -1428,7 +1443,29 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
                 window_decorations: decorations,
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| NimRootView::new()),
+            move |window, cx| {
+                // GWIN: a window GPUI expects to decorate itself (on Wayland
+                // that is its state until the compositor answers) is created
+                // larger by the frame's band, so that its content is the
+                // launch size from the first commit on. See
+                // `NimRootView::launch_inflated`. A maximized launch keeps the
+                // size it was given: the compositor sizes it.
+                let inflated = if !maximized
+                    && matches!(window.window_decorations(), Decorations::Client { .. })
+                {
+                    let band = crate::frame::FRAME_INSET;
+                    window.set_client_inset(px(band));
+                    window.resize(size(px(w + 2.0 * band), px(h + 2.0 * band)));
+                    Some((w, h))
+                } else {
+                    None
+                };
+                cx.new(|_| {
+                    let mut view = NimRootView::new();
+                    view.launch_inflated = inflated;
+                    view
+                })
+            },
         )
         .expect("Failed to open GPUI window");
 
