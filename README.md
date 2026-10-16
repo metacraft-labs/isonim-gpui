@@ -86,6 +86,49 @@ LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} \
 > Window mode requires a running X11 or Wayland display. For headless CI
 > environments, use the Xvfb wrapper (see Testing below).
 
+## Windows on every desktop
+
+Some desktops draw a window's frame, and some leave it to the application.
+GNOME on Wayland is the common case of the second kind. isonim-gpui handles
+both, so an application gets a normal window everywhere without code per
+desktop.
+
+- **The frame.** When the application is expected to decorate its own
+  window, the renderer draws a border and a shadow around it, with resize
+  edges and corners that show resize cursors. No frame is drawn where the
+  desktop provides one, or where the window is maximized, tiled or
+  fullscreen. Colour the frame with `data-isonim-window-border` and
+  `data-isonim-window-shadow` on the root element. Pointer positions are
+  always the content's, and the launch size is the content's size.
+- **A title bar of your own.** Mark elements with
+  `data-window-region` (`windowRegionAttribute`):
+  - `drag` moves the window, toggles maximize on a double-click and opens
+    the window menu on a right-click;
+  - `no-drag` keeps a press for the application, as does any element that
+    listens for the pointer;
+  - `minimize`, `maximize` and `close` act on a click.
+
+  `windowEnvironment(launchWindow())` (`isonim_gpui/window_environment`)
+  says whether to draw the title bar and which buttons the platform
+  supports, and gives the side and order the desktop is configured for.
+  Re-read it in `onWindowState`.
+- **Or none.** An application that declares no `drag` region gets a 32px
+  title bar from the renderer, with the window title and the desktop's
+  buttons (`data-isonim-titlebar-background` / `-foreground` colour it).
+- **Window operations** for menus and key bindings: `minimize`,
+  `toggleMaximize`, `toggleFullscreen` and `requestClose`. Closing, by any
+  route including the desktop's own, asks `onClose` first.
+- **Identity and size.** Call these before `gpui_launch`: `setAppId` (match
+  your `.desktop` file), `setMinWindowSize` and `setInitialWindowState`.
+  `setTitle` changes the title at any time. `onResize` reports every
+  content-size change before the frame at that size is drawn.
+- **`ISONIM_GPUI_DECORATIONS=client|server`** overrides the decoration mode
+  the window asks for.
+
+`just test-gui-window-frame` checks all of this on two real compositors,
+headless sway and headless GNOME Shell, using GuiAssert's desktop
+targets (`../GuiAssert`).
+
 ## Testing
 
 ### Nim tests
