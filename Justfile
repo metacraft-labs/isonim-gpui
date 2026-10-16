@@ -106,6 +106,13 @@ test-reactive-root:
 test-reconciler:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src -d:isonimHmr --nimcache:nimcache/test_gpui_reconciler tests/test_gpui_reconciler_identity.nim
 
+# The client-side window frame on a REAL compositor: GuiAssert's headless
+# sway target drives `tests/gui/window_frame_app.nim` (built here against the
+# windowed shim) and checks the frame, the resize zones and the content
+# coordinates against what sway reports. Linux; needs ../GuiAssert.
+test-gui-window-frame:
+    bash scripts/run-window-frame-suite.sh
+
 test-all: check-exported-symbols rust-test test test-cross test-integration test-structural test-reactive-root test-reconciler
 
 # Run the GUI tests, including the windowed pixel case, under headless

@@ -214,7 +214,15 @@ BENCHMARKS=(
 #   * bindings stays one checkpoint, but it was RED before this change:
 #     76b2a2c declared `gpui_write_clipboard` / `gpui_clipboard_text` and
 #     `test_bindings` never exercised them. Both are now covered there.
-EXPECTED_CASES=318
+# GWIN-M2, 2026-10-16, written LAST and from a run (trap 4c): 324.
+#   * rust 167 -> 173: `frame`'s five geometry tests (no frame under
+#     server-side decorations, a band on every untiled side, none when
+#     maximized, none on a tiled side, every edge and corner found where it
+#     is with corners winning) and `window`'s content-origin round trip.
+#   The frame's own window suite (`tests/test_gui_window_frame.nim`) needs a
+#   compositor and GuiAssert and is NOT in this total; its home is
+#   `just test-gui-window-frame`.
+EXPECTED_CASES=324
 
 total_cases=0
 failed_steps=()

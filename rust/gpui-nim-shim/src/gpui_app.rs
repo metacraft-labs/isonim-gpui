@@ -76,6 +76,27 @@ pub struct NimRootView {
     /// GWIN: set once GPUI has told the window the desktop's button
     /// layout changed. See `desktop_button_layout`.
     layout_reported: std::rc::Rc<std::cell::Cell<bool>>,
+
+    /// GWIN: the window's frame for the frame being built (see `frame.rs`).
+    frame: crate::frame::FrameGeometry,
+
+    /// GWIN: whether the launch's client-side decoration request has been
+    /// repeated now that the window is mapped. Sway grants a client-side
+    /// request only for a window that is floating when it asks (measured,
+    /// sway 1.11), and GPUI asks once, at creation, before any window rule
+    /// has floated it.
+    decorations_rerequested: bool,
+
+    /// GWIN: the content size `gpui_launch` asked for, and whether it has
+    /// been honoured under client-side decorations. GPUI opens a window
+    /// whose WHOLE size — band included — is the launch size, so once the
+    /// window is framed its content is smaller by the band than the
+    /// application asked for (measured on GNOME: 620x380 for 640x400). On
+    /// the first framed frame once the window is active, the window is
+    /// grown by the band, once; a resize the user makes later is never
+    /// undone.
+    launch_size: Option<(f32, f32)>,
+    launch_size_honoured: bool,
 }
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
@@ -86,6 +107,10 @@ impl NimRootView {
             focus_handle: None,
             chrome_observers: Vec::new(),
             layout_reported: std::rc::Rc::new(std::cell::Cell::new(false)),
+            frame: crate::frame::FrameGeometry::new(false, 0, false, 0.0, 0.0),
+            decorations_rerequested: false,
+            launch_size: None,
+            launch_size_honoured: false,
         }
     }
 
@@ -123,13 +148,56 @@ impl NimRootView {
         if let Some(title) = window::take_pending_title() {
             window.set_window_title(&title);
         }
-        window::update_chrome_state(
-            win_id,
-            sample_chrome_state(window, cx, self.layout_reported.get()),
-        );
+        if self.launch_size.is_none() {
+            // Before the first notification the registry still holds the
+            // size the window was created with.
+            self.launch_size =
+                window::window_size(win_id).map(|(w, h)| (w as f32, h as f32));
+        }
+        let chrome = sample_chrome_state(window, cx, self.layout_reported.get());
+        if !self.decorations_rerequested
+            && window::requested_decorations() == Some(window::DECORATIONS_CLIENT)
+            && chrome.decorations == window::DECORATIONS_SERVER
+        {
+            self.decorations_rerequested = true;
+            window.request_decorations(WindowDecorations::Client);
+        }
 
+        // The frame for this frame: a band on every untiled side when the
+        // application draws the decorations. GPUI is told the band so the
+        // compositor's window geometry is the content, and pointer
+        // positions are translated by the content's origin.
         let viewport = window.viewport_size();
-        let size = (f64::from(viewport.width), f64::from(viewport.height));
+        self.frame = crate::frame::FrameGeometry::new(
+            chrome.decorations == window::DECORATIONS_CLIENT,
+            chrome.tiling,
+            chrome.maximized,
+            f32::from(viewport.width),
+            f32::from(viewport.height),
+        );
+        window.set_client_inset(px(self.frame.client_inset()));
+        // Once ACTIVE: the compositor's configure that activates the window
+        // carries the size it knew at map time, and a resize made before it
+        // is overwritten by it (measured on GNOME: grown to 640x400, then
+        // configured back to 620x380).
+        if self.frame.is_framed() && chrome.active && !self.launch_size_honoured {
+            self.launch_size_honoured = true;
+            if let Some((lw, lh)) = self.launch_size {
+                let (cw, ch) = self.frame.content_size();
+                if chrome.tiling == 0 && !chrome.maximized && (cw < lw || ch < lh) {
+                    let f = &self.frame;
+                    window.resize(size(px(lw + f.left + f.right), px(lh + f.top + f.bottom)));
+                }
+            }
+        }
+        let (ox, oy) = self.frame.content_origin();
+        window::set_content_origin(ox, oy);
+        window::update_chrome_state(win_id, chrome);
+
+        // The application is told its CONTENT size, which is the window
+        // the compositor reports.
+        let (cw, ch) = self.frame.content_size();
+        let size = (cw as f64, ch as f64);
         if window::window_size(win_id) != Some(size) {
             window::notify_resize(win_id, size.0, size.1);
         }
@@ -266,7 +334,16 @@ impl Render for NimRootView {
         match crate::render_sync::build_render_plan(&tree, root_id) {
             Some(plan) => {
                 drop(tree); // release lock before building GPUI elements
-                let element = render_root_to_gpui(&plan, &handle);
+                let element = if self.frame.is_framed() {
+                    frame_client_window(
+                        render_plan_to_gpui(&plan),
+                        &self.frame,
+                        FrameColors::of(&plan, window.is_window_active()),
+                        &handle,
+                    )
+                } else {
+                    render_root_to_gpui(&plan, &handle)
+                };
                 // PLAT-42: the render-path half of the frame budget. GPUI's
                 // layout and paint follow and are not in this number.
                 crate::frame_stats::complete_frame(started.elapsed().as_nanos() as u64);
@@ -350,6 +427,111 @@ pub fn render_root_to_gpui(
             .child(render_plan_to_gpui(plan))
             .into_any_element(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// GWIN: the client-side frame (geometry in `frame.rs`)
+// ---------------------------------------------------------------------------
+
+/// The frame's colours: the application's, from attributes on its root
+/// element, or neutral defaults. A shadow is dimmed while the window is
+/// inactive, as desktops do to show which window has focus.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct FrameColors {
+    pub border: Hsla,
+    pub shadow: Hsla,
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl FrameColors {
+    pub fn of(plan: &crate::render_sync::RenderNode, active: bool) -> Self {
+        let pick = |name: &str, default: &str| {
+            plan.attributes
+                .get(name)
+                .and_then(|v| parse_color(v))
+                .or_else(|| parse_color(default))
+                .unwrap_or_default()
+        };
+        let mut shadow = pick("data-isonim-window-shadow", "#00000066");
+        if !active {
+            shadow.a *= 0.5;
+        }
+        FrameColors {
+            border: pick("data-isonim-window-border", "#00000040"),
+            shadow,
+        }
+    }
+}
+
+/// Wrap the application's root in the client-side frame: a transparent
+/// backdrop with a band on every untiled side, the content inside it with a
+/// border and a shadow, and the resize zones on top.
+///
+/// The keyboard is attached to the backdrop, so the whole window remains the
+/// key target. The resize zones occlude what is under them: a press there
+/// resizes and does not reach the application.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn frame_client_window(
+    content: AnyElement,
+    frame: &crate::frame::FrameGeometry,
+    colors: FrameColors,
+    handle: &gpui::FocusHandle,
+) -> AnyElement {
+    use crate::frame::{Edge, FRAME_BORDER};
+    use gpui::{BoxShadow, CursorStyle, ResizeEdge};
+    let (cw, ch) = frame.content_size();
+    let side = |band: f32| if band > 0.0 { band - FRAME_BORDER } else { 0.0 };
+    let border = |band: f32| if band > 0.0 { FRAME_BORDER } else { 0.0 };
+    let body = div()
+        .w(px(cw + border(frame.left) + border(frame.right)))
+        .h(px(ch + border(frame.top) + border(frame.bottom)))
+        .border_color(colors.border)
+        .border_l(px(border(frame.left)))
+        .border_t(px(border(frame.top)))
+        .border_r(px(border(frame.right)))
+        .border_b(px(border(frame.bottom)))
+        .shadow(vec![BoxShadow::new(px(0.), px(0.), colors.shadow)
+            .blur_radius(px(crate::frame::FRAME_INSET / 2.0))])
+        .overflow_hidden()
+        .child(div().w(px(cw)).h(px(ch)).child(content));
+    let mut backdrop = div()
+        .size_full()
+        .pl(px(side(frame.left)))
+        .pt(px(side(frame.top)))
+        .pr(px(side(frame.right)))
+        .pb(px(side(frame.bottom)))
+        .child(body);
+    // GPUI hit-tests the LAST child on top, and `resize_zones` lists the
+    // corners first (they win where they overlap an edge), so the zones are
+    // added in reverse. Added in order, an edge's zone covered its corners:
+    // a corner drag on sway resized along one axis only (measured).
+    for (edge, zone) in frame.resize_zones().into_iter().rev() {
+        let (cursor, resize) = match edge {
+            Edge::Top => (CursorStyle::ResizeUpDown, ResizeEdge::Top),
+            Edge::Bottom => (CursorStyle::ResizeUpDown, ResizeEdge::Bottom),
+            Edge::Left => (CursorStyle::ResizeLeftRight, ResizeEdge::Left),
+            Edge::Right => (CursorStyle::ResizeLeftRight, ResizeEdge::Right),
+            Edge::TopLeft => (CursorStyle::ResizeUpLeftDownRight, ResizeEdge::TopLeft),
+            Edge::BottomRight => (CursorStyle::ResizeUpLeftDownRight, ResizeEdge::BottomRight),
+            Edge::TopRight => (CursorStyle::ResizeUpRightDownLeft, ResizeEdge::TopRight),
+            Edge::BottomLeft => (CursorStyle::ResizeUpRightDownLeft, ResizeEdge::BottomLeft),
+        };
+        backdrop = backdrop.child(
+            div()
+                .absolute()
+                .left(px(zone.x))
+                .top(px(zone.y))
+                .w(px(zone.w))
+                .h(px(zone.h))
+                .cursor(cursor)
+                .occlude()
+                .on_mouse_down(MouseButton::Left, move |_e, window, cx| {
+                    cx.stop_propagation();
+                    window.start_window_resize(resize);
+                }),
+        );
+    }
+    with_keyboard(backdrop, handle).into_any_element()
 }
 
 // ---------------------------------------------------------------------------
@@ -942,19 +1124,21 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
 
     let title_owned = title.to_string();
     let options = window::take_launch_options();
-    let decorations = match window::decorations_override(
+    let requested = window::decorations_override(
         std::env::var("ISONIM_GPUI_DECORATIONS").ok().as_deref(),
-    ) {
-        Ok(Some(window::DECORATIONS_CLIENT)) => Some(WindowDecorations::Client),
-        Ok(Some(_)) => Some(WindowDecorations::Server),
-        Ok(None) => None,
-        Err(value) => {
-            eprintln!(
-                "gpui-nim-shim: ignoring ISONIM_GPUI_DECORATIONS={value:?} \
-                 (expected \"client\" or \"server\")"
-            );
-            None
-        }
+    )
+    .unwrap_or_else(|value| {
+        eprintln!(
+            "gpui-nim-shim: ignoring ISONIM_GPUI_DECORATIONS={value:?} \
+             (expected \"client\" or \"server\")"
+        );
+        None
+    });
+    window::set_requested_decorations(requested);
+    let decorations = match requested {
+        Some(window::DECORATIONS_CLIENT) => Some(WindowDecorations::Client),
+        Some(_) => Some(WindowDecorations::Server),
+        None => None,
     };
     let w = width as f32;
     let h = height as f32;

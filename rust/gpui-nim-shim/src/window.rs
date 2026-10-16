@@ -347,6 +347,42 @@ pub fn take_pending_title() -> Option<String> {
     take_lock(&PENDING_TITLE).take()
 }
 
+/// GWIN — where the application's content starts inside the platform
+/// window: the frame's band on the left and top when the renderer draws the
+/// decorations, (0, 0) otherwise. Written by the render path every frame;
+/// read by `input::deliver_pointer`, which translates every pointer position
+/// by it so the application only ever sees content coordinates. Two `f32`s
+/// packed in one atomic so a reader never sees half of an update.
+static CONTENT_ORIGIN: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_content_origin(x: f32, y: f32) {
+    CONTENT_ORIGIN.store(
+        ((x.to_bits() as u64) << 32) | y.to_bits() as u64,
+        Ordering::Release,
+    );
+}
+
+pub fn content_origin() -> (f32, f32) {
+    let v = CONTENT_ORIGIN.load(Ordering::Acquire);
+    (f32::from_bits((v >> 32) as u32), f32::from_bits(v as u32))
+}
+
+/// The decoration mode the launched window asked for (`decorations_override`
+/// at launch): `None` when the compositor was left to choose. The render path
+/// asks again once the window is mapped — see `NimRootView::sync_window_registry`.
+static REQUESTED_DECORATIONS: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_requested_decorations(mode: Option<u8>) {
+    REQUESTED_DECORATIONS.store(mode.map_or(0, |m| m as u32 + 1), Ordering::Release);
+}
+
+pub fn requested_decorations() -> Option<u8> {
+    match REQUESTED_DECORATIONS.load(Ordering::Acquire) {
+        0 => None,
+        v => Some((v - 1) as u8),
+    }
+}
+
 /// The registry id of the window `gpui_launch` is opening, from just before
 /// it calls the application's root builder until the loop returns; 0 at
 /// any other time. This is how an application registers resize and state
@@ -662,6 +698,8 @@ pub fn reset_windows() {
     set_tick(0, None);
     *take_lock(&LAUNCH_OPTIONS) = LaunchOptions::default();
     *take_lock(&PENDING_TITLE) = None;
+    set_content_origin(0.0, 0.0);
+    set_requested_decorations(None);
 }
 
 #[cfg(test)]
@@ -1178,5 +1216,21 @@ mod tests {
             GPUI_FALLBACK_BUTTON_LAYOUT,
             format_button_layout(&[], &["minimize", "maximize", "close"])
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_content_origin_round_trips_and_resets() {
+        reset_windows();
+        assert_eq!(content_origin(), (0.0, 0.0));
+        set_content_origin(10.0, 10.5);
+        assert_eq!(content_origin(), (10.0, 10.5));
+        set_requested_decorations(Some(DECORATIONS_CLIENT));
+        assert_eq!(requested_decorations(), Some(DECORATIONS_CLIENT));
+        set_requested_decorations(Some(DECORATIONS_SERVER));
+        assert_eq!(requested_decorations(), Some(DECORATIONS_SERVER));
+        reset_windows();
+        assert_eq!(content_origin(), (0.0, 0.0));
+        assert_eq!(requested_decorations(), None);
     }
 }

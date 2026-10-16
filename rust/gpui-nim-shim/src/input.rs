@@ -304,6 +304,12 @@ pub fn deliver_pointer(
     delta: Option<(f32, f32)>,
     modifiers: u32,
 ) -> u32 {
+    // GWIN: positions are the CONTENT's, not the platform window's. When
+    // the renderer draws a frame around the content (client-side
+    // decorations) the window is larger than the content by the frame's
+    // band, and an application that hit-tests its own layout must not see it.
+    let (ox, oy) = crate::window::content_origin();
+    let (x, y) = (x - ox, y - oy);
     let key = match delta {
         Some((dx, dy)) => format!("{:.1},{:.1},{:.1},{:.1}", x, y, dx, dy),
         None => format!("{:.1},{:.1}", x, y),
