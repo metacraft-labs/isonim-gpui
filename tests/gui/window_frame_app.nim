@@ -15,7 +15,9 @@
 ##                  so a suite can find the border on a black desktop
 ##   GWIN_TITLEBAR_BG  the renderer's fallback title bar colour
 ##                  (`data-isonim-titlebar-background`)
-##   GWIN_REGIONS   `1`: also draw a title bar out of window regions — see
+##   GWIN_REGIONS   `grant`: that title bar, but its strip is a drag region
+##                  only while client-side decorations are in force (as
+##                  CodeTracer's is); `1`: also draw a title bar out of window regions — see
 ##                  `buildTitleBar` — and act on keys: m minimize, x toggle
 ##                  maximize, f toggle fullscreen, q close, v refuse the next
 ##                  close (`onClose` returns false once)
@@ -142,11 +144,16 @@ proc build(root: GpuiElement) {.cdecl.} =
   # The size it opens at: a window the compositor never resizes (server-side
   # decorations, launch size kept) is never told one otherwise.
   emit(%*{"event": "resize", "w": win.width, "h": win.height})
-  let regions = getEnv("GWIN_REGIONS") == "1"
+  let mode = getEnv("GWIN_REGIONS")
+  let built = mode in ["1", "grant"]
   win.onWindowState(proc() =
     emit(stateOf(win))
-    if regions: r.layoutButtons(win))
-  if regions: r.buildTitleBar(root, win)
+    if built:
+      if mode == "grant":
+        if win.clientDecorated: r.setAttribute(titleBar, windowRegionAttribute, $wrDrag)
+        else: r.removeAttribute(titleBar, windowRegionAttribute)
+      r.layoutButtons(win))
+  if built: r.buildTitleBar(root, win)
 
 when isMainModule:
   if reportPath.len == 0:

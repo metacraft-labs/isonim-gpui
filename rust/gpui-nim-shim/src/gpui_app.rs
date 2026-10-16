@@ -216,6 +216,13 @@ impl NimRootView {
         ));
         window::set_client_decorated(chrome.decorations == window::DECORATIONS_CLIENT);
         let client = chrome.decorations == window::DECORATIONS_CLIENT;
+        // The application hears about the new state FIRST: it may answer a
+        // grant of client-side decorations by declaring its own title bar,
+        // and the fallback bar is decided from the tree as it stands after
+        // that. Decided before, an application that does so got one frame of
+        // the fallback bar and two spurious resizes at every grant (measured
+        // with CodeTracer on sway: 1280x800 -> 1260x748 -> 1280x800).
+        window::update_chrome_state(win_id, chrome);
         let has_drag_region = {
             let tree = crate::lock_tree();
             let root = *crate::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
@@ -228,7 +235,6 @@ impl NimRootView {
         };
         let (ox, oy) = self.frame.content_origin();
         window::set_content_origin(ox, oy + self.title_bar);
-        window::update_chrome_state(win_id, chrome);
 
         // The application is told its CONTENT size: the window the
         // compositor reports, less the fallback title bar if one is drawn.

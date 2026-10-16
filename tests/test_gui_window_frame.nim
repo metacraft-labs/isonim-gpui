@@ -354,6 +354,28 @@ suite "GWIN — window regions on " & targetName:
     check after.x - w.rect.x in [119, 120]
     check (after.y - w.rect.y, after.w, after.h) == (70, w.rect.w, w.rect.h)
 
+  test "a title bar declared when decorations are granted: no fallback frame":
+    # The app below builds its drag region only once it is told it draws the
+    # decorations. Had the renderer decided on its fallback bar before
+    # telling the app, the app would once be told a content size short by
+    # the bar's height.
+    t.stop()
+    t = newTarget()
+    t.start()
+    removeFile(report)
+    app = t.spawn(@[appBin], extraEnv = [
+      ("GWIN_REPORT", report), ("GWIN_REGIONS", "grant"),
+      ("ISONIM_GPUI_DECORATIONS", "client"), ("LD_LIBRARY_PATH", appLibs)])
+    let w = settledWindow(csd = true)
+    check t.captureSettled(w.rect).pixel(40, 5) == (0x22'u8, 0x44'u8, 0x66'u8)
+    # A frame decided before the app answered is a size short by exactly
+    # the bar: measured without the fix, 620x348 beside 620x380.
+    var heights: seq[int]
+    for r in events("resize"): heights.add int(r["h"].getFloat)
+    checkpoint "heights told: " & $heights
+    for h in heights:
+      check h + BarH notin heights
+
   test "an application with its own title bar gets no fallback one":
     let w = settledWindow(csd = true)
     let img = t.captureSettled(w.rect)
