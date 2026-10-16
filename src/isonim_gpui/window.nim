@@ -259,6 +259,43 @@ proc setInitialWindowState*(maximized: bool) =
   ## application's; the renderer only carries it out.
   gpui_set_initial_window_state(uint8(maximized))
 
+# ---------------------------------------------------------------------------
+# GWIN — window operations and window regions
+# ---------------------------------------------------------------------------
+#
+# A title bar is declared, not programmed: give elements the attribute
+# `windowRegionAttribute` with one of the `WindowRegion` values and the
+# renderer moves, maximizes, minimizes and closes the window for presses on
+# them (a drag region acts only while the application draws the decorations;
+# see `clientDecorated`). These procs are for the same operations from a menu
+# entry or a key binding. They act on the launched window on its next frame.
+
+const windowRegionAttribute* = "data-window-region"
+
+type
+  WindowRegion* = enum
+    wrDrag = "drag"            ## moves the window; double-click maximizes;
+                               ## right-click opens the window menu
+    wrNoDrag = "no-drag"       ## the application's, inside or over a drag region
+    wrMinimize = "minimize"    ## a click minimizes
+    wrMaximize = "maximize"    ## a click toggles maximize
+    wrClose = "close"          ## a click closes, asking `onClose` first
+
+proc minimize*(win: GpuiWindow) =
+  ## Minimize the window, where the platform supports it
+  ## (`wcMinimize in win.supportedControls`).
+  gpui_window_minimize()
+
+proc toggleMaximize*(win: GpuiWindow) =
+  gpui_window_toggle_maximize()
+
+proc toggleFullscreen*(win: GpuiWindow) =
+  gpui_window_toggle_fullscreen()
+
+proc requestClose*(win: GpuiWindow) =
+  ## Close the window as its close button would: `onClose` decides.
+  gpui_window_request_close()
+
 proc requestRepaint*() =
   ## Request a repaint of the active window. Call this after modifying
   ## the shadow tree to trigger a re-render on the next frame.

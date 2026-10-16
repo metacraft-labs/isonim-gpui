@@ -173,6 +173,10 @@ static:
   assert compiles(gpui_set_min_window_size(1050.0.cdouble, 600.0.cdouble))
   assert compiles(gpui_set_initial_window_state(1.uint8))
   assert compiles(gpui_set_window_title(1.uint32, "title".cstring))
+  assert compiles(gpui_window_minimize())
+  assert compiles(gpui_window_toggle_maximize())
+  assert compiles(gpui_window_toggle_fullscreen())
+  assert compiles(gpui_window_request_close())
 
   # --- PLAT-50: the system clipboard (`clipboard.rs`) ---
   var clip: array[16, char]

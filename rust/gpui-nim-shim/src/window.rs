@@ -367,6 +367,44 @@ pub fn content_origin() -> (f32, f32) {
     (f32::from_bits((v >> 32) as u32), f32::from_bits(v as u32))
 }
 
+/// GWIN — whether the launched window is client-decorated this frame, the
+/// condition under which drag regions act (`regions`). Written by the render
+/// path every frame.
+static CLIENT_DECORATED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_client_decorated(on: bool) {
+    CLIENT_DECORATED.store(on, Ordering::Release);
+}
+
+pub fn client_decorated() -> bool {
+    CLIENT_DECORATED.load(Ordering::Acquire)
+}
+
+/// GWIN — window operations requested from outside a title-bar press (a
+/// menu entry, a key binding): latched here from any thread and carried out
+/// on the next frame, where the platform window is in hand. Move and resize
+/// are not among them: the compositor accepts those only inside the press
+/// that starts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowOp {
+    Minimize,
+    ToggleMaximize,
+    ToggleFullscreen,
+    Close,
+}
+
+static PENDING_OPS: Mutex<Vec<WindowOp>> = Mutex::new(Vec::new());
+
+pub fn request_window_op(op: WindowOp) {
+    take_lock(&PENDING_OPS).push(op);
+    request_repaint();
+}
+
+/// The operations requested since the last frame, in request order.
+pub fn take_window_ops() -> Vec<WindowOp> {
+    std::mem::take(&mut *take_lock(&PENDING_OPS))
+}
+
 /// The decoration mode the launched window asked for (`decorations_override`
 /// at launch): `None` when the compositor was left to choose. The render path
 /// asks again once the window is mapped — see `NimRootView::sync_window_registry`.
@@ -700,6 +738,8 @@ pub fn reset_windows() {
     *take_lock(&PENDING_TITLE) = None;
     set_content_origin(0.0, 0.0);
     set_requested_decorations(None);
+    set_client_decorated(false);
+    take_lock(&PENDING_OPS).clear();
 }
 
 #[cfg(test)]
@@ -1232,5 +1272,24 @@ mod tests {
         reset_windows();
         assert_eq!(content_origin(), (0.0, 0.0));
         assert_eq!(requested_decorations(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_window_ops_are_taken_in_order_once_and_reset() {
+        reset_windows();
+        request_window_op(WindowOp::Minimize);
+        request_window_op(WindowOp::Close);
+        assert!(
+            take_repaint_request(),
+            "a requested operation needs a frame"
+        );
+        assert_eq!(take_window_ops(), vec![WindowOp::Minimize, WindowOp::Close]);
+        assert!(take_window_ops().is_empty());
+        request_window_op(WindowOp::ToggleFullscreen);
+        set_client_decorated(true);
+        reset_windows();
+        assert!(take_window_ops().is_empty());
+        assert!(!client_decorated());
     }
 }

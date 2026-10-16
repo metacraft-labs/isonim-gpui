@@ -144,6 +144,14 @@ impl NimRootView {
                 }));
             self.chrome_observers
                 .push(cx.observe_window_activation(window, |_view, _window, cx| cx.notify()));
+            // A close the COMPOSITOR asks for (its own close button, a
+            // keyboard shortcut) goes through the same predicate as the
+            // application's close button and `gpui_window_request_close`:
+            // the application's close callback decides.
+            window.on_window_should_close(cx, move |_window, _cx| window::close_window(win_id));
+        }
+        for op in window::take_window_ops() {
+            perform_window_op(op, window, win_id);
         }
         if let Some(title) = window::take_pending_title() {
             window.set_window_title(&title);
@@ -176,6 +184,7 @@ impl NimRootView {
             f32::from(viewport.height),
         );
         window.set_client_inset(px(self.frame.client_inset()));
+        window::set_client_decorated(chrome.decorations == window::DECORATIONS_CLIENT);
         // Once ACTIVE: the compositor's configure that activates the window
         // carries the size it knew at map time, and a resize made before it
         // is overwritten by it (measured on GNOME: grown to 640x400, then
@@ -365,6 +374,9 @@ impl Render for NimRootView {
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
     el.track_focus(handle)
+        // GWIN: every press starts unclaimed (`regions`); the capture phase
+        // runs before any element's own handler.
+        .capture_any_mouse_down(|_event, _window, _cx| crate::regions::begin_press())
         // A key context is what makes this element a keyboard dispatch
         // target in GPUI's tree. Named for this shim rather than for any
         // product, because the shim has no opinion about what the keys mean.
@@ -649,7 +661,79 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
     }
 
     el = wire_pointer_listeners(el, plan);
-    el
+    wire_window_region(el, plan)
+}
+
+/// GWIN: give an element its window region (`regions.rs`). A drag region
+/// moves, maximizes and shows the window menu; a window button acts on a
+/// click; a `no-drag` element and any element listening for the pointer
+/// claim the press so that no drag region behind them acts on it.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn wire_window_region(el: Div, plan: &crate::render_sync::RenderNode) -> Div {
+    use crate::regions::{self, Region};
+    let region = plan
+        .attributes
+        .get(regions::REGION_ATTRIBUTE)
+        .and_then(|v| regions::parse_region(v));
+    let claim = |el: Div| {
+        el.on_mouse_down(MouseButton::Left, |_e, _w, _cx| regions::claim())
+            .on_mouse_down(MouseButton::Right, |_e, _w, _cx| regions::claim())
+    };
+    match region {
+        Some(Region::Drag) => el
+            .on_mouse_down(MouseButton::Left, |event, window, _cx| {
+                if regions::claimed() || !window::client_decorated() {
+                    return;
+                }
+                if event.click_count >= 2 {
+                    regions::disarm_move();
+                    window.zoom_window();
+                } else {
+                    regions::arm_move();
+                }
+            })
+            .on_mouse_move(|event, window, _cx| {
+                if event.pressed_button == Some(MouseButton::Left) && regions::take_move() {
+                    window.start_window_move();
+                }
+            })
+            .on_mouse_up(MouseButton::Left, |_e, _w, _cx| regions::disarm_move())
+            .on_mouse_down(MouseButton::Right, |event, window, _cx| {
+                if !regions::claimed() && window::client_decorated() {
+                    window.show_window_menu(event.position);
+                }
+            }),
+        Some(button @ (Region::Minimize | Region::Maximize | Region::Close)) => claim(el)
+            .on_mouse_up(MouseButton::Left, move |_e, window, _cx| {
+                let op = match button {
+                    Region::Minimize => window::WindowOp::Minimize,
+                    Region::Maximize => window::WindowOp::ToggleMaximize,
+                    _ => window::WindowOp::Close,
+                };
+                perform_window_op(op, window, active_window_id());
+            }),
+        Some(Region::NoDrag) => claim(el),
+        None if regions::is_pointer_listener(plan.has_click_handler, &plan.event_names) => {
+            claim(el)
+        }
+        None => el,
+    }
+}
+
+/// Carry out a window operation on the platform window. `Close` asks the
+/// application first (`window::close_window`), as a compositor close does.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn perform_window_op(op: window::WindowOp, window: &mut Window, win_id: u32) {
+    match op {
+        window::WindowOp::Minimize => window.minimize_window(),
+        window::WindowOp::ToggleMaximize => window.zoom_window(),
+        window::WindowOp::ToggleFullscreen => window.toggle_fullscreen(),
+        window::WindowOp::Close => {
+            if window::close_window(win_id) {
+                window.remove_window();
+            }
+        }
+    }
 }
 
 /// Wire the POINTER events a node listens for (`mousedown`, `mousemove`,
@@ -1216,7 +1300,10 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
 
     // The event loop has returned -- the user closed the window, or a
     // quit was requested via `gpui_quit` / the auto-quit deadline.
-    if window_id != 0 {
+    // A window already closed through `close_window` (its close button, a
+    // compositor close, `gpui_window_request_close`) has had its close
+    // callback; it is not asked again.
+    if window_id != 0 && window::window_state(window_id) != Some(window::WindowState::Closed) {
         window::close_window(window_id);
     }
 

@@ -46,6 +46,7 @@
 // with (see `gpui_headless_unavailable.rs`'s module docs for what that rule
 // exists to prevent).
 pub mod frame;
+pub mod regions;
 pub mod input;
 // PLAT-50 (CodeTracer): the system clipboard, for a click that copies.
 // Feature-less for `input`'s reason.
@@ -1200,6 +1201,38 @@ pub extern "C" fn gpui_set_window_title(window_id: u32, title: *const c_char) ->
     u8::from(window::set_window_title(window_id, unsafe {
         cstr_to_str(title)
     }))
+}
+
+// ---------------------------------------------------------------------------
+// GWIN — window operations from outside a title-bar press
+// ---------------------------------------------------------------------------
+//
+// For a menu entry or a key binding. Each latches a request that the next
+// frame carries out on the launched window; callable from any thread.
+
+/// Minimize the window (where the platform supports it).
+#[no_mangle]
+pub extern "C" fn gpui_window_minimize() {
+    window::request_window_op(window::WindowOp::Minimize);
+}
+
+/// Maximize the window, or restore it if it is maximized.
+#[no_mangle]
+pub extern "C" fn gpui_window_toggle_maximize() {
+    window::request_window_op(window::WindowOp::ToggleMaximize);
+}
+
+/// Enter or leave fullscreen.
+#[no_mangle]
+pub extern "C" fn gpui_window_toggle_fullscreen() {
+    window::request_window_op(window::WindowOp::ToggleFullscreen);
+}
+
+/// Close the window through its normal close path: the application's close
+/// callback decides, as it does for a close the compositor asks for.
+#[no_mangle]
+pub extern "C" fn gpui_window_request_close() {
+    window::request_window_op(window::WindowOp::Close);
 }
 
 /// Reset all windows (for testing).

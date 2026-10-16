@@ -32,7 +32,7 @@
 ## screen, never from the app's account of itself (except where the app's
 ## account is what is being compared).
 
-import std/[json, os, strutils, unittest]
+import std/[json, os, osproc, strutils, unittest]
 import gui_assert/desktop_env
 import gui_assert/desktop_env/sway
 
@@ -203,3 +203,177 @@ suite "GWIN — no frame where the compositor decorates":
     t.click((w.rect.x + 50, w.rect.y + 40))
     t.waitUntil("the press reported", proc(): bool = events("press").len > 0)
     check int(lastOf("press")["x"].getFloat) == 50
+
+# ---------------------------------------------------------------------------
+# Window regions and window operations. The app's title bar (`GWIN_REGIONS`,
+# `window_frame_app.buildTitleBar`): a drag strip 40px high across the top, a
+# `no-drag` child of it at x=100, a listener drawn over it at x=220, and the
+# window buttons the environment supports at its right end.
+# ---------------------------------------------------------------------------
+
+
+
+const
+  TitleBarH = 40
+  NoDragX = 100
+  ListenerX = 220
+  ButtonSize = 30
+  ButtonGap = 6
+  ButtonMargin = 10
+
+var app: Process
+
+proc launchRegions(decorations = "client") =
+  app = t.spawn(@[appBin], extraEnv = [
+    ("GWIN_REPORT", report), ("GWIN_REGIONS", "1"),
+    ("ISONIM_GPUI_DECORATIONS", decorations), ("LD_LIBRARY_PATH", appLibs)])
+
+proc buttonOrder(): seq[string] =
+  ## The buttons the app last drew, in order: "@[maximize, close]".
+  let b = lastOf("buttons")
+  if b.kind == JNull: return
+  for name in b["order"].getStr.strip(chars = {'@', '[', ']'}).split(", "):
+    if name.len > 0: result.add name
+
+proc buttonCenter(w: EnvWindow; name: string): (int, int) =
+  let order = buttonOrder()
+  let i = order.find(name)
+  doAssert i >= 0, "the app drew no " & name & " button: " & $order
+  let fromRight = ButtonMargin + (order.len - 1 - i) * (ButtonSize + ButtonGap)
+  (w.rect.x + w.rect.w - fromRight - ButtonSize div 2, w.rect.y + TitleBarH div 2)
+
+proc moveDrag(src: (int, int); delta: (int, int)) =
+  ## A title-bar drag. The move starts on the FIRST motion after the press
+  ## (so that a double-click can still maximize), and the compositor's move
+  ## follows the pointer from there: that first motion is 1px, and the
+  ## window travels `delta - (1, 0)`.
+  t.pointerMove(src[0], src[1])
+  t.press()
+  sleep(150)
+  t.pointerMove(src[0] + 1, src[1])
+  sleep(150)
+  t.drag(src + (1, 0), src + delta, steps = 10, stepMs = 30,
+         releaseHoldMs = 250, pressHoldMs = -1)
+
+suite "GWIN — window regions on sway":
+
+  setup:
+    t = newSwayTarget(1280, 800, floatingAppIds = @[AppId])
+    t.start()
+    report = getTempDir() / ("gwin-regions-" & $getCurrentProcessId() & ".jsonl")
+    removeFile(report)
+    launchRegions()
+
+  teardown:
+    t.stop()
+    removeFile(report)
+
+  test "a drag on the title bar moves the window, and only that":
+    var w = settledWindow(csd = true)
+    t.command("[app_id=" & AppId & "] move position 200 150")
+    w = settledWindow(csd = true)
+    moveDrag((w.rect.x + 40, w.rect.y + TitleBarH div 2), (120, 70))
+    t.waitUntil("the window moved", proc(): bool = t.window(AppId).rect.x != w.rect.x)
+    let after = t.window(AppId)
+    check after.rect == Rect(x: w.rect.x + 119, y: w.rect.y + 70, w: w.rect.w, h: w.rect.h)
+
+  test "a drag that starts on a no-drag child of the title bar does not move it":
+    let w = settledWindow(csd = true)
+    moveDrag((w.rect.x + NoDragX + 10, w.rect.y + TitleBarH div 2), (120, 70))
+    sleep(300)
+    check t.window(AppId).rect == w.rect
+
+  test "a drag that starts on a listener drawn over the title bar is the listener's":
+    let w = settledWindow(csd = true)
+    moveDrag((w.rect.x + ListenerX + 10, w.rect.y + TitleBarH div 2), (120, 70))
+    t.waitUntil("the listener's press", proc(): bool =
+      events("listener-press").len > 0)
+    check t.window(AppId).rect == w.rect
+
+  test "a drag below the title bar does not move the window":
+    let w = settledWindow(csd = true)
+    moveDrag((w.rect.x + 300, w.rect.y + 200), (120, 70))
+    t.waitUntil("the press reported", proc(): bool = events("press").len > 0)
+    check t.window(AppId).rect == w.rect
+
+  test "the buttons are the ones the environment supports, where it wants them":
+    discard settledWindow(csd = true)
+    let advertised = t.fact("window.capabilities").value.split(',')
+    proc expected(layout: string): seq[string] =
+      # The configured layout, left side then right, less what the
+      # compositor does not advertise (close is always available).
+      for name in layout.replace(":", ",").split(','):
+        if name in ["minimize", "maximize", "close"] and name notin result and
+           (name == "close" or name in advertised):
+          result.add name
+    for layout in [":minimize,maximize,close", "close,maximize:minimize"]:
+      t.configure("buttonLayout", layout)
+      t.waitUntil("the buttons for " & layout, proc(): bool =
+        buttonOrder() == expected(layout))
+      checkpoint layout & " -> " & $buttonOrder()
+      check "close" in buttonOrder()
+      check ("minimize" in buttonOrder()) == ("minimize" in advertised)
+
+  test "a double-click on the title bar maximizes where the compositor allows it":
+    let w = settledWindow(csd = true)
+    t.doubleClick((w.rect.x + 40, w.rect.y + TitleBarH div 2))
+    if t.boolFact("window.canMaximize"):
+      t.waitUntil("maximized", proc(): bool =
+        let s = lastOf("state")
+        s.kind != JNull and s["maximized"].getBool)
+    else:
+      sleep(500)
+      check t.window(AppId).rect == w.rect
+      check not lastOf("state")["maximized"].getBool
+
+  test "the close button asks onClose, and closes when it agrees":
+    let w = settledWindow(csd = true)
+    t.keys("v")   # refuse the next close
+    sleep(200)
+    t.click(buttonCenter(w, "close"))
+    t.waitUntil("the close refused", proc(): bool =
+      events("close-refused").len > 0)
+    check t.findWindow(AppId)[0]
+    t.click(buttonCenter(t.window(AppId), "close"))
+    t.waitUntil("the app exited", proc(): bool = not app.running)
+    check app.peekExitCode == 0
+    check events("close-allowed").len == 1
+    check not t.findWindow(AppId)[0]
+
+  test "keys toggle fullscreen and close through the imperative operations":
+    let w = settledWindow(csd = true)
+    t.requireFacts("window.canFullscreen")
+    if t.boolFact("window.canFullscreen"):
+      t.keys("f")
+      t.waitUntil("fullscreen", proc(): bool =
+        t.window(AppId).rect == Rect(x: 0, y: 0, w: 1280, h: 800))
+      t.keys("f")
+      t.waitUntil("restored", proc(): bool =
+        let r = t.window(AppId).rect
+        r.w == w.rect.w and r.h == w.rect.h)
+    t.keys("q")
+    t.waitUntil("the app exited", proc(): bool = not app.running)
+    check app.peekExitCode == 0
+    check events("close-allowed").len == 1
+
+suite "GWIN — window regions where the compositor decorates":
+
+  setup:
+    t = newSwayTarget(1280, 800, floatingAppIds = @[AppId])
+    t.start()
+    report = getTempDir() / ("gwin-regions-" & $getCurrentProcessId() & ".jsonl")
+    removeFile(report)
+    launchRegions(decorations = "")
+
+  teardown:
+    t.stop()
+    removeFile(report)
+
+  test "a drag region is inert, and a window button still acts":
+    let w = settledWindow(csd = false)
+    moveDrag((w.rect.x + 40, w.rect.y + TitleBarH div 2), (120, 70))
+    sleep(300)
+    check t.window(AppId).rect == w.rect
+    t.click(buttonCenter(w, "close"))
+    t.waitUntil("the app exited", proc(): bool = not app.running)
+    check app.peekExitCode == 0

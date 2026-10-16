@@ -510,6 +510,21 @@ proc gpui_set_initial_window_state*(maximized: uint8)
 proc gpui_set_window_title*(window_id: uint32; title: cstring): uint8
   {.importc: "gpui_set_window_title".}
 
+# --- GWIN: window operations from outside a title-bar press ---
+
+proc gpui_window_minimize*()
+  {.importc: "gpui_window_minimize".}
+
+proc gpui_window_toggle_maximize*()
+  {.importc: "gpui_window_toggle_maximize".}
+
+proc gpui_window_toggle_fullscreen*()
+  {.importc: "gpui_window_toggle_fullscreen".}
+
+proc gpui_window_request_close*()
+  {.importc: "gpui_window_request_close".}
+  ## Close through the normal close path: the close callback decides.
+
 proc gpui_reset_windows*()
   {.importc: "gpui_reset_windows".}
 

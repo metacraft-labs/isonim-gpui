@@ -222,7 +222,11 @@ BENCHMARKS=(
 #   The frame's own window suite (`tests/test_gui_window_frame.nim`) needs a
 #   compositor and GuiAssert and is NOT in this total; its home is
 #   `just test-gui-window-frame`.
-EXPECTED_CASES=324
+# GWIN-M3, 2026-10-16, written LAST and from a run (trap 4c): 329.
+#   * rust 173 -> 178: `regions`' four (the attribute's values, pointer
+#     listeners as implicitly no-drag, a claim lasting one press, one press
+#     arming one move) and `window`'s queue of window operations.
+EXPECTED_CASES=329
 
 total_cases=0
 failed_steps=()
