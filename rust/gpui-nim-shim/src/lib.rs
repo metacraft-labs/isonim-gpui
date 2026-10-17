@@ -1182,6 +1182,23 @@ pub extern "C" fn gpui_add_font_file(path: *const c_char) -> u8 {
     }
 }
 
+/// What the text system RESOLVED for the faces this process draws in, as a
+/// JSON string, or NULL before a launch has registered fonts.
+///
+/// Free with `gpui_free_string`. The same JSON is written to the file named
+/// by `GPUI_FONT_REPORT_PATH` when that variable is set, which is how a
+/// capture lane records it without having to call back into a running window.
+#[no_mangle]
+pub extern "C" fn gpui_font_report() -> *mut c_char {
+    let Some(json) = window::font_report() else {
+        return std::ptr::null_mut();
+    };
+    match std::ffi::CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// The registry id of the window `gpui_launch` is opening (valid inside the
 /// root builder and while the loop runs), 0 otherwise.
 #[no_mangle]

@@ -426,22 +426,48 @@ pub fn requested_decorations() -> Option<u8> {
 /// a family the application names in `font-family` is drawn in that face
 /// rather than in the platform's fallback. Kept, not consumed: a process that
 /// launches more than once registers them with each app.
-static FONTS: Mutex<Vec<std::sync::Arc<Vec<u8>>>> = Mutex::new(Vec::new());
+static FONTS: Mutex<Vec<(String, std::sync::Arc<Vec<u8>>)>> = Mutex::new(Vec::new());
 
 /// Read a font file (TrueType or OpenType) and keep it for every launch.
 /// Errors: the file cannot be read, or it is empty.
+///
+/// The PATH is kept beside the bytes so `font_report` can name the concrete
+/// file a family came from. A family name alone does not identify a face —
+/// two builds of "Space Mono" with different `hmtx` tables answer to the same
+/// name and set text to different widths — and naming the file is the only
+/// way a parity reading can show the two front-ends loaded the same outlines.
 pub fn add_font_file(path: &str) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     if bytes.is_empty() {
         return Err(format!("{path}: empty"));
     }
-    take_lock(&FONTS).push(std::sync::Arc::new(bytes));
+    take_lock(&FONTS).push((path.to_string(), std::sync::Arc::new(bytes)));
     Ok(())
 }
 
 /// The registered fonts' bytes, in registration order.
 pub fn fonts() -> Vec<std::sync::Arc<Vec<u8>>> {
-    take_lock(&FONTS).clone()
+    take_lock(&FONTS).iter().map(|(_, b)| b.clone()).collect()
+}
+
+/// The registered fonts' paths, in registration order.
+pub fn font_paths() -> Vec<String> {
+    take_lock(&FONTS).iter().map(|(p, _)| p.clone()).collect()
+}
+
+/// The text system's answer about the faces this process registered, as JSON,
+/// published by `gpui_app::register_fonts` once the app's text system exists.
+/// `None` until a launch has registered fonts.
+static FONT_REPORT: Mutex<Option<String>> = Mutex::new(None);
+
+/// Publish the resolved-face report. Called by the backend once, at launch.
+pub fn set_font_report(json: String) {
+    *take_lock(&FONT_REPORT) = Some(json);
+}
+
+/// The resolved-face report, or `None` before a launch has produced one.
+pub fn font_report() -> Option<String> {
+    take_lock(&FONT_REPORT).clone()
 }
 
 /// The registry id of the window `gpui_launch` is opening, from just before

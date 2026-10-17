@@ -262,6 +262,153 @@ pub fn register_fonts(cx: &mut App) {
     if let Err(e) = cx.text_system().add_fonts(owned) {
         eprintln!("gpui-nim-shim: registering {} font file(s) failed: {e}", fonts.len());
     }
+    publish_font_report(cx);
+}
+
+/// Minimal JSON string escaping, for the font report's family names and file
+/// paths. Both can contain a backslash or a quote on some hosts.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A family this font report is deliberately certain no host has.
+///
+/// It is the report's POSITIVE CONTROL and the reason the report can be read
+/// as the RESOLVED face rather than the REQUESTED one. A probe that echoed
+/// its input would answer this entry with monospace metrics identical to
+/// `Space Mono`'s; a probe that asks the text system answers it with
+/// whatever the fallback stack resolves to, whose `unitsPerEm` and advances
+/// differ. `controlProvesResolution` below states that comparison as a
+/// boolean so a reader does not have to make it by eye.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const FONT_REPORT_CONTROL_FAMILY: &str = "ZZ No Such Face ZZ";
+
+/// The families this report answers for: the two the CodeTracer front-end
+/// names in `chrome.nim` (`MonoFontFamily`, `WindowFontFamily`), plus the
+/// control.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const FONT_REPORT_FAMILIES: [&str; 3] =
+    ["Space Mono", "Space Grotesk", FONT_REPORT_CONTROL_FAMILY];
+
+/// What the text system RESOLVED for each family this window draws in, as
+/// JSON, published to `window::set_font_report` and — when
+/// `GPUI_FONT_REPORT_PATH` names one — written to that file.
+///
+/// WHY METRICS AND NOT A NAME. GPUI's `TextSystem` hands back a `FontId` and
+/// no way to ask it which file that id came from (`get_font_for_id` returns
+/// the REQUESTED `Font` key, not the resolved face), so a name read back here
+/// would be the request echoed. The resolved face's `unitsPerEm` and its
+/// per-character advances are read through that id from the loaded face
+/// itself, so they are properties of the FILE and not of the request: Space
+/// Mono is 1000 units per em and 612/1000 em on every character, where the
+/// platform fallbacks are 2048 units per em and proportional. That makes the
+/// metrics a fingerprint of the face, which is also the only property of it
+/// that the advance-drift question turns on.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn publish_font_report(cx: &mut App) {
+    const SIZE_PX: f32 = 16.0;
+    let text_system = cx.text_system().clone();
+    let known: Vec<String> = text_system.all_font_names();
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut fingerprints: Vec<Option<(u32, f32)>> = Vec::new();
+    for family in FONT_REPORT_FAMILIES {
+        // `resolve_font` panics only when neither the family nor any fallback
+        // resolves. A diagnostic must never take the window down with it.
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let id = text_system.resolve_font(&gpui::font(family));
+            let upem = text_system.units_per_em(id);
+            let adv = |c: char| {
+                text_system
+                    .advance(id, gpui::px(SIZE_PX), c)
+                    .map(|s| f32::from(s.width))
+                    .unwrap_or(f32::NAN)
+            };
+            (upem, adv('M'), adv('i'), adv('W'), adv('0'))
+        }));
+        match resolved {
+            Ok((upem, m, i, w, zero)) => {
+                fingerprints.push(Some((upem, m)));
+                entries.push(format!(
+                    concat!(
+                        "{{\"requested\": {}, \"knownToTextSystem\": {}, ",
+                        "\"unitsPerEm\": {}, \"sizePx\": {}, ",
+                        "\"advancePx\": {{\"M\": {}, \"i\": {}, \"W\": {}, \"0\": {}}}, ",
+                        "\"monospaced\": {}, \"advanceEm\": {}}}"
+                    ),
+                    json_str(family),
+                    known.iter().any(|n| n == family),
+                    upem,
+                    SIZE_PX,
+                    m,
+                    i,
+                    w,
+                    zero,
+                    (m - i).abs() < 0.001 && (m - w).abs() < 0.001,
+                    m / SIZE_PX
+                ));
+            }
+            Err(_) => {
+                fingerprints.push(None);
+                entries.push(format!(
+                    "{{\"requested\": {}, \"resolveFontPanicked\": true}}",
+                    json_str(family)
+                ));
+            }
+        }
+    }
+
+    // The control: the bogus family must NOT fingerprint like Space Mono.
+    let control_proves_resolution = match (fingerprints.first(), fingerprints.last()) {
+        (Some(Some((mono_upem, mono_adv))), Some(Some((ctl_upem, ctl_adv)))) => {
+            mono_upem != ctl_upem || (mono_adv - ctl_adv).abs() > 0.001
+        }
+        _ => false,
+    };
+
+    let files: Vec<String> = window::font_paths().iter().map(|p| json_str(p)).collect();
+    let json = format!(
+        concat!(
+            "{{\"probe\": \"gpui-nim-shim/register_fonts\", ",
+            "\"textSystem\": \"gpui-pre 0.3.5 (platform text system)\", ",
+            "\"registeredFileCount\": {}, \"registeredFiles\": [{}], ",
+            "\"queries\": [{}], ",
+            "\"controlFamily\": {}, \"controlProvesResolution\": {}, ",
+            "\"controlMeaning\": \"true means the control family fingerprints ",
+            "DIFFERENTLY from Space Mono, so these are resolved faces and not ",
+            "the requested names echoed back\"}}"
+        ),
+        files.len(),
+        files.join(", "),
+        entries.join(", "),
+        json_str(FONT_REPORT_CONTROL_FAMILY),
+        control_proves_resolution
+    );
+
+    if let Ok(path) = std::env::var("GPUI_FONT_REPORT_PATH") {
+        if !path.is_empty() {
+            if let Err(e) = std::fs::write(&path, &json) {
+                eprintln!("gpui-nim-shim: writing GPUI_FONT_REPORT_PATH {path}: {e}");
+            }
+        }
+    }
+    eprintln!("gpui-nim-shim: font-report {json}");
+    window::set_font_report(json);
 }
 
 /// Read the platform's view of the window's frame (GWIN).
