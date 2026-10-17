@@ -342,8 +342,13 @@ pub struct RenderNode {
 pub const INLINE_TEXT_RUNS_ATTRIBUTE: &str = "data-inline-text-runs";
 
 /// One span of a fused inline formatting context: how many BYTES of the
-/// fused string it covers, and the colour it is drawn in (`None` keeps the
-/// inherited colour).
+/// fused string it covers, and the inline properties it is drawn with
+/// (`None` on any of them keeps the inherited value).
+///
+/// The properties here are the ones a `HighlightStyle` can carry per range
+/// AND that the unfused path already draws, which is what bounds the set:
+/// fusing must change where glyphs land and nothing else. See
+/// `fusable_child_text`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineTextRun {
     /// The span's length in BYTES of the fused string, not characters:
@@ -351,6 +356,8 @@ pub struct InlineTextRun {
     pub len: usize,
     /// The span's `color` style, verbatim; the caller parses it.
     pub color: Option<String>,
+    /// The span's `font-weight`, verbatim; the caller parses it.
+    pub font_weight: Option<String>,
 }
 
 /// A child that may be fused: its text, or `None` if it must stay its own
@@ -380,12 +387,43 @@ fn fusable_child_text(child: &RenderNode) -> Option<&str> {
     // by listing the fields that are allowed to be absent. `GpuiStyles` has
     // some fifty fields and gains more; an allow-list would silently start
     // fusing away a property added later, which is the failure mode that is
-    // hardest to see. Blanking the two properties that a fused run CAN
-    // carry and demanding the rest be untouched fails safe instead: a span
-    // with any other style simply keeps its own element.
+    // hardest to see. Blanking the properties that a fused run CAN carry and
+    // demanding the rest be untouched fails safe instead: a span with any
+    // other style simply keeps its own element.
+    //
+    // WHAT BOUNDS THIS SET is a two-part test, not taste. Fusing replaces N
+    // text elements with one `StyledText` plus one highlight per range, so a
+    // property may join the set only when (1) a `HighlightStyle` can state
+    // it per range, and (2) the UNFUSED path already draws it — otherwise
+    // fusing would start drawing something the spans do not draw today, and
+    // it would no longer be a pure layout change. `color` and `font-weight`
+    // pass both; `flex_shrink` is meaningless once there is one element and
+    // so is safe to ignore.
+    //
+    // `font-style` passes (1) and FAILS (2), which is why it is absent
+    // although a `HighlightStyle` carries it. `GpuiStyles` parses and stores
+    // `font-style` (`lib.rs` push_style) but nothing ever applies it: there
+    // is no `italic` anywhere in this shim, so an unfused italic span is
+    // drawn upright today. Fusing it would make the same markup render
+    // italic only when it happens to fuse. The unapplied property is the
+    // defect to fix, and fixing it is what would let `font-style` join this
+    // set; `inline_runs_decline_a_span_with_a_font_style` is the guard until
+    // then. (Sibling of the filed `letter-spacing` issue, which is the same
+    // shape: parsed, reported, never applied.)
+    //
+    // A BOX PROPERTY MUST NEVER BE ADDED HERE, and `padding_left` is the one
+    // to think about, because it is how a caller spaces two text runs inside
+    // a box. A highlight cannot carry it: fusing two runs separated by
+    // padding CONCATENATES THEM AND DELETES THE SPACE. Measured on this
+    // host 2026-10-21 against codetracer 3fce565eb, an editor inline-value
+    // chip separates its name from its value by ~8.5 pt and BOTH front-ends
+    // draw that gap, so fusing such a chip would be an 8.5 pt regression in
+    // exchange for removing one rounding of at most 2 device px.
+    // `inline_runs_decline_a_span_with_leading_padding` is the guard.
     let mut probe = child.styles.clone();
     probe.text_color = None;
     probe.flex_shrink = None;
+    probe.font_weight = None;
     if probe != GpuiStyles::default() {
         return None;
     }
@@ -430,6 +468,7 @@ pub fn inline_text_runs(plan: &RenderNode) -> Option<(String, Vec<InlineTextRun>
         runs.push(InlineTextRun {
             len: piece.len(),
             color: child.styles.text_color.clone(),
+            font_weight: child.styles.font_weight.clone(),
         });
     }
     Some((text, runs))
@@ -590,15 +629,18 @@ mod tests {
             vec![
                 InlineTextRun {
                     len: 3,
-                    color: Some("#569cd6".into())
+                    color: Some("#569cd6".into()),
+                    font_weight: None
                 },
                 InlineTextRun {
                     len: 5,
-                    color: Some("#d4d4d4".into())
+                    color: Some("#d4d4d4".into()),
+                    font_weight: None
                 },
                 InlineTextRun {
                     len: 1,
-                    color: Some("#ffd700".into())
+                    color: Some("#ffd700".into()),
+                    font_weight: None
                 },
             ]
         );
@@ -613,6 +655,70 @@ mod tests {
     #[test]
     fn inline_runs_decline_a_row_that_did_not_declare_itself() {
         let plan = highlighted_row(false, &[("let", "#569cd6"), (" x", "#d4d4d4")], |_| {});
+        assert_eq!(inline_text_runs(&plan), None);
+    }
+
+    /// TWO SPANS THAT DIFFER ONLY IN WEIGHT FUSE, and the weight rides along
+    /// on the run. This is the property that lets a caller draw a label and
+    /// a bold value as one piece of text, and it is the reason `font-weight`
+    /// was added to the fusable set.
+    #[test]
+    fn inline_runs_fuse_spans_that_differ_only_in_weight() {
+        let mut tree = Tree::new();
+        let mut host = Node::new_element("span");
+        host.attributes
+            .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        let host_id = tree.insert(host);
+        for (text, weight) in [("name", None), ("value", Some("600"))] {
+            let mut span = Node::new_element("span");
+            span.styles.insert("color".into(), "#d4d4d4".into());
+            span.styles.insert("flex-shrink".into(), "0".into());
+            if let Some(w) = weight {
+                span.styles.insert("font-weight".into(), w.into());
+            }
+            let span_id = tree.insert(span);
+            let text_id = tree.insert(Node::new_text(text));
+            tree.append_child(span_id, text_id);
+            tree.append_child(host_id, span_id);
+        }
+        let plan = build_render_plan(&tree, host_id).expect("plan");
+        let (text, runs) = inline_text_runs(&plan).expect("must fuse");
+        assert_eq!(text, "namevalue");
+        assert_eq!(runs[0].font_weight, None, "inherits when unset");
+        assert_eq!(runs[1].font_weight, Some("600".into()));
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+    }
+
+    /// THE GUARD ON THE INLINE-VALUE CHIP. A span with leading padding must
+    /// NOT fuse, because a `HighlightStyle` cannot carry padding: fusing
+    /// would concatenate the two runs and silently delete the space between
+    /// them. Measured on aarch64-darwin 2026-10-21 against codetracer
+    /// 3fce565eb, an editor chip's name and value are ~8.5 pt apart and BOTH
+    /// front-ends draw that gap, so this is a real regression and not a
+    /// hypothetical one. If a later pass wants chips to fuse, the gap has to
+    /// stop being padding first -- deleting this test is not the way.
+    #[test]
+    fn inline_runs_decline_a_span_with_leading_padding() {
+        let plan = highlighted_row(true, &[("name", "#9cdcfe"), ("value", "#d4d4d4")],
+                                   |span| {
+            span.styles.insert("padding-left".into(), "7px".into());
+        });
+        assert_eq!(inline_text_runs(&plan), None);
+    }
+
+    /// `font-style` is NOT in the fusable set although a `HighlightStyle`
+    /// carries it, because nothing in this shim applies `font-style` to an
+    /// unfused span -- there is no `italic` call anywhere. Fusing it would
+    /// make the same markup render italic only when it happened to fuse,
+    /// which would turn fusing from a layout change into a drawing change.
+    /// When the unfused path learns to draw it, this test is the one to
+    /// revisit, together with the comment in `fusable_child_text`.
+    #[test]
+    fn inline_runs_decline_a_span_with_a_font_style() {
+        let plan = highlighted_row(true, &[("let", "#569cd6"), (" x", "#d4d4d4")],
+                                   |span| {
+            span.styles.insert("font-style".into(), "italic".into());
+        });
         assert_eq!(inline_text_runs(&plan), None);
     }
 

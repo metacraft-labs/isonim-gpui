@@ -927,10 +927,17 @@ fn fused_inline_text(plan: &crate::render_sync::RenderNode) -> Option<StyledText
         // A span whose colour does not parse keeps the inherited colour,
         // which is what an unparsable `color` does to an unfused span too.
         let color = run.color.as_deref().and_then(parse_color);
+        // `font-weight` is resolved by the SAME parser the unfused path
+        // uses (`parse_font_weight`, applied at `el.font_weight(..)`), so a
+        // run that fuses is drawn in the weight it would have had as its own
+        // element. A span with no weight of its own leaves the field `None`
+        // and inherits, exactly as it does unfused.
+        let font_weight = run.font_weight.as_deref().map(parse_font_weight);
         highlights.push((
             range,
             HighlightStyle {
                 color,
+                font_weight,
                 ..Default::default()
             },
         ));
