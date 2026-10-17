@@ -265,6 +265,11 @@ fn render_to_rgba(width: u32, height: u32, scale: f32) -> Result<Vec<u8>, ErrorC
     // PlatformTextSystem>` the platform's renderer is configured against.
     let platform = current_platform(true);
     let text_system = platform.text_system();
+    // Disable CoreGraphics stem darkening for this process before anything is
+    // rasterised, so an off-screen capture matches the windowed path and the
+    // Electron reference. See `window::apply_chromium_font_smoothing_policy`.
+    #[cfg(target_os = "macos")]
+    let _ = crate::window::apply_and_report_font_smoothing_policy(text_system.as_ref());
 
     // The headless renderer factory is platform-specific. On macOS it
     // returns `Some(MetalHeadlessRenderer)`; on Linux it returns `None`
@@ -678,6 +683,10 @@ fn render_via_cached(
         }
         let platform = current_platform(true);
         let text_system = platform.text_system();
+        // Same font-smoothing policy as the windowed path, applied through
+        // this context's own text system before the first glyph.
+        #[cfg(target_os = "macos")]
+        let _ = crate::window::apply_and_report_font_smoothing_policy(text_system.as_ref());
         let cx = HeadlessAppContext::with_platform(
             text_system,
             Arc::new(()),

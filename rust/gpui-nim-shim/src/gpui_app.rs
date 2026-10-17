@@ -1682,7 +1682,18 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     // (the old crates.io `Application::new()` constructor is gone). Use
     // `current_platform(false)` to get the windowed (non-headless) platform impl
     // appropriate for the current OS.
-    Application::with_platform(current_platform(false)).run(move |cx: &mut App| {
+    // Bind the platform so the font-smoothing policy can be applied through
+    // the SAME text system this app will render with, before any glyph is
+    // rasterised. `current_platform` is called once, not twice: the policy's
+    // memo is process-global, but creating a second platform here would also
+    // create a second AppKit app object. See
+    // `window::apply_chromium_font_smoothing_policy`.
+    let platform = current_platform(false);
+    #[cfg(target_os = "macos")]
+    let _font_smoothing =
+        crate::window::apply_and_report_font_smoothing_policy(platform.text_system().as_ref());
+
+    Application::with_platform(platform).run(move |cx: &mut App| {
         // The shim owns the quit policy; see `spawn_shutdown_poller`.
         // `QuitMode::Default` is `LastWindowClosed` off macOS, which
         // quits INSIDE the update that removes the last window and so
