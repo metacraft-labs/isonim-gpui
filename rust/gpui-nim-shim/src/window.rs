@@ -1363,8 +1363,35 @@ pub fn text_antialiasing(env: Option<&str>, fc_rgba: Option<&str>) -> Option<Tex
 }
 
 /// fontconfig's `rgba` for the default sans face (`fc-match`), or `None`
-/// when fontconfig cannot be asked.
+/// when fontconfig does not govern this platform's text stack or cannot be
+/// asked.
+///
+/// NOT ASKED ON macOS, AND THIS IS THE POINT OF THE FUNCTION RATHER THAN A
+/// DETAIL OF IT. The rule above is "as Chromium chooses it **on Linux**",
+/// and Chromium only consults fontconfig there. On macOS it renders through
+/// CoreText and takes the smoothing the system dictates; fontconfig has no
+/// say, and a macOS box that happens to have fontconfig installed — every
+/// one that enters this repo's Nix dev shell does — is not thereby a
+/// desktop whose text policy fontconfig states.
+///
+/// Measured on aarch64-darwin inside `codetracer`'s dev shell, 2026-10-17:
+/// `fc-match -f '%{rgba}' sans-serif` exits 0 and prints THE EMPTY STRING.
+/// That returned `Some("")`, which `text_antialiasing` maps — correctly, for
+/// Linux — to `Grayscale`, because on Linux an empty `rgba` is fontconfig
+/// saying "this display has no subpixel order". So the GPUI window was
+/// OVERRIDING its platform default and forcing grayscale on macOS off an
+/// answer that carried no information. The empty string is "unset", and
+/// only on Linux does "unset" mean "grayscale".
+///
+/// Returning `None` here puts macOS back on GPUI's platform default, which
+/// is the CoreText path Chromium also takes. `ISONIM_GPUI_TEXT_RENDERING`
+/// still overrides on every platform, so the behaviour remains reachable
+/// for a test or a comparison. Linux is untouched: `text_antialiasing` and
+/// its unit tests are unchanged, and this function still shells out there.
 pub fn fontconfig_rgba() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
     let out = std::process::Command::new("fc-match")
         .args(["-f", "%{rgba}", "sans-serif"])
         .output()
@@ -1373,6 +1400,32 @@ pub fn fontconfig_rgba() -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod fontconfig_rgba_platform_tests {
+    use super::*;
+
+    /// macOS must not take a text-rendering policy from fontconfig, however
+    /// loudly fontconfig answers. The assertion is split by platform rather
+    /// than skipped on one, so the test says something on both.
+    #[test]
+    fn fontconfig_is_consulted_on_linux_and_not_on_macos() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(fontconfig_rgba(), None);
+            // And therefore nothing is forced: with no env override the
+            // window keeps GPUI's own platform default.
+            assert_eq!(text_antialiasing(None, fontconfig_rgba().as_deref()), None);
+        } else {
+            // Elsewhere the answer depends on whether fc-match is installed,
+            // so the behaviour under test is that an EMPTY answer still means
+            // grayscale -- the Linux reading this change deliberately keeps.
+            assert_eq!(
+                text_antialiasing(None, Some("")),
+                Some(TextAntialiasing::Grayscale)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
