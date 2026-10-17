@@ -70,6 +70,12 @@ pub struct GpuiStyles {
     pub text_size: Option<String>,
     pub text_color: Option<String>,
     pub rounded: Option<String>,
+    /// Per-corner radii (`border-top-left-radius`, ...), each overriding
+    /// `rounded` on its own corner.
+    pub rounded_tl: Option<String>,
+    pub rounded_tr: Option<String>,
+    pub rounded_br: Option<String>,
+    pub rounded_bl: Option<String>,
     pub items: Option<String>,
     pub justify: Option<String>,
     pub border_width: Option<String>,
@@ -105,6 +111,12 @@ pub struct GpuiStyles {
     pub padding_right: Option<String>,
     pub padding_bottom: Option<String>,
     pub padding_left: Option<String>,
+    /// Per-side margins (`margin-top`, ...), each overriding `m` on its own
+    /// side.
+    pub margin_top: Option<String>,
+    pub margin_right: Option<String>,
+    pub margin_bottom: Option<String>,
+    pub margin_left: Option<String>,
     /// The inset of a `position: absolute` element from its containing
     /// block's edges, in pixels.
     pub top: Option<String>,
@@ -154,6 +166,14 @@ impl GpuiStyles {
             "border-radius" | "border_radius" | "rounded" | "corner-radius" | "corner_radius" => {
                 self.rounded = Some(v)
             }
+            "border-top-left-radius" | "border_top_left_radius" => self.rounded_tl = Some(v),
+            "border-top-right-radius" | "border_top_right_radius" => self.rounded_tr = Some(v),
+            "border-bottom-right-radius" | "border_bottom_right_radius" => {
+                self.rounded_br = Some(v)
+            }
+            "border-bottom-left-radius" | "border_bottom_left_radius" => {
+                self.rounded_bl = Some(v)
+            }
             "align-items" | "align_items" | "items" => {
                 self.items = Some(normalize_alignment(value))
             }
@@ -192,6 +212,10 @@ impl GpuiStyles {
             "padding-right" | "padding_right" => self.padding_right = Some(v),
             "padding-bottom" | "padding_bottom" => self.padding_bottom = Some(v),
             "padding-left" | "padding_left" => self.padding_left = Some(v),
+            "margin-top" | "margin_top" => self.margin_top = Some(v),
+            "margin-right" | "margin_right" => self.margin_right = Some(v),
+            "margin-bottom" | "margin_bottom" => self.margin_bottom = Some(v),
+            "margin-left" | "margin_left" => self.margin_left = Some(v),
             _ => {} // Ignore unknown properties
         }
     }
@@ -448,6 +472,36 @@ mod tests {
     fn test_classify_element_node() {
         let node = Node::new_element("div");
         assert_eq!(classify_node(&node), GpuiElementKind::Div);
+    }
+
+    #[test]
+    fn test_margins_are_kept_per_side() {
+        let mut node = Node::new_element("div");
+        node.styles.insert("margin".into(), "2px".into());
+        node.styles.insert("margin-top".into(), "8px".into());
+        node.styles.insert("margin-left".into(), "4px".into());
+        let styles = GpuiStyles::from_node(&node);
+        assert_eq!(styles.m.as_deref(), Some("2px"));
+        assert_eq!(styles.margin_top.as_deref(), Some("8px"));
+        assert_eq!(styles.margin_left.as_deref(), Some("4px"));
+        assert_eq!(styles.margin_right, None);
+        assert_eq!(styles.margin_bottom, None);
+    }
+
+    #[test]
+    fn test_corner_radii_are_kept_per_corner() {
+        let mut node = Node::new_element("div");
+        node.styles.insert("border-radius".into(), "6px".into());
+        node.styles
+            .insert("border-bottom-left-radius".into(), "0px".into());
+        node.styles
+            .insert("border-bottom-right-radius".into(), "0px".into());
+        let styles = GpuiStyles::from_node(&node);
+        assert_eq!(styles.rounded.as_deref(), Some("6px"));
+        assert_eq!(styles.rounded_bl.as_deref(), Some("0px"));
+        assert_eq!(styles.rounded_br.as_deref(), Some("0px"));
+        assert_eq!(styles.rounded_tl, None);
+        assert_eq!(styles.rounded_tr, None);
     }
 
     #[test]

@@ -1333,3 +1333,63 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+
+/// How the window's text is antialiased, chosen as Chromium chooses it on
+/// Linux: from fontconfig's `rgba` for the default face — subpixel for a
+/// known subpixel order (`1`..`4`: rgb, bgr, vrgb, vbgr), grayscale for
+/// none or unknown (`0`, `5`, nothing) — so a GPUI window and an Electron
+/// one on the same desktop draw their text alike. `ISONIM_GPUI_TEXT_RENDERING`
+/// (`grayscale`, `subpixel`, `platform`) overrides it. `None`: GPUI's own
+/// platform default (fontconfig could not be asked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextAntialiasing {
+    Grayscale,
+    Subpixel,
+}
+
+pub fn text_antialiasing(env: Option<&str>, fc_rgba: Option<&str>) -> Option<TextAntialiasing> {
+    match env.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("grayscale") | Some("greyscale") => return Some(TextAntialiasing::Grayscale),
+        Some("subpixel") => return Some(TextAntialiasing::Subpixel),
+        Some("platform") => return None,
+        _ => {}
+    }
+    let rgba = fc_rgba?;
+    match rgba.trim() {
+        "1" | "2" | "3" | "4" => Some(TextAntialiasing::Subpixel),
+        _ => Some(TextAntialiasing::Grayscale),
+    }
+}
+
+/// fontconfig's `rgba` for the default sans face (`fc-match`), or `None`
+/// when fontconfig cannot be asked.
+pub fn fontconfig_rgba() -> Option<String> {
+    let out = std::process::Command::new("fc-match")
+        .args(["-f", "%{rgba}", "sans-serif"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod text_antialiasing_tests {
+    use super::*;
+
+    #[test]
+    fn antialiasing_follows_fontconfig_and_the_override_wins() {
+        use TextAntialiasing::*;
+        assert_eq!(text_antialiasing(None, Some("1")), Some(Subpixel));
+        assert_eq!(text_antialiasing(None, Some("4")), Some(Subpixel));
+        assert_eq!(text_antialiasing(None, Some("0")), Some(Grayscale));
+        assert_eq!(text_antialiasing(None, Some("5")), Some(Grayscale));
+        assert_eq!(text_antialiasing(None, Some("")), Some(Grayscale));
+        assert_eq!(text_antialiasing(None, None), None);
+        assert_eq!(text_antialiasing(Some("subpixel"), Some("0")), Some(Subpixel));
+        assert_eq!(text_antialiasing(Some("grayscale"), Some("1")), Some(Grayscale));
+        assert_eq!(text_antialiasing(Some("platform"), Some("1")), None);
+    }
+}

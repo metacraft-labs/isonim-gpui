@@ -1410,6 +1410,10 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(text_size, "text_size");
         push_style!(text_color, "text_color");
         push_style!(rounded, "rounded");
+        push_style!(rounded_tl, "rounded_tl");
+        push_style!(rounded_tr, "rounded_tr");
+        push_style!(rounded_br, "rounded_br");
+        push_style!(rounded_bl, "rounded_bl");
         push_style!(items, "items");
         push_style!(justify, "justify");
         push_style!(border_width, "border_width");
@@ -1439,6 +1443,10 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(padding_right, "padding_right");
         push_style!(padding_bottom, "padding_bottom");
         push_style!(padding_left, "padding_left");
+        push_style!(margin_top, "margin_top");
+        push_style!(margin_right, "margin_right");
+        push_style!(margin_bottom, "margin_bottom");
+        push_style!(margin_left, "margin_left");
         push_style!(top, "top");
         push_style!(right, "right");
         push_style!(bottom, "bottom");

@@ -1092,6 +1092,19 @@ pub fn apply_styles_to_div(
             el = el.m(px(px_val));
         }
     }
+    // Per-side margins, after `m` so a side named on its own wins.
+    if let Some(v) = styles.margin_top.as_deref().and_then(parse_px) {
+        el = el.mt(px(v));
+    }
+    if let Some(v) = styles.margin_right.as_deref().and_then(parse_px) {
+        el = el.mr(px(v));
+    }
+    if let Some(v) = styles.margin_bottom.as_deref().and_then(parse_px) {
+        el = el.mb(px(v));
+    }
+    if let Some(v) = styles.margin_left.as_deref().and_then(parse_px) {
+        el = el.ml(px(v));
+    }
 
     // Gap
     if let Some(ref gap) = styles.gap {
@@ -1112,6 +1125,20 @@ pub fn apply_styles_to_div(
         if let Some(px_val) = parse_px(r) {
             el = el.rounded(px(px_val));
         }
+    }
+    // A corner of its own, over `rounded`: a tab joined to its panel is
+    // rounded at the top only.
+    if let Some(v) = styles.rounded_tl.as_deref().and_then(parse_px) {
+        el = el.rounded_tl(px(v));
+    }
+    if let Some(v) = styles.rounded_tr.as_deref().and_then(parse_px) {
+        el = el.rounded_tr(px(v));
+    }
+    if let Some(v) = styles.rounded_br.as_deref().and_then(parse_px) {
+        el = el.rounded_br(px(v));
+    }
+    if let Some(v) = styles.rounded_bl.as_deref().and_then(parse_px) {
+        el = el.rounded_bl(px(v));
     }
 
     // Align items
@@ -1461,6 +1488,20 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
         // the same user-visible rule (last window gone => app quits) with
         // a drain in between.
         cx.set_quit_mode(QuitMode::Explicit);
+        // Text antialiasing as Chromium picks it on this desktop
+        // (`window::text_antialiasing`).
+        match crate::window::text_antialiasing(
+            std::env::var("ISONIM_GPUI_TEXT_RENDERING").ok().as_deref(),
+            crate::window::fontconfig_rgba().as_deref(),
+        ) {
+            Some(crate::window::TextAntialiasing::Grayscale) => {
+                cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale)
+            }
+            Some(crate::window::TextAntialiasing::Subpixel) => {
+                cx.set_text_rendering_mode(gpui::TextRenderingMode::Subpixel)
+            }
+            None => {}
+        }
         register_fonts(cx);
 
         // GWIN: the title, identity, minimum size and initial state the
