@@ -54,7 +54,7 @@ pub fn classify_tag(tag: &str) -> GpuiElementKind {
 /// A collected style ready to be applied to a GPUI element.
 /// GPUI uses Tailwind-inspired builder methods; this struct normalizes
 /// CSS-like property names to GPUI equivalents.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GpuiStyles {
     pub bg: Option<String>,
     pub w: Option<String>,
@@ -312,6 +312,129 @@ pub struct RenderNode {
     pub children: Vec<RenderNode>,
 }
 
+// ---------------------------------------------------------------------------
+// Inline formatting contexts: many coloured spans, ONE text element
+// ---------------------------------------------------------------------------
+
+/// The attribute a container declares itself an INLINE FORMATTING CONTEXT
+/// with. Its text-only children are then drawn as ONE piece of text carrying
+/// per-span colours, instead of as one text element each.
+///
+/// WHY THIS EXISTS, AND WHY IT IS NOT A COSMETIC CHANGE. A GPUI text element
+/// rounds its own width UP to a whole logical pixel —
+/// `gpui-pre/src/elements/text.rs`, `size.width = size.width.max(line_size
+/// .width).ceil()`, still present unchanged in every published version
+/// through 0.3.9 (checked 2026-10-17). One element per span therefore
+/// applies that rounding once PER SPAN, and because each span is laid out
+/// after the ones before it, the error ACCUMULATES along the row: a row of
+/// eleven spans can finish several device pixels right of where the same
+/// text lands in a browser. Chromium accumulates inline runs in LayoutUnit
+/// (1/64 px) and rounds once, at the end.
+///
+/// Fusing the spans into one element reproduces the browser's rule rather
+/// than compensating for the difference: the width is rounded ONCE for the
+/// whole context, so there is no per-span residue left to accumulate, at any
+/// span count and any font size.
+///
+/// The declaration is explicit rather than inferred so that fusing is opt-in
+/// per container: a caller that wants per-span elements (because it measures
+/// them, or hangs something off them) keeps them by saying nothing.
+pub const INLINE_TEXT_RUNS_ATTRIBUTE: &str = "data-inline-text-runs";
+
+/// One span of a fused inline formatting context: how many BYTES of the
+/// fused string it covers, and the colour it is drawn in (`None` keeps the
+/// inherited colour).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineTextRun {
+    /// The span's length in BYTES of the fused string, not characters:
+    /// GPUI's highlight ranges are byte ranges.
+    pub len: usize,
+    /// The span's `color` style, verbatim; the caller parses it.
+    pub color: Option<String>,
+}
+
+/// A child that may be fused: its text, or `None` if it must stay its own
+/// element.
+///
+/// A span qualifies only when it is text and NOTHING else — no handler, no
+/// window region, no box styling. Anything else can be positioned, hit-tested
+/// or painted in its own right, and fusing it away would change behaviour
+/// rather than just layout.
+fn fusable_child_text(child: &RenderNode) -> Option<&str> {
+    if child.has_click_handler || child.has_input_handler || !child.event_names.is_empty() {
+        return None;
+    }
+    if child
+        .attributes
+        .contains_key(crate::regions::REGION_ATTRIBUTE)
+    {
+        return None;
+    }
+    if !matches!(
+        child.kind,
+        GpuiElementKind::Div | GpuiElementKind::TextContainer
+    ) {
+        return None;
+    }
+    // INLINE-ONLY STYLING, TESTED BY DIFFERENCE FROM THE DEFAULT rather than
+    // by listing the fields that are allowed to be absent. `GpuiStyles` has
+    // some fifty fields and gains more; an allow-list would silently start
+    // fusing away a property added later, which is the failure mode that is
+    // hardest to see. Blanking the two properties that a fused run CAN
+    // carry and demanding the rest be untouched fails safe instead: a span
+    // with any other style simply keeps its own element.
+    let mut probe = child.styles.clone();
+    probe.text_color = None;
+    probe.flex_shrink = None;
+    if probe != GpuiStyles::default() {
+        return None;
+    }
+    let own_text = child.text.as_deref().filter(|t| !t.is_empty());
+    match (own_text, child.children.as_slice()) {
+        (Some(t), []) => Some(t),
+        (None, [only]) if only.kind == GpuiElementKind::TextNode && only.children.is_empty() => {
+            only.text.as_deref().filter(|t| !t.is_empty())
+        }
+        _ => None,
+    }
+}
+
+/// The fused text of `plan`'s children and the runs covering it, or `None`
+/// when `plan` is not a declared inline formatting context or any child is
+/// not pure text.
+///
+/// All-or-nothing on purpose: fusing some children and leaving others as
+/// elements would reintroduce exactly the per-element rounding the fusion
+/// exists to remove, while making the result harder to reason about.
+pub fn inline_text_runs(plan: &RenderNode) -> Option<(String, Vec<InlineTextRun>)> {
+    let declared = plan
+        .attributes
+        .get(INLINE_TEXT_RUNS_ATTRIBUTE)
+        .map_or(false, |v| v != "0" && v != "false");
+    if !declared {
+        return None;
+    }
+    // A container with text of its own is not purely a sequence of spans,
+    // and `build_plan_div` would append that text AFTER the children.
+    if plan.text.as_deref().map_or(false, |t| !t.is_empty()) {
+        return None;
+    }
+    if plan.children.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    let mut runs = Vec::with_capacity(plan.children.len());
+    for child in &plan.children {
+        let piece = fusable_child_text(child)?;
+        text.push_str(piece);
+        runs.push(InlineTextRun {
+            len: piece.len(),
+            color: child.styles.text_color.clone(),
+        });
+    }
+    Some((text, runs))
+}
+
 /// Build a render plan from the shadow tree, starting at `root_id`.
 ///
 /// This walks the tree recursively and produces a `RenderNode` hierarchy
@@ -416,6 +539,199 @@ pub mod gpui_render {
 mod tests {
     use super::*;
     use crate::tree::{EventListener, Node, NodeId, Tree};
+
+    /// A syntax-highlighted code row as `leaves.nim` builds it: a container
+    /// holding one span per coloured piece, each span holding one text node.
+    /// `extra` runs last on the FIRST span, so a test can make exactly one
+    /// child unfusable and watch the whole row decline.
+    fn highlighted_row(
+        declare: bool,
+        pieces: &[(&str, &str)],
+        extra: impl FnOnce(&mut Node),
+    ) -> RenderNode {
+        let mut tree = Tree::new();
+        let mut code = Node::new_element("span");
+        code.styles.insert("display".into(), "flex".into());
+        if declare {
+            code.attributes
+                .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        }
+        let code_id = tree.insert(code);
+        // `Option::take` so the FnOnce can be consumed inside the loop.
+        let mut extra = Some(extra);
+        for (text, color) in pieces {
+            let mut span = Node::new_element("span");
+            span.styles.insert("color".into(), (*color).into());
+            span.styles.insert("flex-shrink".into(), "0".into());
+            if let Some(f) = extra.take() {
+                f(&mut span);
+            }
+            let span_id = tree.insert(span);
+            let text_id = tree.insert(Node::new_text(text));
+            tree.append_child(span_id, text_id);
+            tree.append_child(code_id, span_id);
+        }
+        build_render_plan(&tree, code_id).expect("plan")
+    }
+
+    /// The motivating case: a declared row of coloured spans fuses into one
+    /// string whose runs cover it exactly, in order, with each span's colour.
+    #[test]
+    fn inline_runs_fuse_a_declared_highlighted_row() {
+        let plan = highlighted_row(
+            true,
+            &[("let", "#569cd6"), (" x = ", "#d4d4d4"), ("(", "#ffd700")],
+            |_| {},
+        );
+        let (text, runs) = inline_text_runs(&plan).expect("declared row must fuse");
+        assert_eq!(text, "let x = (");
+        assert_eq!(
+            runs,
+            vec![
+                InlineTextRun {
+                    len: 3,
+                    color: Some("#569cd6".into())
+                },
+                InlineTextRun {
+                    len: 5,
+                    color: Some("#d4d4d4".into())
+                },
+                InlineTextRun {
+                    len: 1,
+                    color: Some("#ffd700".into())
+                },
+            ]
+        );
+        // The runs must tile the fused string with no gap and no overlap --
+        // that is precisely the contract `with_highlights` is handed.
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+    }
+
+    /// THE NEGATIVE CONTROL FOR EVERY TEST ABOVE AND BELOW. The same row
+    /// without the attribute must NOT fuse, which is what shows the fusing
+    /// is driven by the declaration rather than happening to everything.
+    #[test]
+    fn inline_runs_decline_a_row_that_did_not_declare_itself() {
+        let plan = highlighted_row(false, &[("let", "#569cd6"), (" x", "#d4d4d4")], |_| {});
+        assert_eq!(inline_text_runs(&plan), None);
+    }
+
+    /// A span that can be clicked is not just text: fusing it away would
+    /// delete the hit target, so the whole row keeps its own elements.
+    #[test]
+    fn inline_runs_decline_a_row_whose_span_has_a_handler() {
+        extern "C" fn noop(_p: *const crate::input::GpuiEventPayload) {}
+        let plan = highlighted_row(true, &[("let", "#569cd6"), (" x", "#d4d4d4")], |span| {
+            span.event_listeners
+                .entry("click".into())
+                .or_default()
+                .push(EventListener {
+                    callback: noop,
+                    callback_id: 0,
+                });
+        });
+        assert_eq!(inline_text_runs(&plan), None);
+    }
+
+    /// A span with box styling (here a background) is painted in its own
+    /// right. The check is by difference from the default style, so this
+    /// also guards every property nobody has thought of yet.
+    #[test]
+    fn inline_runs_decline_a_row_whose_span_has_box_styling() {
+        let plan = highlighted_row(true, &[("let", "#569cd6"), (" x", "#d4d4d4")], |span| {
+            span.styles.insert("background".into(), "#333".into());
+        });
+        assert_eq!(inline_text_runs(&plan), None);
+    }
+
+    /// A span declaring a window region acts on the window when pressed.
+    #[test]
+    fn inline_runs_decline_a_row_whose_span_is_a_window_region() {
+        let plan = highlighted_row(true, &[("let", "#569cd6"), (" x", "#d4d4d4")], |span| {
+            span.attributes
+                .insert(crate::regions::REGION_ATTRIBUTE.into(), "drag".into());
+        });
+        assert_eq!(inline_text_runs(&plan), None);
+    }
+
+    /// A span with no colour of its own keeps the inherited one: the run is
+    /// still emitted, so the runs go on tiling the string.
+    #[test]
+    fn inline_runs_keep_an_uncoloured_span_as_an_inherited_run() {
+        let mut tree = Tree::new();
+        let mut code = Node::new_element("span");
+        code.attributes
+            .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        let code_id = tree.insert(code);
+        for (text, color) in [("ab", Some("#111111")), ("cd", None)] {
+            let mut span = Node::new_element("span");
+            if let Some(c) = color {
+                span.styles.insert("color".into(), c.into());
+            }
+            let span_id = tree.insert(span);
+            let text_id = tree.insert(Node::new_text(text));
+            tree.append_child(span_id, text_id);
+            tree.append_child(code_id, span_id);
+        }
+        let plan = build_render_plan(&tree, code_id).expect("plan");
+        let (text, runs) = inline_text_runs(&plan).expect("must fuse");
+        assert_eq!(text, "abcd");
+        assert_eq!(runs[1].color, None);
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+    }
+
+    /// Run lengths are BYTE lengths, because `with_highlights` takes byte
+    /// ranges. A row of multi-byte characters is where a character count
+    /// would silently produce ranges that land mid-character.
+    #[test]
+    fn inline_runs_measure_multibyte_spans_in_bytes() {
+        let plan = highlighted_row(true, &[("λx", "#569cd6"), ("→y", "#d4d4d4")], |_| {});
+        let (text, runs) = inline_text_runs(&plan).expect("must fuse");
+        assert_eq!(runs[0].len, "λx".len());
+        assert_eq!(runs[1].len, "→y".len());
+        assert_ne!(runs[0].len, "λx".chars().count(), "byte length, not chars");
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+        // Every boundary the ranges imply must be a character boundary.
+        let mut at = 0usize;
+        for run in &runs {
+            assert!(text.is_char_boundary(at));
+            at += run.len;
+        }
+        assert!(text.is_char_boundary(at));
+    }
+
+    /// A declared container with no children has nothing to fuse.
+    #[test]
+    fn inline_runs_decline_an_empty_container() {
+        let mut tree = Tree::new();
+        let mut code = Node::new_element("span");
+        code.attributes
+            .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        let code_id = tree.insert(code);
+        let plan = build_render_plan(&tree, code_id).expect("plan");
+        assert_eq!(inline_text_runs(&plan), None);
+    }
+
+    /// `"0"` and `"false"` turn the declaration off, so a caller can carry
+    /// the attribute and decide per frame.
+    #[test]
+    fn inline_runs_honour_a_negative_declaration() {
+        for off in ["0", "false"] {
+            let mut tree = Tree::new();
+            let mut code = Node::new_element("span");
+            code.attributes
+                .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), off.into());
+            let code_id = tree.insert(code);
+            let mut span = Node::new_element("span");
+            span.styles.insert("color".into(), "#fff".into());
+            let span_id = tree.insert(span);
+            let text_id = tree.insert(Node::new_text("x"));
+            tree.append_child(span_id, text_id);
+            tree.append_child(code_id, span_id);
+            let plan = build_render_plan(&tree, code_id).expect("plan");
+            assert_eq!(inline_text_runs(&plan), None, "attribute value {off:?}");
+        }
+    }
 
     #[test]
     fn test_classify_div() {

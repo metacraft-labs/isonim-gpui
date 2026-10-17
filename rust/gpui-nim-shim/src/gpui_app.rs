@@ -20,9 +20,10 @@ use crate::window;
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 use gpui::{
     div, img, px, rgb, rgba, size, AbsoluteLength, AnyElement, App, AppContext as _, Application,
-    AsyncApp, Bounds, Context, Decorations, Div, FontWeight, Hsla, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, QuitMode, Render, Rgba, Styled, Subscription, TitlebarOptions,
-    WeakEntity, Window, WindowBounds, WindowDecorations, WindowOptions,
+    AsyncApp, Bounds, Context, Decorations, Div, FontWeight, HighlightStyle, Hsla,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, QuitMode, Render, Rgba, Styled,
+    StyledText, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowDecorations,
+    WindowOptions,
 };
 
 // RS-M14 Phase 2 (git pin): `Application::new()` from crates.io `gpui = "0.2"`
@@ -866,15 +867,29 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
     let mut el = div();
     el = apply_styles_to_div(el, &plan.styles);
 
-    // Add children
-    for child in &plan.children {
-        el = el.child(render_plan_to_gpui(child));
-    }
+    // A DECLARED INLINE FORMATTING CONTEXT IS ONE TEXT ELEMENT, NOT ONE PER
+    // SPAN (`render_sync::INLINE_TEXT_RUNS_ATTRIBUTE`, which carries the full
+    // reasoning). GPUI rounds each text element's width up to a whole logical
+    // pixel, so a row built from one element per coloured span accumulates
+    // that rounding span by span and drifts right of where a browser puts the
+    // same text. Fused, the row is rounded once.
+    //
+    // Everything below — events, pointer listeners, window regions — is
+    // reached either way: only how the children are built changes.
+    match fused_inline_text(plan) {
+        Some(fused) => el = el.child(fused),
+        None => {
+            // Add children
+            for child in &plan.children {
+                el = el.child(render_plan_to_gpui(child));
+            }
 
-    // If the node has direct text content, add it as a child
-    if let Some(ref text) = plan.text {
-        if !text.is_empty() {
-            el = el.child(text.clone());
+            // If the node has direct text content, add it as a child
+            if let Some(ref text) = plan.text {
+                if !text.is_empty() {
+                    el = el.child(text.clone());
+                }
+            }
         }
     }
 
@@ -888,6 +903,39 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
 
     el = wire_pointer_listeners(el, plan);
     wire_window_region(el, plan)
+}
+
+/// The single text element a declared inline formatting context collapses
+/// to, or `None` when `plan` is not one (see `inline_text_runs`).
+///
+/// The per-span colours are handed over as HIGHLIGHTS rather than as finished
+/// `TextRun`s. A `TextRun` must name a concrete `Font`, which this function
+/// has no business choosing: the row's family, size and weight are inherited
+/// from an ancestor and are known only once the window lays the element out.
+/// `with_highlights` is resolved against `window.text_style()` at layout time
+/// (`gpui-pre/src/elements/text.rs`), so the fused row keeps exactly the face
+/// the unfused spans would have been drawn in, and only the colour is stated
+/// here.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn fused_inline_text(plan: &crate::render_sync::RenderNode) -> Option<StyledText> {
+    let (text, runs) = crate::render_sync::inline_text_runs(plan)?;
+    let mut offset = 0usize;
+    let mut highlights = Vec::with_capacity(runs.len());
+    for run in &runs {
+        let range = offset..offset + run.len;
+        offset = range.end;
+        // A span whose colour does not parse keeps the inherited colour,
+        // which is what an unparsable `color` does to an unfused span too.
+        let color = run.color.as_deref().and_then(parse_color);
+        highlights.push((
+            range,
+            HighlightStyle {
+                color,
+                ..Default::default()
+            },
+        ));
+    }
+    Some(StyledText::new(text).with_highlights(highlights))
 }
 
 /// GWIN: give an element its window region (`regions.rs`). A drag region
