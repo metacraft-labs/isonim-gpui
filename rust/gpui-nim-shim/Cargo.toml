@@ -36,6 +36,9 @@ gpui-backend = [
     "dep:objc2",
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
+    "dep:core-foundation",
+    "dep:core-foundation-sys",
+    "dep:libc",
 ]
 # RS-M14 Phase 2: enable the headless RGBA rendering path via Zed's
 # `HeadlessAppContext::with_platform` + `Window::render_to_image`. Coexists
@@ -55,6 +58,9 @@ gpui-headless = [
     "dep:objc2",
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
+    "dep:core-foundation",
+    "dep:core-foundation-sys",
+    "dep:libc",
     "gpui/test-support",
     "gpui",
     "gpui_platform/test-support",
@@ -117,6 +123,15 @@ objc2-foundation = { version = "0.3.2", default-features = false, optional = tru
     "NSNotification",
     "std",
 ] }
+# macOS text-smoothing policy (`window::apply_chromium_font_smoothing_policy`).
+# Both crates are ALREADY in this workspace's lock as transitive dependencies of
+# `gpui-pre-macos` 0.3.5, at exactly these versions, so naming them here adds a
+# dependency EDGE and no new crate. Optional, and reached only from the two
+# gpui features, so the featureless cdylib is unchanged by their presence.
+core-foundation = { version = "0.10", optional = true }
+core-foundation-sys = { version = "0.8.6", optional = true }
+# `atexit`, to drop the font-smoothing key again when the process ends.
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 serial_test = "3"

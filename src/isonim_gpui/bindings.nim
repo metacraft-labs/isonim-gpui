@@ -495,6 +495,12 @@ proc gpui_add_font_file*(path: cstring): uint8
   ## Before `gpui_launch`: register a TrueType/OpenType file so `font-family`
   ## can name its family. 1 on success, 0 if unreadable.
 
+proc gpui_font_report*(): pointer
+  {.importc: "gpui_font_report".}
+  ## What the text system RESOLVED for the faces this process draws in, as
+  ## JSON; nil before a launch has registered fonts. Free with
+  ## `gpui_free_string`. Also written to `GPUI_FONT_REPORT_PATH` when set.
+
 proc gpui_launch_window_id*(): uint32
   {.importc: "gpui_launch_window_id".}
   ## The window `gpui_launch` is opening: valid inside the root builder and

@@ -21,6 +21,10 @@
  *                  (gpui-pre-linux's `wl_pointer` handler) ignores a
  *                  continuous `axis` whose source is the wheel and scrolls
  *                  by the `axis_discrete` / `axis_value120` steps alone.
+ *   hwheel N       turn the HORIZONTAL wheel N notches (positive: right) —
+ *                  a tilt wheel's or a sideways swipe's discrete steps, on
+ *                  the horizontal axis, so a client's horizontal scroll
+ *                  (its `dx`) is driven by a real device event.
  *   sleep MS       wait MS milliseconds
  *   quit           exit (end of input does too)
  *
@@ -114,6 +118,13 @@ int main(int argc, char **argv) {
       zwlr_virtual_pointer_v1_axis_source(ptr, WL_POINTER_AXIS_SOURCE_WHEEL);
       zwlr_virtual_pointer_v1_axis_discrete(
           ptr, now_ms(), WL_POINTER_AXIS_VERTICAL_SCROLL,
+          wl_fixed_from_double(15.0 * notches), notches);
+      zwlr_virtual_pointer_v1_frame(ptr);
+    } else if (sscanf(line, "hwheel %lf", &a) == 1) {
+      int notches = (int)a;
+      zwlr_virtual_pointer_v1_axis_source(ptr, WL_POINTER_AXIS_SOURCE_WHEEL);
+      zwlr_virtual_pointer_v1_axis_discrete(
+          ptr, now_ms(), WL_POINTER_AXIS_HORIZONTAL_SCROLL,
           wl_fixed_from_double(15.0 * notches), notches);
       zwlr_virtual_pointer_v1_frame(ptr);
     } else if (sscanf(line, "sleep %lf", &a) == 1) {

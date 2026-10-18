@@ -24,6 +24,21 @@ type
   GpuiRenderer* = object
     ## Renderer backend that delegates to GPUI via FFI.
 
+const inlineTextRunsAttribute* = "data-inline-text-runs"
+  ## Declares an element an INLINE FORMATTING CONTEXT: its text-only children
+  ## are drawn as ONE piece of text carrying a colour per span, rather than as
+  ## one text element per span.
+  ##
+  ## Give it to a container whose children are spans of differently coloured
+  ## text on one line — a syntax-highlighted row of code is the motivating
+  ## case. A GPUI text element rounds its width up to a whole logical pixel,
+  ## so one element per span applies that rounding once per span and the
+  ## error accumulates along the row; fused, the row is rounded once, which
+  ## is what a browser's inline layout does. A child that is anything other
+  ## than plain text — it has a handler, a window region, or any box styling
+  ## beyond `color` and `flex-shrink` — makes the renderer keep every span as
+  ## its own element, so the declaration is safe to leave in place.
+
 # ===========================================================================
 # Tag mapping: HTML tags -> GPUI element model
 # ===========================================================================

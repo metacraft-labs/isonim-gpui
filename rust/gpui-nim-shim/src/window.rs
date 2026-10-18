@@ -426,22 +426,48 @@ pub fn requested_decorations() -> Option<u8> {
 /// a family the application names in `font-family` is drawn in that face
 /// rather than in the platform's fallback. Kept, not consumed: a process that
 /// launches more than once registers them with each app.
-static FONTS: Mutex<Vec<std::sync::Arc<Vec<u8>>>> = Mutex::new(Vec::new());
+static FONTS: Mutex<Vec<(String, std::sync::Arc<Vec<u8>>)>> = Mutex::new(Vec::new());
 
 /// Read a font file (TrueType or OpenType) and keep it for every launch.
 /// Errors: the file cannot be read, or it is empty.
+///
+/// The PATH is kept beside the bytes so `font_report` can name the concrete
+/// file a family came from. A family name alone does not identify a face —
+/// two builds of "Space Mono" with different `hmtx` tables answer to the same
+/// name and set text to different widths — and naming the file is the only
+/// way a parity reading can show the two front-ends loaded the same outlines.
 pub fn add_font_file(path: &str) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     if bytes.is_empty() {
         return Err(format!("{path}: empty"));
     }
-    take_lock(&FONTS).push(std::sync::Arc::new(bytes));
+    take_lock(&FONTS).push((path.to_string(), std::sync::Arc::new(bytes)));
     Ok(())
 }
 
 /// The registered fonts' bytes, in registration order.
 pub fn fonts() -> Vec<std::sync::Arc<Vec<u8>>> {
-    take_lock(&FONTS).clone()
+    take_lock(&FONTS).iter().map(|(_, b)| b.clone()).collect()
+}
+
+/// The registered fonts' paths, in registration order.
+pub fn font_paths() -> Vec<String> {
+    take_lock(&FONTS).iter().map(|(p, _)| p.clone()).collect()
+}
+
+/// The text system's answer about the faces this process registered, as JSON,
+/// published by `gpui_app::register_fonts` once the app's text system exists.
+/// `None` until a launch has registered fonts.
+static FONT_REPORT: Mutex<Option<String>> = Mutex::new(None);
+
+/// Publish the resolved-face report. Called by the backend once, at launch.
+pub fn set_font_report(json: String) {
+    *take_lock(&FONT_REPORT) = Some(json);
+}
+
+/// The resolved-face report, or `None` before a launch has produced one.
+pub fn font_report() -> Option<String> {
+    take_lock(&FONT_REPORT).clone()
 }
 
 /// The registry id of the window `gpui_launch` is opening, from just before
@@ -1363,8 +1389,404 @@ pub fn text_antialiasing(env: Option<&str>, fc_rgba: Option<&str>) -> Option<Tex
 }
 
 /// fontconfig's `rgba` for the default sans face (`fc-match`), or `None`
-/// when fontconfig cannot be asked.
+/// when fontconfig does not govern this platform's text stack or cannot be
+/// asked.
+///
+/// NOT ASKED ON macOS, AND THIS IS THE POINT OF THE FUNCTION RATHER THAN A
+/// DETAIL OF IT. The rule above is "as Chromium chooses it **on Linux**",
+/// and Chromium only consults fontconfig there. On macOS it renders through
+/// CoreText and takes the smoothing the system dictates; fontconfig has no
+/// say, and a macOS box that happens to have fontconfig installed — every
+/// one that enters this repo's Nix dev shell does — is not thereby a
+/// desktop whose text policy fontconfig states.
+///
+/// Measured on aarch64-darwin inside `codetracer`'s dev shell, 2026-10-17:
+/// `fc-match -f '%{rgba}' sans-serif` exits 0 and prints THE EMPTY STRING.
+/// That returned `Some("")`, which `text_antialiasing` maps — correctly, for
+/// Linux — to `Grayscale`, because on Linux an empty `rgba` is fontconfig
+/// saying "this display has no subpixel order". So the GPUI window was
+/// OVERRIDING its platform default and forcing grayscale on macOS off an
+/// answer that carried no information. The empty string is "unset", and
+/// only on Linux does "unset" mean "grayscale".
+///
+/// Returning `None` here puts macOS back on GPUI's platform default, which
+/// is the CoreText path Chromium also takes. `ISONIM_GPUI_TEXT_RENDERING`
+/// still overrides on every platform, so the behaviour remains reachable
+/// for a test or a comparison. Linux is untouched: `text_antialiasing` and
+/// its unit tests are unchanged, and this function still shells out there.
+/// What `apply_chromium_font_smoothing_policy` did, so the caller can report
+/// it rather than assume it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontSmoothingPolicy {
+    /// Not macOS: CoreGraphics stem darkening does not exist here.
+    NotApplicable,
+    /// `ISONIM_GPUI_FONT_SMOOTHING=platform` asked for the platform default.
+    /// This is the "before" arm of the parity A/B, and the only way to get
+    /// the dilated rendering back out of the same binary. `dilation_probe`
+    /// is read, not set: it is what the platform decides on its own, and it
+    /// is what makes the other arm's 0 a discriminating result rather than a
+    /// constant.
+    LeftToPlatform { dilation_probe: u8 },
+    /// An explicit `AppleFontSmoothing` already existed and was NOT written
+    /// by this software, so it was read and LEFT EXACTLY AS IT WAS. Carries
+    /// the value found and the resulting dilation, which may legitimately be
+    /// either 0 or non-zero.
+    RespectedExistingSetting { found: i64, dilation_probe: u8 },
+    /// An `AppleFontSmoothing` written by a PREVIOUS run of this software was
+    /// found, identified by its ownership marker. It is ours to manage, so it
+    /// is kept and the exit cleanup is re-armed. This is the normal state
+    /// after a run that was killed rather than allowed to exit.
+    ReclaimedOwnSetting { found: i64, dilation_probe: u8 },
+    /// No explicit value existed; smoothing was disabled for this process and
+    /// the memoised answer was confirmed by probing the real text system.
+    /// `dilation_probe` is `glyph_dilation_for_color(white)` and MUST be 0.
+    DisabledForThisProcess { dilation_probe: u8 },
+    /// The preference was applied but the probe did not come back 0, so the
+    /// `OnceLock` had already been resolved by an earlier rasterisation.
+    /// Reported loudly rather than silently tolerated.
+    AppliedTooLate { dilation_probe: u8 },
+}
+
+/// How `apply_chromium_font_smoothing_policy` should behave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontSmoothingMode {
+    /// Leave macOS alone: the dilated, platform-default rendering.
+    Platform,
+    /// Set the preference, force the memo, then remove the key again.
+    Transient,
+    /// Set the preference and LEAVE it in place for the process lifetime.
+    Retained,
+}
+
+/// The environment override, parsed. Anything unrecognised takes the
+/// default, so a typo cannot silently restore stem darkening.
+pub fn font_smoothing_mode(env: Option<&str>, default: FontSmoothingMode) -> FontSmoothingMode {
+    match env.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("platform") => FontSmoothingMode::Platform,
+        Some("transient") => FontSmoothingMode::Transient,
+        Some("retained") => FontSmoothingMode::Retained,
+        _ => default,
+    }
+}
+
+#[cfg(test)]
+mod font_smoothing_override_tests {
+    use super::*;
+
+    /// Only `platform` opts out. Anything else — including the empty string
+    /// and an unknown word — takes the Chromium-matching policy, so a typo
+    /// cannot silently restore stem darkening.
+    #[test]
+    fn only_platform_opts_out() {
+        let d = FontSmoothingMode::Transient;
+        assert_eq!(font_smoothing_mode(Some("platform"), d), FontSmoothingMode::Platform);
+        assert_eq!(font_smoothing_mode(Some("  PLATFORM  "), d), FontSmoothingMode::Platform);
+        assert_eq!(font_smoothing_mode(Some("retained"), d), FontSmoothingMode::Retained);
+        assert_eq!(font_smoothing_mode(Some("transient"), d), FontSmoothingMode::Transient);
+        // Unrecognised input takes the default rather than the platform path.
+        assert_eq!(font_smoothing_mode(None, d), d);
+        assert_eq!(font_smoothing_mode(Some("auto"), d), d);
+        assert_eq!(font_smoothing_mode(Some(""), d), d);
+        assert_eq!(font_smoothing_mode(Some("disabled"), d), d);
+    }
+}
+
+/// Set once this process has written `AppleFontSmoothing` itself, so the exit
+/// handler only ever removes a key THIS process created. A key that was
+/// already there when we looked is someone else's and is never touched.
+/// The companion key that marks `AppleFontSmoothing` in this application's
+/// own domain as written by this software rather than chosen by the user.
+/// Without it the two are indistinguishable, and a leftover from a killed run
+/// would be mistaken for a deliberate user setting on the next launch — which
+/// is exactly what happened before this marker existed.
+#[cfg(all(target_os = "macos", feature = "gpui"))]
+const FONT_SMOOTHING_OWNER_KEY: &str = "IsonimGpuiManagedAppleFontSmoothing";
+
+#[cfg(all(target_os = "macos", feature = "gpui"))]
+static FONT_SMOOTHING_KEY_OWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Drop the key again when the process ends.
+///
+/// `extern "C"` because it is handed to `atexit`, which is used in preference
+/// to the code after `Application::run` returns: `atexit` also covers the
+/// `exit()` that `-[NSApplication terminate:]` performs, and that path unwinds
+/// nothing (see `stop_platform_loop` in `gpui_app.rs`). A crash still leaves
+/// the key behind; the next launch then takes the `RespectedExistingSetting`
+/// branch, which renders correctly, so the failure mode is a muddied
+/// provenance rather than a wrong frame.
+#[cfg(all(target_os = "macos", feature = "gpui"))]
+extern "C" fn drop_font_smoothing_key_at_exit() {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::preferences::{
+        kCFPreferencesCurrentApplication, CFPreferencesAppSynchronize, CFPreferencesSetAppValue,
+    };
+    if !FONT_SMOOTHING_KEY_OWNED.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    for name in ["AppleFontSmoothing", FONT_SMOOTHING_OWNER_KEY] {
+        let key = CFString::new(name);
+        unsafe {
+            CFPreferencesSetAppValue(
+                key.as_concrete_TypeRef(),
+                std::ptr::null(),
+                kCFPreferencesCurrentApplication,
+            );
+        }
+    }
+    // Removal is durable without this (measured), but at exit there may be no
+    // later opportunity for the asynchronous flush, so force it.
+    unsafe {
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+    }
+}
+
+/// Mark the key as ours and register the exit handler exactly once.
+#[cfg(all(target_os = "macos", feature = "gpui"))]
+fn arm_font_smoothing_cleanup() {
+    use std::sync::atomic::Ordering;
+    FONT_SMOOTHING_KEY_OWNED.store(true, Ordering::SeqCst);
+    static ARMED: std::sync::Once = std::sync::Once::new();
+    ARMED.call_once(|| unsafe {
+        libc::atexit(drop_font_smoothing_key_at_exit);
+    });
+}
+
+/// Ask CoreGraphics NOT to stem-darken this process's glyphs, matching what
+/// the Electron front-end asks Chromium for.
+///
+/// WHY THIS EXISTS. `codetracer.css:1515` sets `-webkit-font-smoothing:
+/// antialiased` on `body`, which tells Chromium to draw glyphs with plain
+/// grayscale antialiasing and NO stem darkening. GPUI makes the opposite
+/// request on macOS: `gpui-pre-macos-0.3.5/src/text_system.rs:502-507` calls
+/// `CGContext::set_should_smooth_fonts(true)` plus a luminance gray fill
+/// whenever `glyph_dilation_for_color` returns non-zero, and that level is
+/// `((4.0 * luminance) + 0.5).floor()` clamped to `0..=4`
+/// (`text_system.rs:218-229`), so CodeTracer's light text on `#1b1b1b` lands
+/// at 3 or 4 — always dilated. Measured on aarch64-darwin, the two front-ends
+/// then differ by ~21% of ink on the same digits at the same positions.
+///
+/// HOW IT IS TURNED OFF. `text_system.rs:222` short-circuits the whole
+/// computation on `!font_smoothing_allowed_by_user()`, which reads the
+/// `AppleFontSmoothing` preference through `CFPreferencesCopyAppValue` for
+/// `kCFPreferencesCurrentApplication` and treats ONLY an explicit `0` as
+/// disabled. There is no API to set it directly: the answer is memoised in a
+/// process-global `OnceLock` (`text_system.rs:232-233`), so the preference has
+/// to be in place before the first glyph is rasterised. A launch argument
+/// cannot carry it either — `codetracer`'s `main.nim:648` refuses unknown `-`
+/// options — so the preference domain is the remaining route. The `=0.3.5`
+/// pin is untouched and no crate source is patched.
+///
+/// WHAT IT DOES TO THE USER'S PREFERENCES: NOTHING DURABLE. The key is set,
+/// the `OnceLock` is forced while it is visible by probing the real text
+/// system, and the key is then REMOVED again. Measured on aarch64-darwin
+/// 2026-10-18 with a standalone CoreFoundation probe: a value set with
+/// `CFPreferencesSetAppValue` is visible to `CFPreferencesCopyAppValue` in the
+/// same process WITHOUT `CFPreferencesAppSynchronize`, and removing it with a
+/// NULL value is durable without one too — a fresh process afterwards reports
+/// the domain/key pair does not exist. (Reading the `.plist` FILE is not a
+/// valid check: it lags `cfprefsd` and showed the removed key still present
+/// for seconds after a new process could no longer see it.)
+///
+/// AND IT NEVER OVERRIDES A DELIBERATE CHOICE. If any explicit
+/// `AppleFontSmoothing` is already visible — the user's, or an
+/// administrator's — it is read and left alone, and the caller reports
+/// `RespectedExistingSetting`.
+#[cfg(all(target_os = "macos", feature = "gpui"))]
+pub fn apply_chromium_font_smoothing_policy(
+    text_system: &dyn gpui::PlatformTextSystem,
+    mode: FontSmoothingMode,
+) -> FontSmoothingPolicy {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::preferences::{
+        kCFPreferencesCurrentApplication, CFPreferencesCopyAppValue, CFPreferencesSetAppValue,
+    };
+
+    if mode == FontSmoothingMode::Platform {
+        // Probe anyway. Reading the platform's own answer costs nothing, and
+        // without it the other arm's 0 would be a number with nothing to be
+        // different from.
+        let dilation_probe = text_system.glyph_dilation_for_color(gpui::white());
+        return FontSmoothingPolicy::LeftToPlatform { dilation_probe };
+    }
+
+    let key = CFString::new("AppleFontSmoothing");
+
+    // 1. Read what is there now, and defer to it if anything is.
+    let existing = unsafe {
+        CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), kCFPreferencesCurrentApplication)
+    };
+    if !existing.is_null() {
+        let value = unsafe { CFType::wrap_under_create_rule(existing) };
+        // A non-number is still an explicit choice; report it as one rather
+        // than overwriting something this code does not understand.
+        let found = value
+            .downcast_into::<CFNumber>()
+            .and_then(|n| n.to_i64())
+            .unwrap_or(i64::MIN);
+        // Ours, or the user's? Only the marker can tell them apart.
+        let marker = CFString::new(FONT_SMOOTHING_OWNER_KEY);
+        let marker_ref = unsafe {
+            CFPreferencesCopyAppValue(
+                marker.as_concrete_TypeRef(),
+                kCFPreferencesCurrentApplication,
+            )
+        };
+        let ours = !marker_ref.is_null();
+        if ours {
+            // Balance the copy rule.
+            drop(unsafe { CFType::wrap_under_create_rule(marker_ref) });
+        }
+        let dilation_probe = text_system.glyph_dilation_for_color(gpui::white());
+        return if ours {
+            // A previous run was killed before its exit handler could run.
+            // Re-arm it rather than leaving the key orphaned for good.
+            arm_font_smoothing_cleanup();
+            FontSmoothingPolicy::ReclaimedOwnSetting {
+                found,
+                dilation_probe,
+            }
+        } else {
+            FontSmoothingPolicy::RespectedExistingSetting {
+                found,
+                dilation_probe,
+            }
+        };
+    }
+
+    // 2. Mark the key as ours FIRST, then disable smoothing.
+    //
+    //    THE ORDER IS THE WHOLE POINT, because this process can be killed
+    //    between the two writes and `atexit` does not run on SIGTERM -- the
+    //    capture lane ends every app that way, so a kill here is the common
+    //    case and not an exotic one. Writing `AppleFontSmoothing` first
+    //    leaves, in that window, an UNMARKED value that the next run reads
+    //    as `RespectedExistingSetting`: the code would then believe the
+    //    user chose it, decline to manage it, and never remove it. That
+    //    orphan is permanent, and it silently holds a macOS text setting
+    //    down for this application with no trace of where it came from.
+    //
+    //    Writing the marker first makes that state unreachable. A kill now
+    //    leaves either the marker alone -- harmless, since step 1 keys off
+    //    `AppleFontSmoothing` and simply proceeds -- or both keys, which
+    //    the next run correctly reclaims. The worst residue becomes a
+    //    self-healing one.
+    if mode == FontSmoothingMode::Retained {
+        let marker = CFString::new(FONT_SMOOTHING_OWNER_KEY);
+        let one = CFNumber::from(1i32);
+        unsafe {
+            CFPreferencesSetAppValue(
+                marker.as_concrete_TypeRef(),
+                one.as_CFTypeRef(),
+                kCFPreferencesCurrentApplication,
+            );
+        }
+    }
+    let zero = CFNumber::from(0i32);
+    unsafe {
+        CFPreferencesSetAppValue(
+            key.as_concrete_TypeRef(),
+            zero.as_CFTypeRef(),
+            kCFPreferencesCurrentApplication,
+        );
+    }
+
+    // 3. Force the `OnceLock` WHILE the preference is visible, through the
+    //    very function whose behaviour we are trying to change. White is the
+    //    worst case: luminance 1.0 gives level 4, the maximum dilation, so a
+    //    0 here cannot be a colour that happens not to dilate.
+    let dilation_probe = text_system.glyph_dilation_for_color(gpui::white());
+
+    // 4. Put the preference domain back -- or, in `Retained` mode, keep the
+    //    key for the process lifetime and arrange to drop it at exit.
+    //
+    //    WHY `Retained` IS THE DEFAULT, AND THIS IS A MEASUREMENT, NOT A
+    //    PREFERENCE. Satisfying the `OnceLock` is NOT sufficient. Measured on
+    //    aarch64-darwin against codetracer 3fce565eb / isonim-gpui 5776cd936
+    //    plus this change, over the three comparable PLAT-37 views against a
+    //    byte-fixed Electron reference: removing the key once the memo is
+    //    resolved (`Transient`) moves the three-view mean `fracOver0_10` by
+    //    only -1.82%, while keeping it in place (`Retained`) moves it by
+    //    -6.77%. The probe reads 0 in BOTH, so GPUI's own dilation is off in
+    //    both and the missing 4.95 points are not GPUI's: CoreGraphics
+    //    consults `AppleFontSmoothing` again when the glyph is actually
+    //    drawn. `Retained` reproduces an earlier external
+    //    `defaults write codetracer-gpui AppleFontSmoothing -int 0` A/B to
+    //    every digit (editorWithMark mean 0.07505948, p90 0.26755214,
+    //    fracOver0_10 0.16467496), which is two unrelated mechanisms agreeing.
+    if mode == FontSmoothingMode::Transient {
+        unsafe {
+            CFPreferencesSetAppValue(
+                key.as_concrete_TypeRef(),
+                std::ptr::null(),
+                kCFPreferencesCurrentApplication,
+            );
+        }
+    } else {
+        arm_font_smoothing_cleanup();
+    }
+
+    if dilation_probe == 0 {
+        FontSmoothingPolicy::DisabledForThisProcess { dilation_probe }
+    } else {
+        FontSmoothingPolicy::AppliedTooLate { dilation_probe }
+    }
+}
+
+/// Apply the policy and say on stderr what happened. The line is the parity
+/// lane's evidence that the preference reached the `OnceLock`, so it is
+/// printed in every arm, including the ones that change nothing.
+#[cfg(all(target_os = "macos", feature = "gpui"))]
+pub fn apply_and_report_font_smoothing_policy(
+    text_system: &dyn gpui::PlatformTextSystem,
+) -> FontSmoothingPolicy {
+    let env = std::env::var("ISONIM_GPUI_FONT_SMOOTHING").ok();
+    let mode = font_smoothing_mode(env.as_deref(), FontSmoothingMode::Retained);
+    let outcome = apply_chromium_font_smoothing_policy(text_system, mode);
+    match outcome {
+        FontSmoothingPolicy::DisabledForThisProcess { dilation_probe } => eprintln!(
+            "gpui-nim-shim: font-smoothing disabled for this process \
+             (mode={mode:?}, glyph_dilation_for_color(white)={dilation_probe}); \
+             matches codetracer.css -webkit-font-smoothing: antialiased"
+        ),
+        FontSmoothingPolicy::AppliedTooLate { dilation_probe } => eprintln!(
+            "gpui-nim-shim: font-smoothing preference applied TOO LATE \
+             (glyph_dilation_for_color(white)={dilation_probe}, expected 0): \
+             a glyph was rasterised before the policy ran"
+        ),
+        FontSmoothingPolicy::ReclaimedOwnSetting {
+            found,
+            dilation_probe,
+        } => eprintln!(
+            "gpui-nim-shim: font-smoothing reclaimed AppleFontSmoothing={found} \
+             left by an earlier run of this software \
+             (glyph_dilation_for_color(white)={dilation_probe})"
+        ),
+        FontSmoothingPolicy::RespectedExistingSetting {
+            found,
+            dilation_probe,
+        } => eprintln!(
+            "gpui-nim-shim: font-smoothing left as the explicit \
+             AppleFontSmoothing={found} already set for this application \
+             (glyph_dilation_for_color(white)={dilation_probe})"
+        ),
+        FontSmoothingPolicy::LeftToPlatform { dilation_probe } => eprintln!(
+            "gpui-nim-shim: font-smoothing left to the platform \
+             (ISONIM_GPUI_FONT_SMOOTHING=platform, \
+             glyph_dilation_for_color(white)={dilation_probe})"
+        ),
+        FontSmoothingPolicy::NotApplicable => {}
+    }
+    outcome
+}
+
 pub fn fontconfig_rgba() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
     let out = std::process::Command::new("fc-match")
         .args(["-f", "%{rgba}", "sans-serif"])
         .output()
@@ -1373,6 +1795,32 @@ pub fn fontconfig_rgba() -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod fontconfig_rgba_platform_tests {
+    use super::*;
+
+    /// macOS must not take a text-rendering policy from fontconfig, however
+    /// loudly fontconfig answers. The assertion is split by platform rather
+    /// than skipped on one, so the test says something on both.
+    #[test]
+    fn fontconfig_is_consulted_on_linux_and_not_on_macos() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(fontconfig_rgba(), None);
+            // And therefore nothing is forced: with no env override the
+            // window keeps GPUI's own platform default.
+            assert_eq!(text_antialiasing(None, fontconfig_rgba().as_deref()), None);
+        } else {
+            // Elsewhere the answer depends on whether fc-match is installed,
+            // so the behaviour under test is that an EMPTY answer still means
+            // grayscale -- the Linux reading this change deliberately keeps.
+            assert_eq!(
+                text_antialiasing(None, Some("")),
+                Some(TextAntialiasing::Grayscale)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
