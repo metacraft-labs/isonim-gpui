@@ -95,7 +95,6 @@ pub struct GpuiStyles {
     /// `text-decoration`: `underline` underlines the element's text.
     pub text_decoration: Option<String>,
     pub line_height: Option<String>,
-    pub letter_spacing: Option<String>,
     pub cursor: Option<String>,
     pub display: Option<String>,
     pub position: Option<String>,
@@ -200,7 +199,6 @@ impl GpuiStyles {
             "font-style" | "font_style" => self.font_style = Some(v),
             "text-decoration" | "text_decoration" => self.text_decoration = Some(v),
             "line-height" | "line_height" => self.line_height = Some(v),
-            "letter-spacing" | "letter_spacing" => self.letter_spacing = Some(v),
             "cursor" => self.cursor = Some(v),
             "display" => self.display = Some(v),
             "position" => self.position = Some(v),
@@ -408,8 +406,9 @@ fn fusable_child_text(child: &RenderNode) -> Option<&str> {
     // italic only when it happens to fuse. The unapplied property is the
     // defect to fix, and fixing it is what would let `font-style` join this
     // set; `inline_runs_decline_a_span_with_a_font_style` is the guard until
-    // then. (Sibling of the filed `letter-spacing` issue, which is the same
-    // shape: parsed, reported, never applied.)
+    // then. (`letter-spacing` had the same shape -- parsed, reported, never
+    // applied -- and was removed from the parser instead, because `gpui-pre`
+    // has no letter-spacing to apply; see `docs/shim-design.md`.)
     //
     // A BOX PROPERTY MUST NEVER BE ADDED HERE, and `padding_left` is the one
     // to think about, because it is how a caller spaces two text runs inside
@@ -995,6 +994,35 @@ mod tests {
         );
         let plain = Node::new_element("span");
         assert_eq!(GpuiStyles::from_node(&plain).text_decoration, None);
+    }
+
+    /// `letter-spacing` IS NOT PARSED, because nothing draws it: `gpui-pre`
+    /// 0.3.5 has no letter-spacing, and no element builder in this shim
+    /// spaces glyphs by hand. A property the shim records but never applies
+    /// makes the render plan disagree with the window, so it falls through to
+    /// the unknown-property arm instead (`docs/shim-design.md`, "Only drawn
+    /// properties are parsed"; issue
+    /// `2026-10-17-letter-spacing-is-parsed-and-reported-but-never-applied.md`).
+    ///
+    /// Compared against the DEFAULT rather than a named field, so the test
+    /// also fails if the value were stored under any other field. Both
+    /// spellings the parser used to accept are checked.
+    #[test]
+    fn test_styles_letter_spacing_is_not_recorded() {
+        for key in ["letter-spacing", "letter_spacing"] {
+            let mut node = Node::new_element("span");
+            node.styles.insert(key.into(), "2px".into());
+            assert_eq!(
+                GpuiStyles::from_node(&node),
+                GpuiStyles::default(),
+                "`{key}` must be ignored as unknown, not recorded"
+            );
+        }
+        // Positive control: a property the shim does draw on the same node
+        // shape is recorded, so the comparison above can fail.
+        let mut drawn = Node::new_element("span");
+        drawn.styles.insert("line-height".into(), "20px".into());
+        assert_ne!(GpuiStyles::from_node(&drawn), GpuiStyles::default());
     }
 
     #[test]
@@ -2170,6 +2198,34 @@ mod integration_tests {
             assert!(json["attributes"].is_object());
             assert_eq!(json["attributes"].as_object().unwrap().len(), 0);
             gpui_destroy_element(node);
+        }
+    }
+
+    /// **The plan does not report `letter-spacing`**, because the window does
+    /// not draw it (issue
+    /// `2026-10-17-letter-spacing-is-parsed-and-reported-but-never-applied.md`).
+    /// A plan that lists a property as set while the pixels ignore it lets a
+    /// plan-level assertion pass on a frame that is wrong. `line-height`, set
+    /// on the same node, is the positive control: it is drawn, so it is
+    /// reported, which shows the `styles` object is being populated at all.
+    #[test]
+    #[serial]
+    fn test_render_plan_does_not_report_letter_spacing() {
+        unsafe {
+            gpui_reset_tree();
+            for key in ["letter-spacing", "letter_spacing"] {
+                let node = gpui_create_element(c("span").as_ptr());
+                gpui_set_style(node, c(key).as_ptr(), c("2px").as_ptr());
+                gpui_set_style(node, c("line-height").as_ptr(), c("20px").as_ptr());
+                let json = get_plan_json(node);
+                assert_eq!(json["styles"]["line_height"], "20px");
+                assert!(
+                    json["styles"].get("letter_spacing").is_none(),
+                    "`{key}` must not appear in the plan: {}",
+                    json["styles"]
+                );
+                gpui_destroy_element(node);
+            }
         }
     }
 

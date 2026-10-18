@@ -275,6 +275,28 @@ fn apply_styles(el: &mut Div, styles: &[(String, String)]) {
 }
 ```
 
+### Only Drawn Properties Are Parsed
+
+A CSS property is parsed into `GpuiStyles` and reported in the render plan's
+`styles` object only if the shim applies it when it builds the drawn element.
+The plan is read as a statement about the window, so a property it reports
+but the window ignores lets a plan-level assertion pass on a wrong frame.
+
+A property the shim cannot draw is not parsed: it falls through to the
+unknown-property arm and is ignored like any other unsupported CSS.
+`letter-spacing` is one — `gpui-pre` has no letter-spacing, and the shim
+does not space glyphs itself. Adding a property to the parser and the dump
+belongs in the same change that makes the element builder apply it.
+
+Known exceptions, which predate the rule and are parsed and reported but not
+applied:
+
+- `font-style` (there is no `italic` in the shim).
+  `inline_runs_decline_a_span_with_a_font_style` keeps it out of inline-run
+  fusion until it is drawn.
+- `min-height`, `max-width` and `max-height`. The element builder applies
+  `min-width` only.
+
 ### Value Parsers
 
 Required parsers for style values:

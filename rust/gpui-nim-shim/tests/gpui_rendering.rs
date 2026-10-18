@@ -586,7 +586,6 @@ fn test_apply_styles_to_div_all_fields() {
             font_weight: None,
             font_style: None,
             line_height: None,
-            letter_spacing: None,
             cursor: Some("pointer".to_string()),
             display: None,
             position: None,
