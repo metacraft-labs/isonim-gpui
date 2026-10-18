@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | open |
+| Status | in-progress (m1:fix-headless-async-render-worker-cannot-buil) |
 | Recorded | 2026-10-02 |
 | Observed in | isonim-gpui @ `4b3ed3e` (`agents`), aarch64-darwin (macOS 15), shim built `--features gpui-headless` |
 | Area | `rust/gpui-nim-shim/src/gpui_headless.rs` `spawn_worker` / `worker_main` / `render_via_cached`; the lane step `rust: cargo test --features gpui-headless` in `ci/run-suite.sh --with-gpui` |
