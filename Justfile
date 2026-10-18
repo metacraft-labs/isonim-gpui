@@ -244,8 +244,23 @@ plat37-shims:
       config="${spec%%:*}"
       flags="${spec#*:}"
       echo "=== ${config} ${flags:-(default)} ==="
+      # THE UPLIFTED ARTEFACT IS DELETED BEFORE EVERY BUILD, because cargo
+      # decides freshness from its fingerprints and the dep-info mtimes, never
+      # from the bytes of the output. `target/debug/libgpui_nim_shim.so` is a
+      # HARDLINK to `target/debug/deps/libgpui_nim_shim.so`, so any `cp` onto
+      # the uplifted path (codetracer's `plat37-capture` swapped arms that way
+      # until 2026-10-18) rewrites cargo's own cached output; the next
+      # `cargo build` then reports the unit fresh and re-uplifts the foreign
+      # bytes. Measured 2026-10-18: the staged FEATURELESS shim was
+      # byte-identical to the headless one (341,153,248 bytes, a gpui
+      # closure), while a genuine featureless link is 8,083,520 bytes with
+      # libgcc + libc only. A MISSING output does make cargo relink (measured:
+      # "Compiling gpui-nim-shim" after the two `rm`s), so this is the
+      # cheapest way to make every staged file the build its name says.
+      rm -f "rust/target/debug/libgpui_nim_shim.${dylib_ext}" \
+        "rust/target/debug/deps/libgpui_nim_shim.${dylib_ext}"
       # shellcheck disable=SC2086  # the flag string must word-split
-      (cd rust && cargo build ${flags})
+      (cd rust && cargo build -p gpui-nim-shim ${flags})
       staged="$out/libgpui_nim_shim.${config}.${dylib_ext}"
       cp "rust/target/debug/libgpui_nim_shim.${dylib_ext}" "${staged}"
       link_closure "${staged}" > "$out/${config}.links.txt" 2>&1 || true
@@ -259,7 +274,19 @@ plat37-shims:
     # every OTHER consumer of this repo expects to find there. A recipe that
     # left a 544 MB windowed cdylib at the shared path would change what the
     # 237-case lane and both sibling repos link, silently.
-    (cd rust && cargo build)
+    rm -f "rust/target/debug/libgpui_nim_shim.${dylib_ext}" \
+      "rust/target/debug/deps/libgpui_nim_shim.${dylib_ext}"
+    (cd rust && cargo build -p gpui-nim-shim)
+    # Three configurations that produced the same bytes are one build under
+    # three names — the stale-artefact state above — so that is refused here
+    # rather than discovered by a differential that compared a build with
+    # itself.
+    sums="$(for c in featureless windowed headless; do
+      cksum <"$out/libgpui_nim_shim.${c}.${dylib_ext}"; done | sort -u | wc -l)"
+    if [ "${sums}" -ne 3 ]; then
+      echo "FAIL: the three staged shims are not three distinct builds" >&2
+      exit 1
+    fi
     echo "OK: three shims in ${out}"
 
 # Run the GUI tests with video recording.
