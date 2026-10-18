@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | in-progress (m1:fix-headless-async-render-worker-cannot-buil) |
+| Status | blocked (m1:fix-headless-async-render-worker-cannot-buil): owner decision required; see below |
 | Recorded | 2026-10-02 |
 | Observed in | isonim-gpui @ `4b3ed3e` (`agents`), aarch64-darwin (macOS 15), shim built `--features gpui-headless` |
 | Area | `rust/gpui-nim-shim/src/gpui_headless.rs` `spawn_worker` / `worker_main` / `render_via_cached`; the lane step `rust: cargo test --features gpui-headless` in `ci/run-suite.sh --with-gpui` |
@@ -134,6 +134,47 @@ Two shapes, and the choice is a design question this issue does not settle.
 Either way, `-6` reaching a caller as *"a panic happened somewhere"* is itself
 worth removing: `worker_main`'s `catch_unwind` converts a precise upstream
 precondition failure into the least informative code the enum has.
+
+## Blocker — 2026-10-18
+
+The suggested direction explicitly leaves the design undecided: "Two shapes,
+and the choice is a design question this issue does not settle." An owner
+must choose between dispatching async rendering to the macOS main queue,
+requiring the embedding process to run a main run loop, and declaring macOS
+async rendering unsupported, weakening the existing success contract.
+
+The issue campaign instructions require recording a blocker rather than
+making an undecided design choice. An independent review found no subsequent
+decision in the renderer documentation or the owning milestones, including
+Editor-Matrix-Closer-2 and PLAT-37. No implementation or test expectations
+were changed.
+
+Fresh reproduction on m1 (Darwin arm64), at the synced `agents` commit
+`443d0b89691581f266fbbd9f370bf1ba294551a2`, still fails for the reported
+reason. The source and tests were unchanged; only this issue record was
+edited while compilation ran. Inside `nix develop`, the compiler was
+`rustc 1.98.1 (48a229cea 2026-09-01)` and Cargo was
+`/nix/store/5wf4lyip5awnvf9zj61hflpk5fj8l9nk-rust-stable-with-components-2026-09-03/bin/cargo`
+(`cargo 1.98.1 (797e8a9bc 2026-08-05)`). Command from the repo root:
+
+```sh
+nix develop --command bash -c 'cd rust && CARGO_BUILD_JOBS=2 RUST_BACKTRACE=1 cargo test --features gpui-headless --test test_async_render async_render_produces_non_empty_buffer -- --nocapture --test-threads=1'
+```
+
+The freshly built test binary was
+`rust/target/debug/deps/test_async_render-5c9d623b7b34cbea`; Cargo exited 101:
+
+```text
+thread 'isonim-gpui-render' panicked at gpui-pre-macos-0.3.5/src/platform.rs:210:46:
+Mac platform not created on main thread
+assertion `left == right` failed: async render must succeed on macOS, got -6
+  left: -6
+ right: 0
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out
+```
+
+This is a focused reproduction, not a full-lane result. No runtime change
+was attempted pending the owner decision.
 
 ## Related
 
