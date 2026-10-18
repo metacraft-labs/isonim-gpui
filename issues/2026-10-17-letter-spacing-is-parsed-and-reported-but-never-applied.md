@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | open |
+| Status | in-progress (m1:fix-letter-spacing-is-parsed-and-reported-bu) |
 | Recorded | 2026-10-17 |
 | Observed in | `isonim-gpui` @ `779f0d1` (branch `agents`) |
 | Area | `rust/gpui-nim-shim/src/render_sync.rs` (`GpuiStyles`, the CSS property table), `src/lib.rs` (the style dump) |
