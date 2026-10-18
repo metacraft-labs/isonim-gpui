@@ -1720,7 +1720,39 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
         // GWIN: the title, identity, minimum size and initial state the
         // application asked for. A maximized window keeps the launch size as
         // its restore size.
-        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
+        // GWIN: the centred origin is SNAPPED TO WHOLE POINTS, because a
+        // fractional one costs the window the size it asked for.
+        //
+        // `Bounds::centered` halves the leftover display extent, so whenever
+        // the display extent and the launch size differ by an ODD number of
+        // points the origin lands on a half point. Measured on this host
+        // (aarch64-darwin, macOS 26.5.2, 1728x1117-point display, 1440x900
+        // launch): x is (1728-1440)/2 = 144 exactly, but y is (1117-900)/2 =
+        // **108.5**. A window opened at a fractional origin does not get the
+        // content area it asked for — AppKit snaps the origin down to a whole
+        // point and GROWS the content view by one point to cover the
+        // remainder. Driven directly against AppKit with gpui's own style
+        // mask (titled|closable|resizable|miniaturizable), a 900-point
+        // content request produced a 901-point content view at y =
+        // 108.25/108.5/108.75 and exactly 900 at y = 108 or 109. The width
+        // was never wrong here for the one reason that its centred origin
+        // happened to be integral.
+        //
+        // One surplus point is not cosmetic: the top bar is top-anchored and
+        // the status bar bottom-anchored, so the surplus lands in the pane
+        // area between them and every row below the top bar is drawn one
+        // point lower than the layout says.
+        //
+        // This is NOT macOS-specific and is deliberately not behind a
+        // `cfg(target_os)`. A window origin is a whole number of pixels on
+        // X11 and Wayland as well, so a fractional origin is an artefact of
+        // the centring arithmetic on every platform rather than a position
+        // any of them can honour; rounding it is correct everywhere and
+        // changes nothing on a display whose arithmetic already came out
+        // even.
+        let mut bounds = Bounds::centered(None, size(px(w), px(h)), cx);
+        bounds.origin.x = bounds.origin.x.round();
+        bounds.origin.y = bounds.origin.y.round();
         let maximized = options.maximized;
         cx.open_window(
             WindowOptions {
