@@ -227,6 +227,41 @@ API contract. Re-read them on every pin bump. At 0.3.5 all three still hold:
   between window removal and `cx.quit()` in `gpui_app.rs` is still
   load-bearing for that reason.
 
+## Window-framing internals this repository overrides
+
+`rust/gpui-nim-shim/src/mac_window_frame.rs` adds
+`constrainFrameRect:toScreen:` to gpui's **`GPUIWindow`** class at run time,
+through the Objective-C runtime, so a window keeps the frame it is given
+instead of being fitted to the screen's visible frame. Read that file's
+header for why (Chromium overrides the same method, and this shim is matching
+Electron's behaviour window-for-window). What a pin bump has to re-check:
+
+- **The class is still named `GPUIWindow`, and still built by a `#[ctor]`**
+  (`gpui-pre-macos-0.3.5/src/window.rs:132-136`). A rename makes the lookup
+  miss; `install_unconstrained_window_frame` then returns `ClassMissing`,
+  the launch path prints it to stderr, and the `wide` viewport comes back
+  clamped. **The lane does not fail silently, but nothing fails loudly
+  either** — the window simply shrinks — so the stderr line is the signal.
+- **`WindowKind::Normal` still allocates `GPUIWindow`, not `GPUIPanel`**
+  (`:1012-1025`). Only `GPUIWindow` is overridden, deliberately: popups,
+  dialogs and floating panels keep stock AppKit constraining.
+- **`GPUIWindow` still does NOT define `constrainFrameRect:toScreen:`
+  itself.** At 0.3.5 `build_window_class` (`:435`) adds 27 methods and
+  this is not one of them. If upstream adds its own, `class_addMethod`
+  refuses, the shim reports `DefinedUpstream` and **leaves it alone** rather
+  than clobbering it — at which point someone has to read the new upstream
+  method and decide. This is the one variant that is a judgement call rather
+  than a breakage.
+- **Nothing else in the crate clamps the launch frame.** Its only other
+  `visibleFrame` reference is the zoom path (`:870`), which this window does
+  not take. A new clamp upstream would be invisible to the override.
+
+Measured 2026-10-18 on aarch64-darwin, macOS 26.5.2, a 1728x1117-point
+display: a `--width=1920 --height=1080` window reports
+`topBar.window.content` `[1920, 1080]` in a 1920x1108 frame at x = -96, where
+the same binary with the pre-change shim reported `[1728, 1056]` in a
+1728x1084 frame. The 1440x900 window is byte-identical either way.
+
 ## Related decisions
 
 - **`gpui-kit` is still not a dependency of this workspace**, but it is now

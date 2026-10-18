@@ -74,6 +74,14 @@ pub mod gpui_app;
 #[cfg(feature = "gpui-headless")]
 pub mod gpui_headless;
 pub mod mac_event_loop;
+// macOS only, and the reason the `wide` viewport is honoured at all on a
+// display narrower than it: gpui's window class inherits `NSWindow`'s
+// `constrainFrameRect:toScreen:`, which fits the window to the screen's
+// visible frame, and Chromium — hence the Electron front-end this one is
+// being matched to — overrides exactly that. The file carries its own
+// `#![cfg(…)]`, so the `mod` here is unconditional and the module is empty
+// off macOS.
+pub mod mac_window_frame;
 // …and its feature-less counterpart, so the cdylib's EXPORTED SYMBOL SET
 // does not depend on which features it was built with. Without this a
 // plain `cargo build` produced 56 exports while `bindings.nim` imported

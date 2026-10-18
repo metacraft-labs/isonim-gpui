@@ -1693,6 +1693,31 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     let _font_smoothing =
         crate::window::apply_and_report_font_smoothing_policy(platform.text_system().as_ref());
 
+    // macOS: let the window keep the size it is about to be asked for.
+    // `GPUIWindow` inherits `NSWindow`'s `constrainFrameRect:toScreen:`,
+    // which fits a window to the screen's visible frame — so a viewport
+    // larger than this display came back silently shrunk, where Chromium
+    // (and therefore the Electron front-end) returns the proposed frame
+    // unchanged and gets the size it asked for. See
+    // `mac_window_frame.rs` for the measurement and the scope.
+    //
+    // BEFORE `run`, and that is load-bearing: the first constraining
+    // happens inside `initWithContentRect:…`, so an override installed
+    // once a window exists is already too late for that window's frame.
+    #[cfg(target_os = "macos")]
+    let window_frame_override = crate::mac_window_frame::install_unconstrained_window_frame();
+    #[cfg(target_os = "macos")]
+    if !window_frame_override.is_installed() {
+        // Not fatal — a clamped window still runs — but it is the one
+        // state in which a `wide` capture silently measures a different
+        // window than the one the scenario named, so it is never left to
+        // be inferred from the pixels.
+        eprintln!(
+            "gpui-nim-shim: window frame override NOT installed ({window_frame_override:?}); \
+             a window larger than the display will be clamped to its visible frame"
+        );
+    }
+
     Application::with_platform(platform).run(move |cx: &mut App| {
         // The shim owns the quit policy; see `spawn_shutdown_poller`.
         // `QuitMode::Default` is `LastWindowClosed` off macOS, which
