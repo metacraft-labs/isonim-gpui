@@ -984,3 +984,148 @@ fn test_right_and_middle_buttons_reach_their_listeners() {
         assert_eq!(AUXES.load(Ordering::SeqCst), 1);
     });
 }
+
+// ---------------------------------------------------------------------------
+// Test: `min-height`, `max-width` and `max-height` are LAID OUT, not just
+// reported.
+//
+// Until 2026-10-18 the three were parsed into `GpuiStyles` and dumped in the
+// render plan, but `apply_styles_to_div` applied only `min-width`, so the plan
+// claimed a capped or floored box the window never drew
+// (issues/2026-10-18-min-height-max-width-max-height-are-parsed-and-reported-but-never-applied.md).
+// These cases measure the element GPUI actually laid out: the probe is
+// tagged with a `debug_selector`, drawn in a real (test-platform) window,
+// and its bounds are read back from the rendered frame. Each case has a
+// control without the property, so a pass cannot come from the fixture.
+// ---------------------------------------------------------------------------
+
+/// A 400×400 flex column (children stretch to its width) holding a single
+/// probe child styled by `apply_styles_to_div`.
+struct ConstraintProbe {
+    styles: GpuiStyles,
+}
+
+impl gpui::Render for ConstraintProbe {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{InteractiveElement, ParentElement, Styled};
+        div()
+            .flex()
+            .flex_col()
+            .w(gpui::px(400.0))
+            .h(gpui::px(400.0))
+            .child(apply_styles_to_div(div(), &self.styles).debug_selector(|| "probe".into()))
+    }
+}
+
+/// Lay out a probe child with `styles` and return its drawn (width, height).
+fn probe_size(cx: &mut TestAppContext, styles: GpuiStyles) -> (f32, f32) {
+    let (_view, vcx) = cx.add_window_view(move |_window, _cx| ConstraintProbe { styles });
+    vcx.run_until_parked();
+    let b = vcx
+        .debug_bounds("probe")
+        .expect("the probe was drawn and its bounds recorded");
+    (f32::from(b.size.width), f32::from(b.size.height))
+}
+
+#[test]
+#[serial]
+fn test_max_width_caps_the_laid_out_width() {
+    run_gpui_test("test_max_width_caps_the_laid_out_width", |cx| {
+        // Control: a stretching child of the 400px column is 400px wide.
+        let (w, _) = probe_size(
+            cx,
+            GpuiStyles {
+                h: Some("10px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(w, 400.0, "control: the child stretches to its parent");
+
+        let (w, _) = probe_size(
+            cx,
+            GpuiStyles {
+                h: Some("10px".into()),
+                max_w: Some("50px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(w, 50.0, "max-width: 50px laid out {w}px wide");
+    });
+}
+
+#[test]
+#[serial]
+fn test_max_height_caps_the_laid_out_height() {
+    run_gpui_test("test_max_height_caps_the_laid_out_height", |cx| {
+        // Control: an explicit 100px height is drawn as 100px.
+        let (_, h) = probe_size(
+            cx,
+            GpuiStyles {
+                h: Some("100px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(h, 100.0, "control: the explicit height is drawn");
+
+        let (_, h) = probe_size(
+            cx,
+            GpuiStyles {
+                h: Some("100px".into()),
+                max_h: Some("30px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(h, 30.0, "max-height: 30px laid out {h}px tall");
+    });
+}
+
+#[test]
+#[serial]
+fn test_min_height_floors_the_laid_out_height() {
+    run_gpui_test("test_min_height_floors_the_laid_out_height", |cx| {
+        // Control: an empty child of a column has no height of its own.
+        let (_, h) = probe_size(cx, GpuiStyles::default());
+        assert_eq!(h, 0.0, "control: the empty child has no height of its own");
+
+        let (_, h) = probe_size(
+            cx,
+            GpuiStyles {
+                min_h: Some("80px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(h, 80.0, "min-height: 80px laid out {h}px tall");
+    });
+}
+
+#[test]
+#[serial]
+fn test_min_width_floors_the_laid_out_width() {
+    // Positive control for the fixture: `min-width` was always applied, so
+    // this passes before and after the fix. An explicit narrow width opts
+    // out of the column's stretch, and min-width must then override it.
+    run_gpui_test("test_min_width_floors_the_laid_out_width", |cx| {
+        let (w, _) = probe_size(
+            cx,
+            GpuiStyles {
+                w: Some("20px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(w, 20.0, "control: the explicit width is drawn");
+
+        let (w, _) = probe_size(
+            cx,
+            GpuiStyles {
+                w: Some("20px".into()),
+                min_w: Some("120px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(w, 120.0, "min-width: 120px laid out {w}px wide");
+    });
+}

@@ -1441,6 +1441,19 @@ pub fn apply_styles_to_div(
         }
     }
 
+    // min-height, max-width and max-height, as pixel values like min-width.
+    // Parsed and dumped since the start but not applied until 2026-10-18, so
+    // the plan reported a floor or cap the window never drew.
+    if let Some(px_val) = styles.min_h.as_deref().and_then(parse_px) {
+        el = el.min_h(px(px_val));
+    }
+    if let Some(px_val) = styles.max_w.as_deref().and_then(parse_px) {
+        el = el.max_w(px(px_val));
+    }
+    if let Some(px_val) = styles.max_h.as_deref().and_then(parse_px) {
+        el = el.max_h(px(px_val));
+    }
+
     // BORDERS AND WEIGHT (2026-09-29). Both were parsed into the plan and
     // never drawn — the plan said a pane was outlined and a tab was bold, the
     // window showed neither. A width applies to every side unless a per-side

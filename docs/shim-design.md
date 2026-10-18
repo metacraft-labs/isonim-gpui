@@ -288,14 +288,10 @@ unknown-property arm and is ignored like any other unsupported CSS.
 does not space glyphs itself. Adding a property to the parser and the dump
 belongs in the same change that makes the element builder apply it.
 
-Known exceptions, which predate the rule and are parsed and reported but not
-applied:
-
-- `font-style` (there is no `italic` in the shim).
-  `inline_runs_decline_a_span_with_a_font_style` keeps it out of inline-run
-  fusion until it is drawn.
-- `min-height`, `max-width` and `max-height`. The element builder applies
-  `min-width` only.
+One known exception predates the rule and is parsed and reported but not
+applied: `font-style` (there is no `italic` in the shim).
+`inline_runs_decline_a_span_with_a_font_style` keeps it out of inline-run
+fusion until it is drawn.
 
 ### Value Parsers
 
