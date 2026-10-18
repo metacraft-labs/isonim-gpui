@@ -436,19 +436,71 @@ fn fusable_child_text(child: &RenderNode) -> Option<&str> {
     }
 }
 
-/// The fused text of `plan`'s children and the runs covering it, or `None`
-/// when `plan` is not a declared inline formatting context or any child is
-/// not pure text.
+/// One piece of a declared inline formatting context, in child order.
 ///
-/// All-or-nothing on purpose: fusing some children and leaving others as
-/// elements would reintroduce exactly the per-element rounding the fusion
-/// exists to remove, while making the result harder to reason about.
-pub fn inline_text_runs(plan: &RenderNode) -> Option<(String, Vec<InlineTextRun>)> {
-    let declared = plan
-        .attributes
+/// A context is NOT required to be fusable end to end. A row that interleaves
+/// text with things that must keep their own element — an icon, a spacer, a
+/// bracket carrying a margin — yields a mix of both variants, and
+/// `build_plan_div` lays them out in exactly this order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineChunk {
+    /// A maximal run of TWO OR MORE adjacent fusable spans, drawn as one
+    /// text element so the run is rounded once instead of once per span.
+    Fused(FusedRun),
+    /// A child that keeps its own element, by index into `plan.children`.
+    /// Carries no copy of the child: the plan is the single source of truth
+    /// and the consumer renders `plan.children[i]` the ordinary way.
+    Own(usize),
+}
+
+/// A maximal run of adjacent fusable spans, flattened into one string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FusedRun {
+    /// Index into `plan.children` of the first span this run covers. Kept so
+    /// a reader (and a test) can map a run back to the spans it came from;
+    /// the spans themselves are still in the plan, untouched.
+    pub start: usize,
+    /// The concatenated text of the run's spans.
+    pub text: String,
+    /// The runs tiling `text`, one per span, in order.
+    pub runs: Vec<InlineTextRun>,
+}
+
+/// Is this a container that declared itself an inline formatting context?
+fn declares_inline_runs(plan: &RenderNode) -> bool {
+    plan.attributes
         .get(INLINE_TEXT_RUNS_ATTRIBUTE)
-        .map_or(false, |v| v != "0" && v != "false");
-    if !declared {
+        .map_or(false, |v| v != "0" && v != "false")
+}
+
+/// `plan`'s children grouped into maximal runs of fusable spans, or `None`
+/// when `plan` is not a declared inline formatting context or when nothing
+/// in it would fuse.
+///
+/// WHY THIS IS SEGMENTED AND NOT ALL-OR-NOTHING. The first version of this
+/// fused a container only when EVERY child was pure text, which made the
+/// declaration a silent no-op on every row that interleaves text with
+/// something else — and the rows that drift worst are exactly those: a
+/// call-trace row carries a toggle icon, a spacer, a bracket with a margin
+/// and a return arrow in another face between its text spans. Refusing to
+/// fuse such a row leaves every one of its text spans rounded separately,
+/// which is the whole defect. Grouping instead removes the rounding WITHIN
+/// each run while leaving every non-text child exactly where it was, so the
+/// spacing those children provide is preserved rather than concatenated
+/// away.
+///
+/// A run of ONE span is deliberately NOT fused: one span is already one text
+/// element, so fusing it would change nothing about layout while needlessly
+/// replacing an element with a synthesised one.
+///
+/// THE PLAN IS NOT MODIFIED. Grouping happens here, in the plan's CONSUMER,
+/// so every span — and every per-span attribute hung off it, such as the
+/// call trace's `data-call-arg` — is still in the plan for hit-testing and
+/// for tests to read. This is the property that lets a row fuse without
+/// giving up per-span identity, and it is why fusing is not done by
+/// rewriting the markup into fusable sub-groups.
+pub fn inline_chunks(plan: &RenderNode) -> Option<Vec<InlineChunk>> {
+    if !declares_inline_runs(plan) {
         return None;
     }
     // A container with text of its own is not purely a sequence of spans,
@@ -459,18 +511,66 @@ pub fn inline_text_runs(plan: &RenderNode) -> Option<(String, Vec<InlineTextRun>
     if plan.children.is_empty() {
         return None;
     }
-    let mut text = String::new();
-    let mut runs = Vec::with_capacity(plan.children.len());
-    for child in &plan.children {
-        let piece = fusable_child_text(child)?;
-        text.push_str(piece);
-        runs.push(InlineTextRun {
-            len: piece.len(),
-            color: child.styles.text_color.clone(),
-            font_weight: child.styles.font_weight.clone(),
-        });
+
+    let mut chunks: Vec<InlineChunk> = Vec::with_capacity(plan.children.len());
+    let mut pending: Vec<(usize, &str)> = Vec::new();
+
+    // Close the run accumulated so far: a real fusion at two spans or more,
+    // otherwise the single span goes back to being its own element.
+    fn flush(chunks: &mut Vec<InlineChunk>, plan: &RenderNode, pending: &mut Vec<(usize, &str)>) {
+        if pending.len() >= 2 {
+            let start = pending[0].0;
+            let mut text = String::new();
+            let mut runs = Vec::with_capacity(pending.len());
+            for (i, piece) in pending.iter() {
+                text.push_str(piece);
+                runs.push(InlineTextRun {
+                    len: piece.len(),
+                    color: plan.children[*i].styles.text_color.clone(),
+                    font_weight: plan.children[*i].styles.font_weight.clone(),
+                });
+            }
+            chunks.push(InlineChunk::Fused(FusedRun { start, text, runs }));
+        } else {
+            for (i, _) in pending.iter() {
+                chunks.push(InlineChunk::Own(*i));
+            }
+        }
+        pending.clear();
     }
-    Some((text, runs))
+
+    for (i, child) in plan.children.iter().enumerate() {
+        match fusable_child_text(child) {
+            Some(piece) => pending.push((i, piece)),
+            None => {
+                flush(&mut chunks, plan, &mut pending);
+                chunks.push(InlineChunk::Own(i));
+            }
+        }
+    }
+    flush(&mut chunks, plan, &mut pending);
+
+    // Nothing fused: tell the caller so, rather than handing back a plan
+    // restated as `Own` entries it would render identically. This keeps the
+    // "declared but nothing fusable" case on exactly the original code path.
+    if !chunks.iter().any(|c| matches!(c, InlineChunk::Fused(_))) {
+        return None;
+    }
+    Some(chunks)
+}
+
+/// The whole of `plan` fused into one string and its runs, or `None` when it
+/// does not fuse end to end.
+///
+/// Retained because it states the ALL-FUSABLE case directly, which is both
+/// the editor code row's shape and the simplest thing for a test to assert.
+pub fn inline_text_runs(plan: &RenderNode) -> Option<(String, Vec<InlineTextRun>)> {
+    match inline_chunks(plan)?.as_slice() {
+        [InlineChunk::Fused(run)] if run.start == 0 && run.runs.len() == plan.children.len() => {
+            Some((run.text.clone(), run.runs.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// Build a render plan from the shadow tree, starting at `root_id`.
@@ -803,6 +903,296 @@ mod tests {
             at += run.len;
         }
         assert!(text.is_char_boundary(at));
+    }
+
+    // ---- SEGMENTED FUSION (`inline_chunks`) --------------------------
+    //
+    // The all-or-nothing tests above still hold and are the back-compat
+    // floor: a row whose children are ALL fusable must still collapse to a
+    // single run covering every child, which is what `inline_text_runs`
+    // asserts for them. The tests below cover what segmenting ADDS — a row
+    // that interleaves text with children that must keep their own element.
+
+    /// Build a row that interleaves fusable spans with children that are
+    /// not fusable, as a call-trace row does. `spec` is read left to right:
+    /// `Some(text)` is a plain coloured span, `None` is a child that cannot
+    /// fuse (here a sized box, standing in for the toggle icon or spacer).
+    fn mixed_row(spec: &[Option<&str>]) -> RenderNode {
+        let mut tree = Tree::new();
+        let mut host = Node::new_element("div");
+        host.attributes
+            .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        let host_id = tree.insert(host);
+        for item in spec {
+            match item {
+                Some(t) => {
+                    let mut span = Node::new_element("span");
+                    span.styles.insert("color".into(), "#d4d4d4".into());
+                    span.styles.insert("flex-shrink".into(), "0".into());
+                    let span_id = tree.insert(span);
+                    let text_id = tree.insert(Node::new_text(t));
+                    tree.append_child(span_id, text_id);
+                    tree.append_child(host_id, span_id);
+                }
+                None => {
+                    let mut box_ = Node::new_element("div");
+                    // A width is box styling, so this child cannot fuse --
+                    // the same reason the call trace's 8 px spacer cannot.
+                    box_.styles.insert("width".into(), "8px".into());
+                    let box_id = tree.insert(box_);
+                    tree.append_child(host_id, box_id);
+                }
+            }
+        }
+        build_render_plan(&tree, host_id).expect("plan")
+    }
+
+    /// Collect the shape of the chunking as a compact description, so a
+    /// test asserts the WHOLE layout order rather than one chunk of it.
+    fn shape(plan: &RenderNode) -> Vec<String> {
+        inline_chunks(plan)
+            .expect("must chunk")
+            .iter()
+            .map(|c| match c {
+                InlineChunk::Fused(r) => format!("fused@{}:{}", r.start, r.text),
+                InlineChunk::Own(i) => format!("own@{i}"),
+            })
+            .collect()
+    }
+
+    /// THE MOTIVATING CASE FOR SEGMENTING. A row that interleaves text with
+    /// a non-fusable child fuses each maximal run of text and leaves the
+    /// other child exactly where it was. Before segmenting this row fused
+    /// NOTHING -- the declaration was a silent no-op -- and every one of its
+    /// four text spans was rounded separately.
+    #[test]
+    fn inline_chunks_fuse_each_run_around_a_non_fusable_child() {
+        let plan = mixed_row(&[Some("foo"), Some("()"), None, Some(" => "), Some("42")]);
+        assert_eq!(
+            shape(&plan),
+            vec!["fused@0:foo()", "own@2", "fused@3: => 42"]
+        );
+    }
+
+    /// THE NEGATIVE CONTROL FOR SEGMENTING, the counterpart of
+    /// `inline_runs_decline_a_row_that_did_not_declare_itself`: the SAME
+    /// interleaved row without the attribute must not chunk at all, so the
+    /// grouping is driven by the declaration and not by the shape.
+    #[test]
+    fn inline_chunks_decline_an_interleaved_row_that_did_not_declare_itself() {
+        let mut plan = mixed_row(&[Some("foo"), Some("()"), None, Some("42")]);
+        plan.attributes.remove(INLINE_TEXT_RUNS_ATTRIBUTE);
+        assert_eq!(inline_chunks(&plan), None);
+    }
+
+    /// A RUN OF ONE IS NOT FUSED. One span is already one text element, so
+    /// fusing it would change no layout while replacing a real element with
+    /// a synthesised one. Here every text span is isolated by a box, so
+    /// there is no run of two anywhere and the whole row declines.
+    #[test]
+    fn inline_chunks_decline_a_row_whose_text_spans_are_all_isolated() {
+        let plan = mixed_row(&[Some("a"), None, Some("b"), None, Some("c")]);
+        assert_eq!(inline_chunks(&plan), None);
+    }
+
+    /// A row with no fusable child at all declines, rather than restating
+    /// every child as an `Own` entry the consumer would render identically.
+    #[test]
+    fn inline_chunks_decline_a_row_with_no_fusable_child() {
+        let plan = mixed_row(&[None, None]);
+        assert_eq!(inline_chunks(&plan), None);
+    }
+
+    /// BACK-COMPAT, STATED AS CHUNKS. The editor code row -- every child
+    /// fusable -- must still be ONE run covering every child from index 0.
+    /// This is the property `inline_text_runs` now reads off `inline_chunks`,
+    /// and the editor pane's measured parity depends on it not changing.
+    #[test]
+    fn inline_chunks_fuse_an_all_fusable_row_as_one_run() {
+        let plan = highlighted_row(
+            true,
+            &[("let", "#569cd6"), (" x = ", "#d4d4d4"), ("(", "#ffd700")],
+            |_| {},
+        );
+        assert_eq!(shape(&plan), vec!["fused@0:let x = ("]);
+        // And the all-or-nothing view of the same plan still answers.
+        let (text, runs) = inline_text_runs(&plan).expect("all-fusable row");
+        assert_eq!(text, "let x = (");
+        assert_eq!(runs.len(), 3);
+    }
+
+    /// `inline_text_runs` is the ALL-FUSABLE view and must NOT report a
+    /// partially fused row as if the whole of it had fused -- otherwise a
+    /// caller reading it would believe a row collapsed to one element when
+    /// three remain. The row below does chunk; it just does not chunk whole.
+    #[test]
+    fn inline_text_runs_decline_a_row_that_only_partly_fuses() {
+        let plan = mixed_row(&[Some("foo"), Some("()"), None, Some(" => "), Some("42")]);
+        assert!(inline_chunks(&plan).is_some(), "it does chunk");
+        assert_eq!(inline_text_runs(&plan), None, "but not as a whole");
+    }
+
+    /// Each fused run's byte lengths tile ITS OWN text exactly -- the
+    /// contract `with_highlights` is handed, now asserted per run rather
+    /// than once for the row, and over multi-byte spans.
+    #[test]
+    fn inline_chunks_tile_each_run_in_bytes() {
+        let plan = mixed_row(&[
+            Some("\u{3bb}x"),
+            Some("\u{2192}y"),
+            None,
+            Some("ab"),
+            Some("cd"),
+        ]);
+        let chunks = inline_chunks(&plan).expect("must chunk");
+        let mut fused = 0;
+        for chunk in &chunks {
+            if let InlineChunk::Fused(run) = chunk {
+                fused += 1;
+                assert_eq!(
+                    run.runs.iter().map(|r| r.len).sum::<usize>(),
+                    run.text.len()
+                );
+                let mut at = 0usize;
+                for r in &run.runs {
+                    assert!(run.text.is_char_boundary(at));
+                    at += r.len;
+                }
+                assert!(run.text.is_char_boundary(at));
+            }
+        }
+        assert_eq!(fused, 2, "both runs fused");
+    }
+
+    /// A non-fusable child is referenced BY INDEX into the plan, and the
+    /// plan still holds every span with its own attributes. This is what
+    /// lets the call trace fuse a row while keeping `data-call-arg` on each
+    /// argument for hit-testing -- the grouping is a rendering decision, not
+    /// a rewrite of the markup.
+    #[test]
+    fn inline_chunks_leave_the_plan_and_its_per_span_attributes_intact() {
+        let mut tree = Tree::new();
+        let mut host = Node::new_element("div");
+        host.attributes
+            .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        let host_id = tree.insert(host);
+        for (text, arg) in [("a", Some("0")), ("b", Some("1"))] {
+            let mut span = Node::new_element("span");
+            span.styles.insert("color".into(), "#d4d4d4".into());
+            if let Some(a) = arg {
+                span.attributes.insert("data-call-arg".into(), a.into());
+            }
+            let span_id = tree.insert(span);
+            let text_id = tree.insert(Node::new_text(text));
+            tree.append_child(span_id, text_id);
+            tree.append_child(host_id, span_id);
+        }
+        let plan = build_render_plan(&tree, host_id).expect("plan");
+        assert_eq!(shape(&plan), vec!["fused@0:ab"]);
+        // The spans the run was built from are still there, attributes and
+        // all: fusing consumed nothing.
+        assert_eq!(plan.children.len(), 2);
+        assert_eq!(
+            plan.children[0].attributes.get("data-call-arg"),
+            Some(&"0".to_string())
+        );
+        assert_eq!(
+            plan.children[1].attributes.get("data-call-arg"),
+            Some(&"1".to_string())
+        );
+    }
+
+    /// PLAT-50's ACTUAL GUARANTEE, stated per span. A call-trace argument
+    /// is clickable: `window_clicks.wireWindowClicks` walks the shadow tree
+    /// and hangs `mousedown` / `contextmenu` / `auxdown` on every span
+    /// carrying `data-call-arg`, so the span's right-click menu works. A
+    /// fused run is ONE synthesised `StyledText` and the spans it covers get
+    /// no element of their own -- so if a wired span could fuse, its
+    /// listeners would have nothing to attach to and the menu would die
+    /// silently.
+    ///
+    /// It cannot, and this is what makes PLAT-50 safe: `fusable_child_text`
+    /// rejects any child with a listener BEFORE it looks at anything else.
+    /// The row below is fusable end to end except for the wired span in the
+    /// middle, which must come back as its own element with its neighbours
+    /// fused around it -- not swallowed into either run.
+    ///
+    /// The sibling test above shows the plan keeps `data-call-arg`; this one
+    /// shows the span keeps its ELEMENT, which is the half that actually
+    /// delivers the click.
+    #[test]
+    fn inline_chunks_keep_a_wired_span_as_its_own_element() {
+        extern "C" fn noop(_p: *const crate::input::GpuiEventPayload) {}
+        let mut tree = Tree::new();
+        let mut host = Node::new_element("div");
+        host.attributes
+            .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        let host_id = tree.insert(host);
+        for (text, wired) in [
+            ("f", false),
+            ("(", false),
+            ("arg", true),
+            (")", false),
+            (" => 1", false),
+        ] {
+            let mut span = Node::new_element("span");
+            span.styles.insert("color".into(), "#d4d4d4".into());
+            if wired {
+                span.attributes.insert("data-call-arg".into(), "0".into());
+                for name in ["mousedown", "contextmenu", "auxdown"] {
+                    span.event_listeners
+                        .entry(name.into())
+                        .or_default()
+                        .push(EventListener {
+                            callback: noop,
+                            callback_id: 0,
+                        });
+                }
+            }
+            let span_id = tree.insert(span);
+            let text_id = tree.insert(Node::new_text(text));
+            tree.append_child(span_id, text_id);
+            tree.append_child(host_id, span_id);
+        }
+        let plan = build_render_plan(&tree, host_id).expect("plan");
+        // The wired argument keeps its own element; the plain text each side
+        // of it still fuses, so the parity win is kept where it is free.
+        assert_eq!(shape(&plan), vec!["fused@0:f(", "own@2", "fused@3:) => 1"]);
+        // POSITIVE CONTROL: the same row WITHOUT the listeners fuses whole,
+        // so the `own@2` above is caused by the listeners and not by the
+        // row's shape or by `data-call-arg` itself.
+        let mut unwired = plan.clone();
+        unwired.children[2].event_names.clear();
+        unwired.children[2].has_click_handler = false;
+        assert_eq!(shape(&unwired), vec!["fused@0:f(arg) => 1"]);
+    }
+
+    /// EVERY DECLINE GUARD ABOVE STILL DECLINES PER SPAN, not just per row.
+    /// A span with leading padding inside an otherwise fusable row must now
+    /// keep its own element -- the guard's point was that fusing would
+    /// delete the gap, and segmenting must not quietly reintroduce that.
+    #[test]
+    fn inline_chunks_keep_a_padded_span_as_its_own_element() {
+        let mut tree = Tree::new();
+        let mut host = Node::new_element("div");
+        host.attributes
+            .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        let host_id = tree.insert(host);
+        for (text, pad) in [("a", false), ("(", true), ("b", false), ("c", false)] {
+            let mut span = Node::new_element("span");
+            span.styles.insert("color".into(), "#d4d4d4".into());
+            if pad {
+                span.styles.insert("padding-left".into(), "5px".into());
+            }
+            let span_id = tree.insert(span);
+            let text_id = tree.insert(Node::new_text(text));
+            tree.append_child(span_id, text_id);
+            tree.append_child(host_id, span_id);
+        }
+        let plan = build_render_plan(&tree, host_id).expect("plan");
+        // "a" is a run of one, so it keeps its element too; the padded "("
+        // is its own; "bc" fuses. The 5 px is preserved either way.
+        assert_eq!(shape(&plan), vec!["own@0", "own@1", "fused@2:bc"]);
     }
 
     /// A declared container with no children has nothing to fuse.

@@ -876,8 +876,22 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
     //
     // Everything below — events, pointer listeners, window regions — is
     // reached either way: only how the children are built changes.
-    match fused_inline_text(plan) {
-        Some(fused) => el = el.child(fused),
+    match crate::render_sync::inline_chunks(plan) {
+        Some(chunks) => {
+            // A declared row lays its chunks out IN CHILD ORDER: each fused
+            // run becomes one text element, and every child that could not
+            // fuse is rendered exactly as it would have been. A container
+            // with its own text never reaches here (`inline_chunks`
+            // declines it), so there is no trailing text to append.
+            for chunk in chunks {
+                el = match chunk {
+                    crate::render_sync::InlineChunk::Fused(run) => el.child(fused_run_text(&run)),
+                    crate::render_sync::InlineChunk::Own(i) => {
+                        el.child(render_plan_to_gpui(&plan.children[i]))
+                    }
+                };
+            }
+        }
         None => {
             // Add children
             for child in &plan.children {
@@ -905,8 +919,8 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
     wire_window_region(el, plan)
 }
 
-/// The single text element a declared inline formatting context collapses
-/// to, or `None` when `plan` is not one (see `inline_text_runs`).
+/// The single text element one FUSED RUN of a declared inline formatting
+/// context collapses to (see `render_sync::inline_chunks`).
 ///
 /// The per-span colours are handed over as HIGHLIGHTS rather than as finished
 /// `TextRun`s. A `TextRun` must name a concrete `Font`, which this function
@@ -917,11 +931,12 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
 /// the unfused spans would have been drawn in, and only the colour is stated
 /// here.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
-fn fused_inline_text(plan: &crate::render_sync::RenderNode) -> Option<StyledText> {
-    let (text, runs) = crate::render_sync::inline_text_runs(plan)?;
+fn fused_run_text(fused: &crate::render_sync::FusedRun) -> StyledText {
+    let text = fused.text.clone();
+    let runs = &fused.runs;
     let mut offset = 0usize;
     let mut highlights = Vec::with_capacity(runs.len());
-    for run in &runs {
+    for run in runs {
         let range = offset..offset + run.len;
         offset = range.end;
         // A span whose colour does not parse keeps the inherited colour,
@@ -942,7 +957,7 @@ fn fused_inline_text(plan: &crate::render_sync::RenderNode) -> Option<StyledText
             },
         ));
     }
-    Some(StyledText::new(text).with_highlights(highlights))
+    StyledText::new(text).with_highlights(highlights)
 }
 
 /// GWIN: give an element its window region (`regions.rs`). A drag region
