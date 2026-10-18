@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | in-progress (m1:fix-letter-spacing-is-parsed-and-reported-bu) |
+| Status | blocked (m1:fix-letter-spacing-is-parsed-and-reported-bu): owner decision required; see below |
 | Recorded | 2026-10-17 |
 | Observed in | `isonim-gpui` @ `779f0d1` (branch `agents`) |
 | Area | `rust/gpui-nim-shim/src/render_sync.rs` (`GpuiStyles`, the CSS property table), `src/lib.rs` (the style dump) |
@@ -62,6 +62,45 @@ defect-fix:
    runs by hand at the shim level, which interacts with the row fusion added
    in `inline_text_runs` — fused runs would need the spacing folded into
    their per-run widths.
+
+## Blocker — 2026-10-18
+
+**Still reproduces.** Measured 2026-10-18 on aarch64-darwin against
+`isonim-gpui@95a61f8` (the tip of `agents`): a search of
+`rust/gpui-nim-shim/src/` for `letter_spacing|letter-spacing` returns the
+same three sites (`lib.rs:1454` dump, `render_sync.rs:98` field,
+`render_sync.rs:203` parser arm) plus a comment at `render_sync.rs:411`;
+nothing consumes the field. `gpui-pre-0.3.5/src` still has no
+letter-spacing (every case-insensitive hit for
+`letter_spacing|letter.spacing|tracking` is unrelated "tracking" prose;
+control: `line_height` is found in 9 files).
+
+**Not fixed, because the fix is the choice this issue calls a product
+decision.** Both suggested directions satisfy the proposed rule ("take
+effect or be rejected where it is parsed"), and no specification picks
+between them: `docs/shim-design.md` only says an unknown property is
+ignored, and nothing in `isonim-pm/spec/` (`isonim-gpui-window-decorations.md`,
+`isonim-cross-platform-architecture.md`, `IsoNim.md`) states which CSS
+properties the GPUI renderer must draw. What each option costs, so the
+owner can decide:
+
+1. **Drop it** from the parser arm, the `GpuiStyles` field and the dump
+   (and the `letter_spacing: None` literal in `tests/gpui_rendering.rs`).
+   No pixel changes, since nothing draws it today. But the IsoNim editor's
+   own chrome sets it (`isonim/src/isonim/editor/views/gallery_overlay.nim`,
+   `inspector_sections.nim`), and the editor's property-evidence table
+   (`viewmodels.nim`: `propertyEvidenceRow("typography", @["letter-spacing"], ltpesValidated, …)`)
+   claims letter-spacing as validated; after the drop a GPUI render plan
+   would silently stop carrying a property that table claims.
+2. **Implement it.** `gpui-pre` is consumed from crates.io at `=0.3.5`
+   (`docs/gpui-pin.md`), so it cannot be patched in place; the shim would
+   have to lay glyphs out itself (its own shaping and wrapping instead of
+   `StyledText`), and the fused-run path in `inline_text_runs` would have
+   to fold the spacing into per-run widths. That is a feature, not a
+   defect-fix.
+
+Decision needed: one of the two, or a third (for example, keep parsing but
+mark the property as unapplied in the dump). No code change was made.
 
 ## Related
 
