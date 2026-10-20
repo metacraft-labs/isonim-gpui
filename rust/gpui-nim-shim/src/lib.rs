@@ -555,6 +555,32 @@ pub extern "C" fn gpui_launch(
     }
 }
 
+/// Returns 1 if this build of the shim can open a window — that is, if it
+/// was compiled with `--features gpui-backend`, so `gpui_launch` enters
+/// GPUI's event loop — and 0 otherwise.
+///
+/// WHY AN APPLICATION NEEDS TO ASK. Without the feature `gpui_launch` builds
+/// the shadow tree, calls the root builder and RETURNS, by design (that is
+/// the stub the test suites and the render-plan tooling run against). An
+/// application that calls it to show a window therefore sees an ordinary
+/// return and has no way to tell "the user closed the window" from "there
+/// never was one" — so it exits 0 having shown nothing, and says nothing.
+/// Asking first lets it refuse by name instead (CodeTracer's GPUI front-end
+/// does, with exit 3).
+///
+/// It answers about the WINDOWED feature only. `gpui-headless` renders
+/// off-screen through `gpui_render_to_pixels` and opens no window, so a
+/// headless-only build answers 0, which is the truth about `gpui_launch`.
+///
+/// The symbol exists in EVERY build, for the reason the shutdown exports
+/// below give: a symbol that came and went with a Cargo feature could not be
+/// imported unconditionally from Nim, and the question would be answered by
+/// a load failure instead of by a value.
+#[no_mangle]
+pub extern "C" fn gpui_has_window_backend() -> u8 {
+    u8::from(cfg!(feature = "gpui-backend"))
+}
+
 /// RS-M14 Phase 2: set the global `ROOT_NODE_ID` to the given element
 /// handle. Callers that build the shadow tree *without* going through
 /// `gpui_launch` (e.g. the GPUI streaming adapter in
@@ -2353,6 +2379,20 @@ mod tests {
         assert_eq!(BUILDER_CALLED.load(Ordering::SeqCst), 1);
         // Root + span child = 2 nodes
         assert_eq!(gpui_tree_node_count(), 2);
+    }
+
+    /// `gpui_has_window_backend` answers for the feature this very test
+    /// binary was compiled with, in both directions: the default lane
+    /// (`cargo test`) checks the 0 a featureless build must report, and
+    /// `cargo test --features gpui-backend` checks the 1. The expected value
+    /// is spelled per `cfg` rather than computed with `cfg!`, so the test
+    /// does not restate the implementation it is checking.
+    #[test]
+    fn test_has_window_backend_matches_the_build() {
+        #[cfg(feature = "gpui-backend")]
+        assert_eq!(gpui_has_window_backend(), 1);
+        #[cfg(not(feature = "gpui-backend"))]
+        assert_eq!(gpui_has_window_backend(), 0);
     }
 
     // -----------------------------------------------------------------------

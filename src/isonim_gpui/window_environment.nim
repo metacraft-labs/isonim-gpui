@@ -20,7 +20,7 @@
 ## environment.
 
 import std/[os, strutils]
-import isonim_gpui/window
+import isonim_gpui/[display_session, window]
 
 type
   WindowButton* = enum
@@ -60,11 +60,14 @@ type
 proc currentPlatform*(): string =
   ## The platform GPUI runs on, as the strings `WindowEnvironment.platform`
   ## uses. On Linux GPUI picks Wayland when `WAYLAND_DISPLAY` is set and X11
-  ## otherwise, and so does this.
+  ## otherwise, and so does this — through `display_session`, the one place
+  ## that rule is written down. (Its headless outcome reads as "linux-x11"
+  ## here, as it always has: there is no window to describe in that case.)
   when defined(macosx): "macos"
   elif defined(windows): "windows"
   elif defined(linux) or defined(freebsd):
-    if getEnv("WAYLAND_DISPLAY").len > 0: "linux-wayland" else: "linux-x11"
+    if gpuiLinuxPlatform(processEnv) == glpWayland: "linux-wayland"
+    else: "linux-x11"
   else: hostOS
 
 proc currentDesktop*(): string =

@@ -43,6 +43,7 @@ tests/test_gpui_reconciler_identity
 tests/test_input_focus
 tests/test_gui_keyboard
 tests/test_window_environment
+tests/test_window_backend
 tests/test_nimcache_is_worktree_local
 
 # Repro development environment cache

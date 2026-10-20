@@ -179,6 +179,16 @@ proc gpui_launch*(title: cstring; width, height: cdouble;
                   root_builder: RootBuilderCallback)
   {.importc: "gpui_launch".}
 
+proc gpui_has_window_backend*(): uint8
+  {.importc: "gpui_has_window_backend".}
+  ## 1 if the loaded shim was built with `--features gpui-backend`, so
+  ## `gpui_launch` opens a real window and blocks until it closes; 0 if it
+  ## was not, in which case `gpui_launch` only builds the shadow tree and
+  ## RETURNS — indistinguishable, afterwards, from a window the user closed.
+  ## Ask before `gpui_launch` and refuse by name when a window is the point
+  ## (see `display_session` for the other way a launch shows nothing: no
+  ## graphical session on Linux). Present in every build of the shim.
+
 proc gpui_dispatch_event*(node: GpuiElement; event: cstring)
   {.importc: "gpui_dispatch_event".}
 

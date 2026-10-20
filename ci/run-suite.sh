@@ -93,6 +93,10 @@ UNITTEST_SUITES=(
 	# GWIN-M1 (T3): window chrome state, the window-environment helper and
 	# the launch options through the real shim.
 	tests/test_window_environment.nim
+	# Whether a window can open at all: the shim's `gpui_has_window_backend`
+	# (this lane links the featureless shim, which must answer 0) and
+	# `display_session`'s mirror of GPUI's Linux platform choice.
+	tests/test_window_backend.nim
 )
 ASSERT_SCRIPTS=(
 	tests/test_basic.nim
@@ -231,7 +235,21 @@ BENCHMARKS=(
 #     configured layout followed, unsupported operations dropped, the
 #     platform convention when none is configured (the cases
 #     `test_window_environment.nim` runs against the Nim helper).
-EXPECTED_CASES=336
+# 2026-10-20, written LAST and from a run (trap 4c), at `058d5e1` with the
+# window-backend change uncommitted: 372.
+#   * THE LANE WAS ALREADY RED BEFORE THIS CHANGE, by drift: at `058d5e1`
+#     unmodified, `cargo test` passed 211 Rust cases (measured, with only
+#     this change's `lib.rs` stashed), where the GWIN-M4 figure was 181 and
+#     the 336 above was never annotated. So 336 -> 362 is the Rust cases that
+#     landed since without moving this figure.
+#   * 362 -> 372 is this change: `lib.rs`'s
+#     `test_has_window_backend_matches_the_build` (+1) and the new
+#     `tests/test_window_backend.nim` (+9: the shim's answer and
+#     `display_session`'s mirror of GPUI's platform choice).
+#   * `test_bindings` stays one checkpoint, but it was RED at `058d5e1`:
+#     06acc9f declared `gpui_font_report` without exercising it there. It is
+#     covered now, beside `gpui_has_window_backend`.
+EXPECTED_CASES=372
 
 total_cases=0
 failed_steps=()

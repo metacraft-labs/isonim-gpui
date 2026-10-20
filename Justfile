@@ -114,7 +114,14 @@ test-reconciler:
 test-gui-window-frame:
     bash scripts/run-window-frame-suite.sh
 
-test-all: check-exported-symbols rust-test test test-cross test-integration test-structural test-reactive-root test-reconciler
+# Whether a window can open at all: `gpui_has_window_backend` from the shim
+# this binary loads (the default build must answer 0) and `display_session`,
+# the mirror of GPUI's Linux platform choice. Requires the Rust shim
+# (`just rust-build`) for the reason `test-reactive-root` gives.
+test-window-backend:
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_window_backend tests/test_window_backend.nim
+
+test-all: check-exported-symbols rust-test test test-cross test-integration test-structural test-reactive-root test-reconciler test-window-backend
 
 # Run the GUI tests, including the windowed pixel case, under headless
 # sway. THIS IS THE GUI LANE. (RS-M14b)

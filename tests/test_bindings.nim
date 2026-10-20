@@ -258,6 +258,10 @@ static:
   # --- Render plan inspection ---
   assert compiles(gpui_render_plan_json(e))
   assert compiles(gpui_free_string(nil))
+  # Declared by 06acc9f without a check here, which left this file red
+  # (the completeness scan above names it); covered alongside the free.
+  assert compiles(block:
+    var x: pointer = gpui_font_report())
   assert compiles(gpui_render_plan_element_count(e))
   assert compiles(gpui_verify_render_plan(e))
   assert compiles(block:
@@ -333,6 +337,8 @@ static:
     var x: uint8 = gpui_take_repaint_request())
   assert compiles(block:
     var x: uint8 = gpui_quit_requested())
+  assert compiles(block:
+    var x: uint8 = gpui_has_window_backend())
 
   # Verify functions that return uint32
   assert compiles(block:
