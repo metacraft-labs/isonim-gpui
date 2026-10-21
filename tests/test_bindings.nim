@@ -165,6 +165,10 @@ static:
   assert compiles(gpui_window_button_layout(1.uint32))
   assert compiles(gpui_set_window_state_dispatcher(sd))
   assert compiles(gpui_on_window_state_id(1.uint32))
+  var ad: WindowActivatedDispatcher
+  assert compiles(gpui_set_window_activated_dispatcher(ad))
+  assert compiles(gpui_on_window_activated_id(1.uint32))
+  assert compiles(gpui_notify_window_activation(1.uint32, 0.uint8))
   assert compiles(gpui_notify_window_state(1.uint32, 1.uint8, 0.uint8,
                                            15.uint8, 0.uint8, 1.uint8,
                                            ":close".cstring))

@@ -1172,8 +1172,40 @@ pub extern "C" fn gpui_on_window_state_id(window_id: u32) -> u8 {
     u8::from(window::enable_state_dispatch(window_id))
 }
 
+/// Register the process-wide window-ACTIVATION dispatcher: called with the
+/// window's id when that window goes from inactive to active — the user
+/// came back to it from another program. Fired from the same per-frame
+/// sample as the window-state dispatcher, after it, on the event loop's
+/// thread. See `window::WindowActivatedDispatcher`.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_activated_dispatcher(
+    dispatcher: window::WindowActivatedDispatcher,
+) {
+    window::set_activated_dispatcher(dispatcher);
+}
+
+/// Opt `window_id` into activation delivery. Returns 1 if it exists.
+#[no_mangle]
+pub extern "C" fn gpui_on_window_activated_id(window_id: u32) -> u8 {
+    u8::from(window::enable_activated_dispatch(window_id))
+}
+
+/// Record an activation change as if the platform had reported it (for
+/// testing / event bridging, like `gpui_notify_window_state`): what GPUI's
+/// activation observer tells the shim the moment it happens, frame or no
+/// frame. `active` 0 marks the window as having been inactive, so the next
+/// active state sample is an activation even when no sample saw it
+/// inactive: a window on another workspace draws no frame while the user is
+/// away. Dispatches nothing itself. Returns 1 if the window exists.
+#[no_mangle]
+pub extern "C" fn gpui_notify_window_activation(window_id: u32, active: u8) -> u8 {
+    u8::from(window::note_activation(window_id, active != 0))
+}
+
 /// Record a chrome state as if the window had reported it (for testing /
 /// event bridging, like `gpui_notify_resize`). `button_layout` may be null.
+/// An `active` of 1 after 0 is an activation, delivered exactly as a live
+/// window's (`gpui_on_window_activated_id`).
 #[no_mangle]
 pub extern "C" fn gpui_notify_window_state(
     window_id: u32,
@@ -2350,6 +2382,55 @@ mod tests {
         });
         gpui_notify_resize(999, 100.0, 100.0);
         gpui_notify_focus(999, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_window_activation_through_the_c_abi() {
+        // The exported path end to end: the dispatcher and the opt-in as a
+        // host registers them, the bridging entry point standing in for the
+        // per-frame sample, and the activation read back through the query.
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static LAST: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn on_activated(id: u32) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            LAST.store(id, Ordering::SeqCst);
+        }
+        gpui_reset_windows();
+        CALLS.store(0, Ordering::SeqCst);
+        gpui_set_window_activated_dispatcher(on_activated);
+        let title = c("activated");
+        let id = gpui_create_window(title.as_ptr(), 100.0, 100.0);
+        assert_eq!(gpui_on_window_activated_id(id), 1);
+        assert_eq!(gpui_on_window_activated_id(999), 0);
+        let layout = c(":close");
+        // Inactive -> active: delivered, once.
+        gpui_notify_window_state(id, 0, 0, 15, 0, 0, layout.as_ptr());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+        gpui_notify_window_state(id, 0, 0, 15, 0, 1, layout.as_ptr());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(LAST.load(Ordering::SeqCst), id);
+        assert_eq!(gpui_window_is_active(id), 1);
+        // Active -> active (a maximize) and active -> inactive: not edges.
+        gpui_notify_window_state(id, 0, 0, 15, 1, 1, layout.as_ptr());
+        gpui_notify_window_state(id, 0, 0, 15, 1, 0, std::ptr::null());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        // Back again: the second activation.
+        gpui_notify_window_state(id, 0, 0, 15, 1, 1, std::ptr::null());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        // Away while HIDDEN: the observer reports the deactivation and no
+        // frame samples it, so the next sample reads active after active.
+        // That is still a return, delivered once and by the sample.
+        assert_eq!(gpui_notify_window_activation(id, 0), 1);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(gpui_notify_window_activation(id, 1), 1);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        gpui_notify_window_state(id, 0, 0, 15, 1, 1, std::ptr::null());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        gpui_notify_window_state(id, 0, 0, 15, 1, 1, std::ptr::null());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        assert_eq!(gpui_notify_window_activation(999, 0), 0);
+        gpui_reset_windows();
     }
 
     #[test]

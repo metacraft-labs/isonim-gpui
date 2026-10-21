@@ -66,6 +66,7 @@ var
   focusCallbacks: Table[uint32, proc(focused: bool)]
   closeCallbacks: Table[uint32, proc(): bool]
   stateCallbacks: Table[uint32, proc()]
+  activatedCallbacks: Table[uint32, proc()]
   windowDispatchersRegistered = false
 
 proc resizeDispatcher(windowId: uint32; w, h: cdouble) {.cdecl.} =
@@ -87,12 +88,17 @@ proc stateDispatcher(windowId: uint32) {.cdecl.} =
   let cb = stateCallbacks.getOrDefault(windowId)
   if cb != nil: cb()
 
+proc activatedDispatcher(windowId: uint32) {.cdecl.} =
+  let cb = activatedCallbacks.getOrDefault(windowId)
+  if cb != nil: cb()
+
 proc ensureWindowDispatchers() =
   if not windowDispatchersRegistered:
     gpui_set_window_resize_dispatcher(resizeDispatcher)
     gpui_set_window_focus_dispatcher(focusDispatcher)
     gpui_set_window_close_dispatcher(closeDispatcher)
     gpui_set_window_state_dispatcher(stateDispatcher)
+    gpui_set_window_activated_dispatcher(activatedDispatcher)
     windowDispatchersRegistered = true
 
 proc windowCallbackCount*(): int =
@@ -108,6 +114,8 @@ proc windowCallbackCount*(): int =
     if id notin ids: ids.add id
   for id in stateCallbacks.keys:
     if id notin ids: ids.add id
+  for id in activatedCallbacks.keys:
+    if id notin ids: ids.add id
   ids.len
 
 proc releaseWindowCallbacks(windowId: uint32) =
@@ -115,6 +123,7 @@ proc releaseWindowCallbacks(windowId: uint32) =
   focusCallbacks.del(windowId)
   closeCallbacks.del(windowId)
   stateCallbacks.del(windowId)
+  activatedCallbacks.del(windowId)
 
 # ===========================================================================
 # Window API
@@ -240,6 +249,28 @@ proc onWindowState*(win: GpuiWindow; callback: proc()) =
   stateCallbacks[win.id] = callback
   discard gpui_on_window_state_id(win.id)
 
+proc onWindowActivated*(win: GpuiWindow; callback: proc()) =
+  ## Called when the window is ACTIVATED: `isActive` went from false to
+  ## true — the user came back to it from another program (alt-tab, a click
+  ## on it, the dock). The moment to re-read state another program may have
+  ## changed while the window was in the background, as a web page does on
+  ## its window `focus` event; a refresh on a clock alone leaves the window
+  ## showing stale state for up to one interval after the user returns.
+  ##
+  ## An edge, delivered once per return: deactivation, a repeat, and any
+  ## other chrome change while active (`onWindowState`'s business) do not
+  ## call it. A window starts inactive, so its first active frame counts as
+  ## an activation. So does a return to a window that drew nothing while the
+  ## user was away (another workspace, minimized): the renderer keeps the
+  ## platform's report that the window went inactive until the next frame
+  ## samples it. It runs on the event loop's thread from inside the frame
+  ## that sampled the change, after `onWindowState`'s callback for the same
+  ## frame, so whatever it changes in the tree is drawn in that frame.
+  ## Registering again replaces this window's handler; `destroy` releases it.
+  ensureWindowDispatchers()
+  activatedCallbacks[win.id] = callback
+  discard gpui_on_window_activated_id(win.id)
+
 proc setTitle*(win: GpuiWindow; title: string): bool =
   ## Change the window's title; the platform sees it on the next frame.
   gpui_set_window_title(win.id, title.cstring) != 0
@@ -323,6 +354,7 @@ proc resetWindows*() =
   focusCallbacks.clear()
   closeCallbacks.clear()
   stateCallbacks.clear()
+  activatedCallbacks.clear()
   # Re-register the dispatchers so they are always set after a reset,
   # mirroring `renderer.resetCallbacks`.
   windowDispatchersRegistered = false

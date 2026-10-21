@@ -115,6 +115,11 @@ type WindowCloseDispatcher* = proc(windowId: uint32): uint8 {.cdecl.}
 type WindowStateDispatcher* = proc(windowId: uint32) {.cdecl.}
   ## GWIN: the window's chrome state changed; read it back with the
   ## `gpui_window_*` queries.
+type WindowActivatedDispatcher* = proc(windowId: uint32) {.cdecl.}
+  ## The window went from inactive to active (`gpui_window_is_active` 0 then
+  ## 1): the user came back to it from another program. An EDGE — not every
+  ## chrome change, and not the per-frame keyboard focus `gpui_notify_focus`
+  ## reports.
 
 {.push cdecl, dynlib: shimLib.}
 
@@ -491,6 +496,22 @@ proc gpui_set_window_state_dispatcher*(dispatcher: WindowStateDispatcher)
 
 proc gpui_on_window_state_id*(window_id: uint32): uint8
   {.importc: "gpui_on_window_state_id".}
+
+proc gpui_set_window_activated_dispatcher*(
+    dispatcher: WindowActivatedDispatcher)
+  {.importc: "gpui_set_window_activated_dispatcher".}
+
+proc gpui_on_window_activated_id*(window_id: uint32): uint8
+  {.importc: "gpui_on_window_activated_id".}
+  ## Opt `window_id` into activation delivery; 1 if the window exists.
+
+proc gpui_notify_window_activation*(window_id: uint32; active: uint8): uint8
+  {.importc: "gpui_notify_window_activation".}
+  ## Bridging, like `gpui_notify_window_state`: the platform's activation
+  ## report as it happens, frame or no frame. An `active` of 0 makes the next
+  ## active state sample an activation even if no sample saw the window
+  ## inactive (a window on another workspace draws nothing while the user is
+  ## away). Dispatches nothing itself; 1 if the window exists.
 
 proc gpui_notify_window_state*(window_id: uint32; decorations, tiling,
                                controls, maximized, active: uint8;

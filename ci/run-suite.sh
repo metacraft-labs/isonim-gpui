@@ -249,7 +249,14 @@ BENCHMARKS=(
 #   * `test_bindings` stays one checkpoint, but it was RED at `058d5e1`:
 #     06acc9f declared `gpui_font_report` without exercising it there. It is
 #     covered now, beside `gpui_has_window_backend`.
-EXPECTED_CASES=372
+# 2026-10-21, written LAST and from a run (trap 4c), at `d4325e9` with the
+# window-activation change uncommitted: 382.
+#   * rust 212 -> 217: `window`'s four activation-edge cases (the edge and
+#     only the edge, a deactivation no frame sampled, only to an opted-in
+#     window, after the same sample's state dispatch) and `lib.rs`'s C-ABI
+#     round trip of it.
+#   * window-environment 17 -> 22: `onWindowActivated`'s five cases.
+EXPECTED_CASES=382
 
 total_cases=0
 failed_steps=()

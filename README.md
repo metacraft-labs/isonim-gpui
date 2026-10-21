@@ -122,6 +122,13 @@ desktop.
   your `.desktop` file), `setMinWindowSize` and `setInitialWindowState`.
   `setTitle` changes the title at any time. `onResize` reports every
   content-size change before the frame at that size is drawn.
+- **Coming back to the window.** `onWindowActivated` runs once each time
+  the window goes from inactive to active, when the user returns to it from
+  another program. Use it to re-read state another program may have changed
+  in the meantime, as a web page does on its window `focus` event. It is not
+  called while the window stays active or when it loses activation. A return
+  to a window that drew nothing while you were away, such as one on another
+  workspace or a minimized one, counts too.
 - **`ISONIM_GPUI_DECORATIONS=client|server`** overrides the decoration mode
   the window asks for.
 

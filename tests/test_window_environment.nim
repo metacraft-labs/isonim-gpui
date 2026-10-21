@@ -16,6 +16,13 @@
 ##     `windowEnvironment` read it back across the C boundary, and
 ##     `onWindowState` fires once per CHANGE and not for a repeat — the
 ##     discrimination that makes it usable for redraws.
+##   * `onWindowActivated` fires on the inactive-to-active EDGE only — once
+##     per return to the window, not for a repeat, a deactivation or a
+##     maximize while active — for the window it happened to, after the same
+##     sample's `onWindowState`, with `isActive` already true — and on a
+##     return from a window that drew no frame while the user was away, which
+##     only the platform's activation report (`gpui_notify_window_activation`)
+##     saw leave.
 ##   * `launchWindow` is id 0 outside `gpui_launch`, and the title setter
 ##     reports whether the window exists.
 ##
@@ -149,6 +156,76 @@ suite "GWIN — chrome state through the shim":
   test "destroying a window releases its state callback":
     let win = createWindow("gone", 100, 100)
     win.onWindowState(proc() = discard)
+    check windowCallbackCount() == 1
+    win.destroy()
+    check windowCallbackCount() == 0
+
+suite "window activation — the inactive-to-active edge":
+
+  setup:
+    resetWindows()
+
+  test "onWindowActivated fires on each return, never while still active":
+    let win = createWindow("returned-to", 100, 100)
+    var calls = 0
+    win.onWindowActivated(proc() = inc calls)
+    # A window starts inactive; an inactive sample is no activation.
+    gpui_notify_window_state(win.id, 1, 0, 15, 0, 0, ":close")
+    check calls == 0
+    # The user switches to it.
+    gpui_notify_window_state(win.id, 1, 0, 15, 0, 1, ":close")
+    check calls == 1
+    # Still active: a repeat, and a maximize while active, are not returns.
+    gpui_notify_window_state(win.id, 1, 0, 15, 0, 1, ":close")
+    gpui_notify_window_state(win.id, 1, 0, 15, 1, 1, ":close")
+    check calls == 1
+    # Away (another program focused) and back again.
+    gpui_notify_window_state(win.id, 1, 0, 15, 1, 0, ":close")
+    check calls == 1
+    gpui_notify_window_state(win.id, 1, 0, 15, 1, 1, ":close")
+    check calls == 2
+
+  test "the edge reaches only the window it happened to":
+    let a = createWindow("a", 100, 100)
+    let b = createWindow("b", 100, 100)
+    var aCalls, bCalls = 0
+    a.onWindowActivated(proc() = inc aCalls)
+    b.onWindowActivated(proc() = inc bCalls)
+    gpui_notify_window_state(b.id, 1, 0, 15, 0, 1, "")
+    check aCalls == 0
+    check bCalls == 1
+
+  test "the handler reads the window as active, after onWindowState ran":
+    let win = createWindow("ordered", 100, 100)
+    var order: seq[string]
+    win.onWindowState(proc() = order.add "state")
+    win.onWindowActivated(proc() =
+      order.add(if win.isActive: "activated-active" else: "activated-inactive"))
+    gpui_notify_window_state(win.id, 1, 0, 15, 0, 1, "")
+    check order == @["state", "activated-active"]
+
+  test "a return the frame sampler never saw leave is still one activation":
+    let win = createWindow("hidden-away", 100, 100)
+    var calls = 0
+    win.onWindowActivated(proc() = inc calls)
+    gpui_notify_window_state(win.id, 1, 0, 15, 0, 1, ":close")
+    check calls == 1
+    # Another workspace: the platform reports the window inactive and back,
+    # and no frame runs in between, so no sample sees it inactive.
+    check gpui_notify_window_activation(win.id, 0) == 1
+    check gpui_notify_window_activation(win.id, 1) == 1
+    check calls == 1
+    # The first frame after the return samples it active again: a return.
+    gpui_notify_window_state(win.id, 1, 0, 15, 0, 1, ":close")
+    check calls == 2
+    check win.isActive
+    # And only one: the next frame is not another.
+    gpui_notify_window_state(win.id, 1, 0, 15, 0, 1, ":close")
+    check calls == 2
+
+  test "destroying a window releases its activation callback":
+    let win = createWindow("gone", 100, 100)
+    win.onWindowActivated(proc() = discard)
     check windowCallbackCount() == 1
     win.destroy()
     check windowCallbackCount() == 0

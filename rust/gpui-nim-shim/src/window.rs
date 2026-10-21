@@ -41,10 +41,27 @@ pub type WindowCloseDispatcher = extern "C" fn(window_id: u32) -> u8;
 /// arguments would make every future field an ABI break.
 pub type WindowStateDispatcher = extern "C" fn(window_id: u32);
 
+/// Called with the window's id when the window was ACTIVATED: its
+/// [`ChromeState::active`] went from `false` to `true` between two samples
+/// (`update_chrome_state`). That is the moment the user came back to the
+/// window from another program, and the one an application re-reads state
+/// another program may have changed on — a web page's window `focus` event,
+/// which CodeTracer's desktop VCS panel refreshes on.
+///
+/// An EDGE, not a level and not every change: the state dispatcher above
+/// already fires for every chrome change, including deactivation and a
+/// maximize while active, and an application that wanted the edge had to
+/// remember the previous `active` itself, per window. Not to be confused
+/// with `notify_focus`, which `NimRootView::render` calls on EVERY frame
+/// with the root's KEYBOARD-focus state (PLAT-38's key-delivery predicate):
+/// that is not window activation and is deliberately left alone.
+pub type WindowActivatedDispatcher = extern "C" fn(window_id: u32);
+
 static RESIZE_DISPATCHER: Mutex<Option<WindowResizeDispatcher>> = Mutex::new(None);
 static FOCUS_DISPATCHER: Mutex<Option<WindowFocusDispatcher>> = Mutex::new(None);
 static CLOSE_DISPATCHER: Mutex<Option<WindowCloseDispatcher>> = Mutex::new(None);
 static STATE_DISPATCHER: Mutex<Option<WindowStateDispatcher>> = Mutex::new(None);
+static ACTIVATED_DISPATCHER: Mutex<Option<WindowActivatedDispatcher>> = Mutex::new(None);
 
 fn take_lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     match m.lock() {
@@ -67,6 +84,10 @@ pub fn set_close_dispatcher(d: WindowCloseDispatcher) {
 
 pub fn set_state_dispatcher(d: WindowStateDispatcher) {
     *take_lock(&STATE_DISPATCHER) = Some(d);
+}
+
+pub fn set_activated_dispatcher(d: WindowActivatedDispatcher) {
+    *take_lock(&ACTIVATED_DISPATCHER) = Some(d);
 }
 
 /// Unique window identifier (simple incrementing counter).
@@ -113,6 +134,15 @@ pub struct WindowConfig {
     pub dispatch_close: bool,
     /// GWIN: this window opted into `gpui_on_window_state` delivery.
     pub dispatch_state: bool,
+    /// This window opted into `gpui_on_window_activated_id` delivery.
+    pub dispatch_activated: bool,
+    /// The platform reported the window INACTIVE since the last chrome
+    /// sample ([`note_activation`]). Set by GPUI's activation observer,
+    /// cleared by every sample. It is how a deactivation that no frame saw
+    /// still counts: a window on another workspace, minimized or covered
+    /// draws no frame, so the per-frame sample goes from active straight to
+    /// active again when the user comes back.
+    pub activation_lapsed: bool,
 
     /// GWIN: what the platform last said about this window's frame,
     /// sampled by `NimRootView::render` once per frame.
@@ -135,6 +165,8 @@ impl WindowConfig {
             dispatch_focus: false,
             dispatch_close: false,
             dispatch_state: false,
+            dispatch_activated: false,
+            activation_lapsed: false,
             chrome: ChromeState::default(),
         }
     }
@@ -241,6 +273,35 @@ pub fn enable_state_dispatch(id: u32) -> bool {
     with_window_mut(id, |w| w.dispatch_state = true).is_some()
 }
 
+/// Opt `id` into activation delivery ([`WindowActivatedDispatcher`]).
+pub fn enable_activated_dispatch(id: u32) -> bool {
+    with_window_mut(id, |w| w.dispatch_activated = true).is_some()
+}
+
+/// Record what the platform said about window `id`'s ACTIVATION, at the
+/// moment it said it: GPUI's `observe_window_activation`, which runs on every
+/// change whether or not the window is drawing frames. Returns whether the
+/// window exists.
+///
+/// Only a deactivation is recorded, as [`WindowConfig::activation_lapsed`];
+/// nothing is dispatched from here. The activation itself is still delivered
+/// by the next chrome sample ([`update_chrome_state`]), from inside a frame
+/// and after the state dispatch, as the activated dispatcher promises.
+///
+/// WHY A LATCH IS NEEDED. Measured 2026-10-21 on headless sway 1.11: a window
+/// whose workspace is switched away and back gets the observer's `false` and
+/// then `true`, but no frame in between, because sway sends no frame
+/// callbacks to a surface that is not shown. The per-frame sample therefore
+/// read `active` before and `active` after, and the return was not an edge.
+pub fn note_activation(id: u32, active: bool) -> bool {
+    with_window_mut(id, |w| {
+        if !active {
+            w.activation_lapsed = true;
+        }
+    })
+    .is_some()
+}
+
 /// The last sampled chrome state of window `id`.
 pub fn chrome_state(id: u32) -> Option<ChromeState> {
     with_window(id, |w| w.chrome.clone())
@@ -250,16 +311,42 @@ pub fn chrome_state(id: u32) -> Option<ChromeState> {
 /// one and the window opted in, the state dispatcher runs — after the
 /// registry lock is released, so a handler may query the window it was
 /// called for. Returns whether anything changed.
+///
+/// When the sample also ACTIVATED the window (`active` false before, true
+/// now) and the window opted into activation delivery, the activated
+/// dispatcher runs next — after the state dispatcher, so an application
+/// that redraws its chrome on the state change has done so before it acts
+/// on the activation. The first sample of an active window counts: a
+/// window starts inactive (`ChromeState::default`) and the frame that finds
+/// it focused is its first activation. So is the first active sample after
+/// the platform reported the window inactive ([`note_activation`]), even when
+/// no sample saw it inactive.
+///
+/// Live windows are sampled once per frame (`NimRootView::render`, which
+/// GPUI re-runs on every activation change through
+/// `observe_window_activation`), so both callbacks run on the event loop's
+/// own thread, inside the frame whose tree they may change.
 pub fn update_chrome_state(id: u32, state: ChromeState) -> bool {
-    let Some((changed, dispatched)) = with_window_mut(id, |w| {
+    let Some((changed, activated, dispatch_state, dispatch_activated)) = with_window_mut(id, |w| {
         let changed = w.chrome != state;
+        let activated = state.active && (!w.chrome.active || w.activation_lapsed);
+        // The sample has seen the current activation, whatever it is.
+        w.activation_lapsed = false;
         w.chrome = state;
-        (changed, w.dispatch_state)
+        (changed, activated, w.dispatch_state, w.dispatch_activated)
     }) else {
         return false;
     };
-    if changed && dispatched {
+    if changed && dispatch_state {
         if let Some(d) = *take_lock(&STATE_DISPATCHER) {
+            d(id);
+        }
+    }
+    if activated && dispatch_activated {
+        // Copied out of the mutex before the call, so a handler that
+        // registers a dispatcher of its own cannot deadlock on this one.
+        let dispatcher = *take_lock(&ACTIVATED_DISPATCHER);
+        if let Some(d) = dispatcher {
             d(id);
         }
     }
@@ -1221,6 +1308,153 @@ mod tests {
         assert!(!update_chrome_state(999, client_state()));
         assert!(!enable_state_dispatch(999));
         assert_eq!(STATE_CALLS.load(TestOrdering::SeqCst), 2);
+    }
+
+    // ---- Activation edge ----------------------------------------------
+
+    static ACTIVATED_CALLS: TestAtomicU32 = TestAtomicU32::new(0);
+    static ACTIVATED_LAST_ID: TestAtomicU32 = TestAtomicU32::new(0);
+    static ACTIVATED_SAW_ACTIVE: TestAtomicU32 = TestAtomicU32::new(0);
+    static ORDER_STATE_FIRST: TestAtomicU32 = TestAtomicU32::new(0);
+    extern "C" fn record_activated(id: u32) {
+        ACTIVATED_CALLS.fetch_add(1, TestOrdering::SeqCst);
+        ACTIVATED_LAST_ID.store(id, TestOrdering::SeqCst);
+        // The new state is already recorded, and the registry lock is
+        // released: a handler asking "am I active?" gets the answer the
+        // edge announced. A deadlock here hangs the test.
+        if chrome_state(id).map(|s| s.active) == Some(true) {
+            ACTIVATED_SAW_ACTIVE.fetch_add(1, TestOrdering::SeqCst);
+        }
+        // Delivered AFTER the state dispatcher for the same sample.
+        if STATE_CALLS.load(TestOrdering::SeqCst) > 0 {
+            ORDER_STATE_FIRST.fetch_add(1, TestOrdering::SeqCst);
+        }
+    }
+
+    fn with_active(active: bool) -> ChromeState {
+        ChromeState {
+            active,
+            ..ChromeState::default()
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_activation_dispatches_on_the_inactive_to_active_edge_only() {
+        reset_windows();
+        set_activated_dispatcher(record_activated);
+        ACTIVATED_CALLS.store(0, TestOrdering::SeqCst);
+        ACTIVATED_SAW_ACTIVE.store(0, TestOrdering::SeqCst);
+        let a = create_window("A", 10.0, 10.0);
+        assert!(enable_activated_dispatch(a));
+
+        // A window starts inactive; its first active sample is an edge.
+        assert!(update_chrome_state(a, with_active(true)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 1);
+        assert_eq!(ACTIVATED_LAST_ID.load(TestOrdering::SeqCst), a);
+        assert_eq!(ACTIVATED_SAW_ACTIVE.load(TestOrdering::SeqCst), 1);
+
+        // Still active: a repeat, and a change of another field while
+        // active (a maximize), are not activations.
+        assert!(!update_chrome_state(a, with_active(true)));
+        let mut maximized = with_active(true);
+        maximized.maximized = true;
+        assert!(update_chrome_state(a, maximized));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 1);
+
+        // Deactivation is a change but not an activation...
+        assert!(update_chrome_state(a, with_active(false)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 1);
+        // ...and coming back is: the user returned from another program.
+        assert!(update_chrome_state(a, with_active(true)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 2);
+        assert_eq!(ACTIVATED_SAW_ACTIVE.load(TestOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_activation_counts_a_deactivation_no_sample_saw() {
+        // The window is left while it draws nothing (another workspace): the
+        // observer reports `false` and then `true`, no frame runs between,
+        // and the sample after the return reads active after active.
+        reset_windows();
+        set_activated_dispatcher(record_activated);
+        ACTIVATED_CALLS.store(0, TestOrdering::SeqCst);
+        let a = create_window("A", 10.0, 10.0);
+        assert!(enable_activated_dispatch(a));
+        assert!(update_chrome_state(a, with_active(true)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 1);
+
+        assert!(note_activation(a, false));
+        assert!(note_activation(a, true));
+        // Nothing is dispatched by the observer itself...
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 1);
+        // ...the next active sample is the return, though nothing changed...
+        assert!(!update_chrome_state(a, with_active(true)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 2);
+        // ...and only once: the sample cleared the latch.
+        assert!(!update_chrome_state(a, with_active(true)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 2);
+
+        // A deactivation the sample DID see is not counted twice: the
+        // inactive sample clears the latch, and the return is one edge.
+        assert!(note_activation(a, false));
+        assert!(update_chrome_state(a, with_active(false)));
+        assert!(update_chrome_state(a, with_active(true)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 3);
+
+        // An activation alone latches nothing, and an unknown window is
+        // refused.
+        assert!(note_activation(a, true));
+        assert!(!update_chrome_state(a, with_active(true)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 3);
+        assert!(!note_activation(999, false));
+    }
+
+    #[test]
+    #[serial]
+    fn test_activation_is_delivered_only_to_an_opted_in_window() {
+        reset_windows();
+        set_activated_dispatcher(record_activated);
+        ACTIVATED_CALLS.store(0, TestOrdering::SeqCst);
+        let watched = create_window("watched", 10.0, 10.0);
+        let unwatched = create_window("unwatched", 10.0, 10.0);
+        assert!(enable_activated_dispatch(watched));
+
+        // The other window's edge is recorded but not delivered.
+        assert!(update_chrome_state(unwatched, with_active(true)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 0);
+        assert_eq!(chrome_state(unwatched).map(|s| s.active), Some(true));
+
+        // Unknown windows neither opt in nor deliver.
+        assert!(!enable_activated_dispatch(999));
+        assert!(!update_chrome_state(999, with_active(true)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 0);
+
+        // A reset forgets the opt-in along with the window.
+        reset_windows();
+        let fresh = create_window("fresh", 10.0, 10.0);
+        assert!(update_chrome_state(fresh, with_active(true)));
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_activation_follows_the_state_dispatch_of_the_same_sample() {
+        reset_windows();
+        set_state_dispatcher(record_state);
+        set_activated_dispatcher(record_activated);
+        STATE_CALLS.store(0, TestOrdering::SeqCst);
+        ACTIVATED_CALLS.store(0, TestOrdering::SeqCst);
+        ORDER_STATE_FIRST.store(0, TestOrdering::SeqCst);
+        let a = create_window("A", 10.0, 10.0);
+        assert!(enable_state_dispatch(a));
+        assert!(enable_activated_dispatch(a));
+        assert!(update_chrome_state(a, with_active(true)));
+        assert_eq!(STATE_CALLS.load(TestOrdering::SeqCst), 1);
+        assert_eq!(ACTIVATED_CALLS.load(TestOrdering::SeqCst), 1);
+        // `record_activated` saw the state dispatch already counted.
+        assert_eq!(ORDER_STATE_FIRST.load(TestOrdering::SeqCst), 1);
     }
 
     #[test]

@@ -153,8 +153,16 @@ impl NimRootView {
                     reported.set(true);
                     window.refresh();
                 }));
+            // The observer also RECORDS the activation it was told about,
+            // because the frame it asks for may not come: a window that is
+            // not shown (another workspace, minimized) draws nothing, and the
+            // per-frame sample would miss the deactivation entirely
+            // (`window::note_activation`).
             self.chrome_observers
-                .push(cx.observe_window_activation(window, |_view, _window, cx| cx.notify()));
+                .push(cx.observe_window_activation(window, move |_view, window, cx| {
+                    window::note_activation(win_id, window.is_window_active());
+                    cx.notify();
+                }));
             // A close the COMPOSITOR asks for (its own close button, a
             // keyboard shortcut) goes through the same predicate as the
             // application's close button and `gpui_window_request_close`:
