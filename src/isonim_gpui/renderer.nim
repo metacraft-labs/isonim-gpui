@@ -61,10 +61,12 @@ const inlineTextRunsAttribute* = "data-inline-text-runs"
   ##
   ## A child that does not qualify keeps its own element, and only runs of
   ## two or more adjacent plain spans are fused. A container that puts
-  ## something between its children — a `gap`, a `space-*`
-  ## `justify-content`, or a `flex-direction` other than `row` — is not
-  ## fused at all, because fusing would delete that spacing. The declaration
-  ## is therefore safe to leave in place.
+  ## something between its children — a `gap` or a `space-*`
+  ## `justify-content` — is not fused at all, because fusing would delete
+  ## that spacing. Nor is a container that is not drawn as a flex row
+  ## (`display: flex`, or `flex-direction: row`): a column, or a container
+  ## with no flex layout, stacks its children, and fusing would draw them
+  ## on one line. The declaration is therefore safe to leave in place.
 
 # ===========================================================================
 # Tag mapping: HTML tags -> GPUI element model

@@ -620,18 +620,35 @@ pub struct FusedRun {
 /// - `justify-content: space-between` / `space-around` (and any other
 ///   `space-*` value) distribute the free space between children, so
 ///   fusing would redistribute it.
-/// - `flex-direction` other than `row`: a column stacks the children, and
-///   fusing would draw them on one line.
+/// - A container that is not drawn as a ROW: a column, and equally a
+///   container with no flex layout at all (GPUI's default display is block),
+///   stacks its children one per line, and fusing would draw them on one
+///   line. See `lays_out_as_row`.
 fn spaces_its_children(styles: &GpuiStyles) -> bool {
     styles.gap.is_some()
         || styles
             .justify
             .as_deref()
             .map_or(false, |j| j.starts_with("space"))
-        || styles
-            .flex_direction
+        || !lays_out_as_row(styles)
+}
+
+/// Does the unfused path draw this container as a horizontal flex row?
+///
+/// This states the rule `gpui_app::apply_styles_to_div` applies, and the two
+/// must agree: `flex-direction: row` makes a row, `display: flex` with no
+/// direction makes a row (CSS's default direction), and anything else —
+/// `column`, an unrecognised direction such as `row-reverse` (which that
+/// function does not draw), or no flex layout at all — leaves GPUI's block
+/// layout, which stacks the children vertically.
+fn lays_out_as_row(styles: &GpuiStyles) -> bool {
+    match styles.flex_direction.as_deref() {
+        Some(d) => d == "row",
+        None => styles
+            .display
             .as_deref()
-            .map_or(false, |d| d != "row")
+            .map_or(false, |d| d.trim() == "flex"),
+    }
 }
 
 /// Is this a container that declared itself an inline formatting context?
@@ -979,6 +996,7 @@ mod tests {
         let mut host = Node::new_element("span");
         host.attributes
             .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        host.styles.insert("display".into(), "flex".into());
         let host_id = tree.insert(host);
         for (text, weight) in [("name", None), ("value", Some("600"))] {
             let mut span = Node::new_element("span");
@@ -1084,6 +1102,7 @@ mod tests {
         let mut code = Node::new_element("span");
         code.attributes
             .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        code.styles.insert("display".into(), "flex".into());
         let code_id = tree.insert(code);
         for (text, color) in [("ab", Some("#111111")), ("cd", None)] {
             let mut span = Node::new_element("span");
@@ -1139,6 +1158,7 @@ mod tests {
         let mut host = Node::new_element("div");
         host.attributes
             .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        host.styles.insert("display".into(), "flex".into());
         let host_id = tree.insert(host);
         for item in spec {
             match item {
@@ -1292,6 +1312,7 @@ mod tests {
         let mut host = Node::new_element("div");
         host.attributes
             .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        host.styles.insert("display".into(), "flex".into());
         let host_id = tree.insert(host);
         for (text, arg) in [("a", Some("0")), ("b", Some("1"))] {
             let mut span = Node::new_element("span");
@@ -1344,6 +1365,7 @@ mod tests {
         let mut host = Node::new_element("div");
         host.attributes
             .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        host.styles.insert("display".into(), "flex".into());
         let host_id = tree.insert(host);
         for (text, wired) in [
             ("f", false),
@@ -1701,6 +1723,31 @@ mod tests {
             assert_eq!(inline_chunks(&plan), None, "container {key}: {value}");
             assert_eq!(inline_text_runs(&plan), None, "container {key}: {value}");
         }
+        // A container the unfused path does not draw as a row STACKS its
+        // children (GPUI's default display is block), so fusing would pull
+        // a column of spans onto one line: no flex layout at all, a display
+        // other than flex, and a direction the renderer does not draw.
+        for (display, direction) in [
+            (None, None),
+            (Some("block"), None),
+            (Some("flex"), Some("row-reverse")),
+        ] {
+            let mut plan = mixed_row(&[Some("a"), Some("b"), Some("c")]);
+            plan.styles.display = display.map(String::from);
+            if let Some(d) = direction {
+                plan.styles.apply("flex-direction", d);
+            }
+            assert_eq!(
+                inline_chunks(&plan),
+                None,
+                "display {display:?}, direction {direction:?}"
+            );
+        }
+        // `flex-direction: row` draws a row without `display: flex`.
+        let mut plan = mixed_row(&[Some("a"), Some("b")]);
+        plan.styles.display = None;
+        plan.styles.apply("flex-direction", "row");
+        assert_eq!(shape(&plan), vec!["fused@0:ab"]);
         // Properties that only ALIGN the children, or state the default
         // direction, add nothing between them and must not decline.
         for (key, value) in [
@@ -1721,6 +1768,7 @@ mod tests {
         let mut code = Node::new_element("span");
         code.attributes
             .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        code.styles.insert("display".into(), "flex".into());
         let code_id = tree.insert(code);
         let plan = build_render_plan(&tree, code_id).expect("plan");
         assert_eq!(inline_text_runs(&plan), None);
@@ -1735,6 +1783,7 @@ mod tests {
             let mut code = Node::new_element("span");
             code.attributes
                 .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), off.into());
+            code.styles.insert("display".into(), "flex".into());
             let code_id = tree.insert(code);
             let mut span = Node::new_element("span");
             span.styles.insert("color".into(), "#fff".into());
