@@ -36,8 +36,12 @@ const inlineTextRunsAttribute* = "data-inline-text-runs"
   ## error accumulates along the row; fused, the row is rounded once, which
   ## is what a browser's inline layout does. A child that is anything other
   ## than plain text — it has a handler, a window region, or any box styling
-  ## beyond `color` and `flex-shrink` — makes the renderer keep every span as
-  ## its own element, so the declaration is safe to leave in place.
+  ## beyond `color`, `font-weight` and `flex-shrink` — keeps its own element,
+  ## and only runs of two or more adjacent plain spans are fused. A container
+  ## that puts something between its children — a `gap`, a `space-*`
+  ## `justify-content`, or a `flex-direction` other than `row` — is not fused
+  ## at all, because fusing would delete that spacing. The declaration is
+  ## therefore safe to leave in place.
 
 # ===========================================================================
 # Tag mapping: HTML tags -> GPUI element model

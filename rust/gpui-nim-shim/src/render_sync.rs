@@ -466,6 +466,41 @@ pub struct FusedRun {
     pub runs: Vec<InlineTextRun>,
 }
 
+/// Does the CONTAINER put something between its adjacent children that
+/// fusing would delete?
+///
+/// This is the parent-side half of the guard in `fusable_child_text`, and
+/// it has to be written by hand. The child-side probe tests a child's whole
+/// `GpuiStyles` against the default, so a spacing field added to the struct
+/// later is refused on a CHILD automatically. Nothing equivalent exists for
+/// the container: most of its styling (a background, a padding, a height)
+/// is legitimately kept by the fused row, because the container keeps its
+/// own element. What is NOT kept is anything the layout places BETWEEN two
+/// children, since fusing a run of n spans removes n-1 children and every
+/// separation between them. A new field of that kind (a `column_gap`, a
+/// `row_gap`) must be added here, or fusing will silently delete it.
+///
+/// - `gap` puts a gap between every pair of adjacent children: `N*(n-1)`
+///   px of spacing per fused run. Any value is refused, `0` included,
+///   rather than parsing it: refusing costs only the rounding fusion would
+///   have removed, while a mis-parsed gap would delete real spacing.
+/// - `justify-content: space-between` / `space-around` (and any other
+///   `space-*` value) distribute the free space between children, so
+///   fusing would redistribute it.
+/// - `flex-direction` other than `row`: a column stacks the children, and
+///   fusing would draw them on one line.
+fn spaces_its_children(styles: &GpuiStyles) -> bool {
+    styles.gap.is_some()
+        || styles
+            .justify
+            .as_deref()
+            .map_or(false, |j| j.starts_with("space"))
+        || styles
+            .flex_direction
+            .as_deref()
+            .map_or(false, |d| d != "row")
+}
+
 /// Is this a container that declared itself an inline formatting context?
 fn declares_inline_runs(plan: &RenderNode) -> bool {
     plan.attributes
@@ -509,6 +544,9 @@ pub fn inline_chunks(plan: &RenderNode) -> Option<Vec<InlineChunk>> {
         return None;
     }
     if plan.children.is_empty() {
+        return None;
+    }
+    if spaces_its_children(&plan.styles) {
         return None;
     }
 
@@ -1193,6 +1231,47 @@ mod tests {
         // "a" is a run of one, so it keeps its element too; the padded "("
         // is its own; "bc" fuses. The 5 px is preserved either way.
         assert_eq!(shape(&plan), vec!["own@0", "own@1", "fused@2:bc"]);
+    }
+
+    /// THE CONTAINER-SIDE COUNTERPART OF THE PADDED-SPAN GUARD. A flex
+    /// container's `gap` puts space BETWEEN adjacent children, so fusing a
+    /// run of n spans removes n-1 children and n-1 gaps with them -- the
+    /// same spacing the padded-span guard protects, expressed on the parent
+    /// instead of the child. The child-side probe cannot see it, so the
+    /// container is refused outright. `justify-content: space-between` and
+    /// `space-around` distribute free space between children the same way,
+    /// and `flex-direction: column` puts a line break between them; each is
+    /// refused for the same reason.
+    #[test]
+    fn inline_chunks_decline_a_container_that_spaces_its_children() {
+        // POSITIVE CONTROL: the bare row fuses whole, so each decline below
+        // is caused by the container property and not by the row's shape.
+        let plan = mixed_row(&[Some("a"), Some("b"), Some("c")]);
+        assert_eq!(shape(&plan), vec!["fused@0:abc"]);
+        for (key, value) in [
+            ("gap", "8px"),
+            ("gap", "0"),
+            ("justify-content", "space-between"),
+            ("justify-content", "space-around"),
+            ("justify-content", "space-evenly"),
+            ("flex-direction", "column"),
+        ] {
+            let mut plan = mixed_row(&[Some("a"), Some("b"), Some("c")]);
+            plan.styles.apply(key, value);
+            assert_eq!(inline_chunks(&plan), None, "container {key}: {value}");
+            assert_eq!(inline_text_runs(&plan), None, "container {key}: {value}");
+        }
+        // Properties that only ALIGN the children, or state the default
+        // direction, add nothing between them and must not decline.
+        for (key, value) in [
+            ("justify-content", "start"),
+            ("align-items", "center"),
+            ("flex-direction", "row"),
+        ] {
+            let mut plan = mixed_row(&[Some("a"), Some("b")]);
+            plan.styles.apply(key, value);
+            assert_eq!(shape(&plan), vec!["fused@0:ab"], "container {key}: {value}");
+        }
     }
 
     /// A declared container with no children has nothing to fuse.
