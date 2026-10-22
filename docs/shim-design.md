@@ -293,6 +293,30 @@ applied: `font-style` (there is no `italic` in the shim).
 `inline_runs_decline_a_span_with_a_font_style` keeps it out of inline-run
 fusion until it is drawn.
 
+### Inline-Run Fusion and Horizontal Insets
+
+A container that declares `data-inline-text-runs` has its text-only
+children drawn as one text element per run, so the run's width is rounded
+once instead of once per span. The governing rule is the
+`inlineTextRunsAttribute` doc comment in `src/isonim_gpui/renderer.nim`;
+`fusable_child_text` in `render_sync.rs` implements it.
+
+A `StyledText` highlight carries colour and weight but no padding, so a
+span's padding used to keep that span out of every fused run. A span's own
+`padding-left` / `padding-right` (a non-negative px length) now fuses when
+the container declares `white-space: nowrap` or `pre` and no
+`text-overflow`. Such a run is drawn by `InsetRunText` (`gpui_app.rs`): one
+measured layout leaf that shapes the spans between insets as single lines,
+places them at unrounded pen offsets separated by the device-pixel-snapped
+insets, and lets GPUI round the total once. Runs without insets are still
+drawn as a `StyledText`, unchanged. The one-line condition exists because
+`InsetRunText` never wraps or truncates. A run whose text holds a hard line
+break cannot be shaped as one line either, so it is split back at its padded
+spans: those keep their own elements and the plain spans between them fuse
+as a `StyledText`, exactly as before insets existed. Vertical padding, the `padding`
+shorthand, margins and every other box style still keep a span as its own
+element.
+
 ### Value Parsers
 
 Required parsers for style values:

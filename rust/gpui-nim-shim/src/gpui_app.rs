@@ -893,6 +893,31 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
             // declines it), so there is no trailing text to append.
             for chunk in chunks {
                 el = match chunk {
+                    // A run carrying a horizontal inset (a span's own
+                    // padding, admitted only in a context that promised one
+                    // line) cannot be a `StyledText`: a highlight has no
+                    // gap. It is drawn by `InsetRunText`, which keeps the
+                    // gap and still rounds the run once. Every other run is
+                    // drawn exactly as before, so the wrap and truncate
+                    // behaviour of existing fused rows does not change.
+                    crate::render_sync::InlineChunk::Fused(run)
+                        if run.runs.iter().any(crate::render_sync::InlineTextRun::has_inset) =>
+                    {
+                        if InsetRunText::can_draw(&run) {
+                            el.child(InsetRunText::new(run))
+                        } else {
+                            // Defensive: `inline_chunks` never hands over an
+                            // inset run it cannot draw, but if it did, the
+                            // spans are drawn as their own elements -- the
+                            // unfused path, gap included -- rather than as a
+                            // `StyledText` that would delete the gap.
+                            plan.children
+                                .iter()
+                                .skip(run.start)
+                                .take(run.runs.len())
+                                .fold(el, |el, child| el.child(render_plan_to_gpui(child)))
+                        }
+                    }
                     crate::render_sync::InlineChunk::Fused(run) => el.child(fused_run_text(&run)),
                     crate::render_sync::InlineChunk::Own(i) => {
                         el.child(render_plan_to_gpui(&plan.children[i]))
@@ -947,25 +972,300 @@ fn fused_run_text(fused: &crate::render_sync::FusedRun) -> StyledText {
     for run in runs {
         let range = offset..offset + run.len;
         offset = range.end;
-        // A span whose colour does not parse keeps the inherited colour,
-        // which is what an unparsable `color` does to an unfused span too.
-        let color = run.color.as_deref().and_then(parse_color);
-        // `font-weight` is resolved by the SAME parser the unfused path
-        // uses (`parse_font_weight`, applied at `el.font_weight(..)`), so a
-        // run that fuses is drawn in the weight it would have had as its own
-        // element. A span with no weight of its own leaves the field `None`
-        // and inherits, exactly as it does unfused.
-        let font_weight = run.font_weight.as_deref().map(parse_font_weight);
-        highlights.push((
-            range,
-            HighlightStyle {
-                color,
-                font_weight,
-                ..Default::default()
-            },
-        ));
+        highlights.push((range, run_highlight(run)));
     }
     StyledText::new(text).with_highlights(highlights)
+}
+
+/// The per-span inline style of one fused run, as a `HighlightStyle` --
+/// shared by `fused_run_text` and `InsetRunText` so the two fused drawings
+/// can never disagree about a span's colour or weight.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn run_highlight(run: &crate::render_sync::InlineTextRun) -> HighlightStyle {
+    // A span whose colour does not parse keeps the inherited colour, which
+    // is what an unparsable `color` does to an unfused span too.
+    let color = run.color.as_deref().and_then(parse_color);
+    // `font-weight` is resolved by the SAME parser the unfused path uses
+    // (`parse_font_weight`, applied at `el.font_weight(..)`), so a run that
+    // fuses is drawn in the weight it would have had as its own element. A
+    // span with no weight of its own leaves the field `None` and inherits,
+    // exactly as it does unfused.
+    let font_weight = run.font_weight.as_deref().map(parse_font_weight);
+    HighlightStyle {
+        color,
+        font_weight,
+        ..Default::default()
+    }
+}
+
+/// ONE FUSED RUN THAT CARRIES HORIZONTAL INSETS, drawn as ONE measured
+/// layout leaf: the shaped segments of the run, with each span's own
+/// `padding-left` / `padding-right` left as a gap between them.
+///
+/// WHY IT EXISTS. A GPUI text element ceils its width to a whole logical
+/// pixel (`gpui-pre/src/elements/text.rs`, `size.width.max(line_size
+/// .width).ceil()`), and GPUI's taffy wrapper ceils every measured leaf to a
+/// device pixel again (`snap_measured_size_to_device_pixels`). Fusing spans
+/// into one `StyledText` removes that rounding within a run, but a
+/// `HighlightStyle` cannot carry padding, so a run whose spans are spaced by
+/// padding -- the editor's inline-value chip, `name` + 7 px + `value` --
+/// could not fuse without deleting the gap, and kept rounding once per span,
+/// so a row of chips drifted right of where a browser draws it. This
+/// element states the gap itself, so such a run fuses too.
+///
+/// WHY ONE LEAF. The whole run is ONE `request_measured_layout` returning
+/// its exact width, so GPUI rounds it ONCE, to a device pixel, at the end --
+/// which is how Chromium lays out inline runs (it accumulates in LayoutUnit,
+/// 1/64 px, and rounds once). Inside the leaf the pen accumulates UNROUNDED:
+/// each segment is placed at the sum of the snapped insets and the exact
+/// `ShapedLine::width()`s before it, so no per-span residue builds up.
+///
+/// HOW IT MATCHES THE UNFUSED PATH. Text runs are built exactly as
+/// `StyledText::compute_runs` builds them (`text_style.highlight(..)
+/// .to_run(len)`, with the highlight from `run_highlight`), and font size
+/// and line height exactly as `TextLayout::layout` computes them. Adjacent
+/// spans with no inset between them are shaped TOGETHER as one line, so
+/// their kerning and shaping match a `StyledText`. Each inset is snapped to
+/// the device-pixel grid with `Window::pixel_snap` (round half toward zero
+/// in device px), which is how taffy snaps the unfused span's authored
+/// padding (`Style::to_taffy` -> `round_to_device_pixel`), so the gap is
+/// the gap the unfused span is drawn with, not an approximation of it.
+///
+/// WHAT IT DOES NOT SUPPORT, and why that is safe. It draws exactly one
+/// line: no wrapping, no truncation, no `text-overflow`, no hard line
+/// breaks. `render_sync::fusable_child_text` therefore admits an inset only
+/// in a context that declared `white-space: nowrap` / `pre` and no
+/// `text-overflow` -- where the unfused spans could not wrap or elide
+/// either -- and `render_sync::inline_chunks` never hands it a run holding
+/// a line break. `can_draw` re-checks that at the call site, so a violated
+/// precondition draws the spans as their own elements (the unfused path,
+/// gap included) instead of reaching `shape_line`, which cannot shape a
+/// break. Per-span hit-testing is not provided either; spans with listeners
+/// never fuse in the first place.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct InsetRunText {
+    run: crate::render_sync::FusedRun,
+}
+
+/// One shaped segment of an `InsetRunText`, and the pen offset from the
+/// element's left edge it is painted at.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct InsetSegment {
+    x: gpui::Pixels,
+    line: gpui::ShapedLine,
+}
+
+/// What `InsetRunText::request_layout` measured, kept for `paint`.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct InsetRunLayout {
+    segments: Vec<InsetSegment>,
+    /// The run's exact width: every snapped inset plus every segment's
+    /// unrounded shaped width. GPUI ceils it to a device pixel, once.
+    width: gpui::Pixels,
+    line_height: gpui::Pixels,
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl InsetRunText {
+    /// Wrap one fused run. Callers check `can_draw` first.
+    pub fn new(run: crate::render_sync::FusedRun) -> Self {
+        Self { run }
+    }
+
+    /// Can this element draw `run` faithfully: is its text a single line
+    /// (`shape_line` cannot shape a break) and do its runs tile the text
+    /// exactly on character boundaries? A run without insets is drawn by
+    /// `fused_run_text` instead, and the caller decides that.
+    pub fn can_draw(run: &crate::render_sync::FusedRun) -> bool {
+        if run.text.contains(['\n', '\r']) {
+            return false;
+        }
+        let mut at = 0usize;
+        for r in &run.runs {
+            at += r.len;
+            if !run.text.is_char_boundary(at) {
+                return false;
+            }
+        }
+        at == run.text.len()
+    }
+
+    /// Shape the run into segments split at every non-zero inset, and
+    /// measure it. `text_style` is the inherited style at this element.
+    fn measure(&self, text_style: &gpui::TextStyle, window: &mut Window) -> InsetRunLayout {
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        // As `TextLayout::layout` computes it, so a chip's height is the
+        // height its unfused text elements had.
+        let line_height = window.pixel_snap(
+            text_style
+                .line_height
+                .to_pixels(font_size.into(), window.rem_size()),
+        );
+
+        let text = self.run.text.as_str();
+        let mut segments = Vec::new();
+        let mut pen = px(0.0);
+        let mut seg_start = 0usize;
+        let mut seg_end = 0usize;
+        let mut seg_runs: Vec<gpui::TextRun> = Vec::new();
+
+        // Shape the spans accumulated since the last inset as ONE line, so
+        // adjacent uninset spans kern and shape exactly as in a `StyledText`.
+        let mut flush = |seg_start: &mut usize,
+                         seg_end: usize,
+                         seg_runs: &mut Vec<gpui::TextRun>,
+                         pen: &mut gpui::Pixels,
+                         window: &mut Window| {
+            if seg_runs.is_empty() {
+                return;
+            }
+            // `inline_chunks` tiles the text with its runs on character
+            // boundaries; a range that is not a slice means a malformed run,
+            // and that segment is skipped rather than shaped from garbage.
+            if let Some(piece) = text.get(*seg_start..seg_end) {
+                if !piece.is_empty() {
+                    let line = window.text_system().shape_line(
+                        gpui::SharedString::from(piece.to_string()),
+                        font_size,
+                        seg_runs,
+                        None,
+                    );
+                    let width = line.width();
+                    segments.push(InsetSegment { x: *pen, line });
+                    *pen += width;
+                }
+            }
+            seg_runs.clear();
+            *seg_start = seg_end;
+        };
+
+        for run in &self.run.runs {
+            let left = run.inset_left_px();
+            if left > 0.0 {
+                flush(&mut seg_start, seg_end, &mut seg_runs, &mut pen, window);
+                pen += window.pixel_snap(px(left));
+            }
+            seg_runs.push(
+                text_style
+                    .clone()
+                    .highlight(run_highlight(run))
+                    .to_run(run.len),
+            );
+            seg_end += run.len;
+            let right = run.inset_right_px();
+            if right > 0.0 {
+                flush(&mut seg_start, seg_end, &mut seg_runs, &mut pen, window);
+                pen += window.pixel_snap(px(right));
+            }
+        }
+        flush(&mut seg_start, seg_end, &mut seg_runs, &mut pen, window);
+
+        InsetRunLayout {
+            segments,
+            width: pen,
+            line_height,
+        }
+    }
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl gpui::Element for InsetRunText {
+    type RequestLayoutState = InsetRunLayout;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let text_style = window.text_style();
+        let layout = self.measure(&text_style, window);
+        // ONE leaf, measured once: the size does not depend on the space
+        // offered, because the run is one line that never wraps or elides.
+        let measured = size(layout.width, layout.line_height);
+        let layout_id = window
+            .request_measured_layout(Default::default(), move |_known, _available, _w, _cx| {
+                measured
+            });
+        (layout_id, layout)
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<gpui::Pixels>,
+        _layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // The run is aligned AS A WHOLE within the element's bounds, as a
+        // `StyledText` line is (`aligned_origin_x` in gpui's line.rs); each
+        // segment is then painted left-aligned at its own pen offset, so a
+        // centred run does not centre every segment separately.
+        let text_align = window.text_style().text_align;
+        let slack = bounds.size.width - layout.width;
+        let shift = match text_align {
+            gpui::TextAlign::Left => px(0.0),
+            gpui::TextAlign::Center => slack / 2.0,
+            gpui::TextAlign::Right => slack,
+        };
+        for segment in &layout.segments {
+            let origin = gpui::point(bounds.origin.x + shift + segment.x, bounds.origin.y);
+            // Background before glyphs, as `TextLayout::paint` does. A
+            // failure (a glyph the atlas could not take) loses that segment
+            // for this frame and the others still paint; a `StyledText`
+            // likewise drops the error (`log_err`). It is not printed: paint
+            // runs every frame, and the shim has no logger to rate-limit it.
+            let _ = segment.line.paint_background(
+                origin,
+                layout.line_height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+            let _ = segment.line.paint(
+                origin,
+                layout.line_height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+        }
+    }
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl IntoElement for InsetRunText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
 }
 
 /// GWIN: give an element its window region (`regions.rs`). A drag region

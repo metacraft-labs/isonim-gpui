@@ -34,14 +34,37 @@ const inlineTextRunsAttribute* = "data-inline-text-runs"
   ## case. A GPUI text element rounds its width up to a whole logical pixel,
   ## so one element per span applies that rounding once per span and the
   ## error accumulates along the row; fused, the row is rounded once, which
-  ## is what a browser's inline layout does. A child that is anything other
-  ## than plain text — it has a handler, a window region, or any box styling
-  ## beyond `color`, `font-weight` and `flex-shrink` — keeps its own element,
-  ## and only runs of two or more adjacent plain spans are fused. A container
-  ## that puts something between its children — a `gap`, a `space-*`
-  ## `justify-content`, or a `flex-direction` other than `row` — is not fused
-  ## at all, because fusing would delete that spacing. The declaration is
-  ## therefore safe to leave in place.
+  ## is what a browser's inline layout does.
+  ##
+  ## THE FUSION SAFETY RULE. A child fuses only when it is plain text: no
+  ## handler, no window region, and no style beyond `color`, `font-weight`
+  ## and `flex-shrink`, tested by difference from the default style so a
+  ## style the renderer learns later keeps its own element rather than
+  ## fusing silently. A style may join that set only when (1) the fused
+  ## element can state it per span and (2) the unfused path already draws
+  ## it, so that fusing changes where glyphs land and nothing else.
+  ##
+  ## One box property passes that test, under a condition: a child's own
+  ## HORIZONTAL padding (`padding-left` / `padding-right`, each a
+  ## non-negative px length) fuses when THIS ELEMENT declares
+  ## `white-space: nowrap` (or `pre`) and declares no `text-overflow`. The
+  ## renderer then draws the run with an element that leaves exactly the
+  ## padded gap between the text either side of it — snapped to the device
+  ## pixel grid as the unfused padding is — and still rounds the run once,
+  ## so the gap is kept and only the rounding goes. The one-line condition
+  ## is required because that element draws one line and never truncates:
+  ## a context that may wrap or elide keeps a padded child as its own
+  ## element, as does a padding that is not a px length, the `padding`
+  ## shorthand, vertical padding, margins and every other box style.
+  ## A text-overflow inherited from an ancestor is not seen by the rule, so
+  ## do not declare a one-line context inside an eliding one.
+  ##
+  ## A child that does not qualify keeps its own element, and only runs of
+  ## two or more adjacent plain spans are fused. A container that puts
+  ## something between its children — a `gap`, a `space-*`
+  ## `justify-content`, or a `flex-direction` other than `row` — is not
+  ## fused at all, because fusing would delete that spacing. The declaration
+  ## is therefore safe to leave in place.
 
 # ===========================================================================
 # Tag mapping: HTML tags -> GPUI element model

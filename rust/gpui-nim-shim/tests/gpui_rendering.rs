@@ -1129,3 +1129,133 @@ fn test_min_width_floors_the_laid_out_width() {
         assert_eq!(w, 120.0, "min-width: 120px laid out {w}px wide");
     });
 }
+
+// ---------------------------------------------------------------------------
+// Test: an inline-value chip is ROUNDED ONCE, not once per span.
+//
+// The editor's inline-value chips drifted right of a browser's rendering. A
+// GPUI text element ceils its own width to a whole logical pixel and taffy
+// then ceils every measured leaf to a device pixel, so a chip drawn as a
+// name element plus a padded value element rounds TWICE and a row of chips
+// accumulates the residue. A chip that declares
+// itself a one-line inline formatting context must be drawn as one measured
+// leaf: name, 7 px inset, value, accumulated unrounded and ceiled once.
+//
+// WHY THESE NUMBERS DISCRIMINATE. The test platform's text system is gpui's
+// `NoopTextSystem`, which is no mock of ours: it is what `TestAppContext`
+// installs. It advances every BMP character by 0.6 em, so at 13 px each glyph
+// is 7.8 px -- fractional, which is what lets a single rounding and a
+// per-span rounding land on different widths. The test window's scale factor
+// is 2.0, so a device pixel is 0.5 logical px. The CONTROL (the same chip
+// without the declaration) must measure the per-span prediction, which proves
+// the fixture really produces fractional advances: if a future gpui changed
+// either fact the control would fail first, instead of the main assertion
+// passing for the wrong reason.
+// ---------------------------------------------------------------------------
+
+/// The chip as `leaves.nim` builds it, minus its decoration: a flex box
+/// holding the name and the value, the value spaced 7 px off the name by its
+/// own `padding-left`. `declare` makes it a one-line inline formatting
+/// context (the declaration plus `white-space: nowrap`).
+fn chip_plan(declare: bool, name: &str, value: &str) -> RenderNode {
+    use gpui_nim_shim::render_sync::INLINE_TEXT_RUNS_ATTRIBUTE;
+    use gpui_nim_shim::tree::Tree;
+    let mut tree = Tree::new();
+    let mut chip = Node::new_element("div");
+    chip.styles.insert("display".into(), "flex".into());
+    chip.styles.insert("flex-shrink".into(), "0".into());
+    chip.styles.insert("font-size".into(), "13px".into());
+    if declare {
+        chip.attributes
+            .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        chip.styles.insert("white-space".into(), "nowrap".into());
+    }
+    let chip_id = tree.insert(chip);
+    let spans: [(&str, &[(&str, &str)]); 2] = [
+        (name, &[("color", "#9cdcfe"), ("flex-shrink", "0")]),
+        (
+            value,
+            &[
+                ("color", "#d4d4d4"),
+                ("font-weight", "600"),
+                ("padding-left", "7px"),
+                ("flex-shrink", "0"),
+            ],
+        ),
+    ];
+    for (text, styles) in spans {
+        let mut span = Node::new_element("div");
+        for (k, v) in styles {
+            span.styles.insert((*k).into(), (*v).into());
+        }
+        let span_id = tree.insert(span);
+        let text_id = tree.insert(Node::new_text(text));
+        tree.append_child(span_id, text_id);
+        tree.append_child(chip_id, span_id);
+    }
+    build_render_plan(&tree, chip_id).expect("plan")
+}
+
+/// A wide row holding the chip in a wrapper the size of its content, which
+/// is what `debug_bounds` reads back.
+struct ChipProbe {
+    plan: RenderNode,
+}
+
+impl gpui::Render for ChipProbe {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{InteractiveElement, ParentElement, Styled};
+        div().flex().flex_row().w(gpui::px(600.0)).h(gpui::px(100.0)).child(
+            div()
+                .flex()
+                .flex_shrink_0()
+                .debug_selector(|| "chip".into())
+                .child(render_plan_to_gpui(&self.plan)),
+        )
+    }
+}
+
+fn chip_width(cx: &mut TestAppContext, plan: RenderNode) -> f32 {
+    let (_view, vcx) = cx.add_window_view(move |_window, _cx| ChipProbe { plan });
+    vcx.run_until_parked();
+    let b = vcx
+        .debug_bounds("chip")
+        .expect("the chip was drawn and its bounds recorded");
+    f32::from(b.size.width)
+}
+
+#[test]
+#[serial]
+fn test_a_one_line_chip_is_rounded_once_not_per_span() {
+    run_gpui_test("test_a_one_line_chip_is_rounded_once_not_per_span", |cx| {
+        const GLYPH: f32 = 0.6 * 13.0; // NoopTextSystem's advance at 13 px
+        const SCALE: f32 = 2.0; // the test window's scale factor
+        let (name, value) = ("abc", "1234");
+        let name_w = GLYPH * name.len() as f32; // 23.4
+        let value_w = GLYPH * value.len() as f32; // 31.2
+        let device_ceil = |w: f32| (w * SCALE).ceil() / SCALE;
+        // Per span: each text element ceils to a logical px, then to a
+        // device px; the 7 px padding sits between them.
+        let per_span = device_ceil(name_w.ceil()) + 7.0 + device_ceil(value_w.ceil());
+        // Once: the whole chip is one leaf, ceiled to a device px.
+        let once = device_ceil(name_w + 7.0 + value_w);
+        assert!(
+            (per_span - once).abs() >= 0.5,
+            "fixture must discriminate: per-span {per_span} vs once {once}"
+        );
+
+        // CONTROL: undeclared, the chip is drawn span by span.
+        let w = chip_width(cx, chip_plan(false, name, value));
+        assert_eq!(w, per_span, "control: an undeclared chip rounds per span");
+
+        // The declared chip is rounded once, and keeps its 7 px gap: `once`
+        // includes it, and a fused width that had lost the gap would be
+        // 7 px short of `once`.
+        let w = chip_width(cx, chip_plan(true, name, value));
+        assert_eq!(w, once, "a declared nowrap chip must be rounded once");
+    });
+}

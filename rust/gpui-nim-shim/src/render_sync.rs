@@ -337,16 +337,34 @@ pub struct RenderNode {
 /// The declaration is explicit rather than inferred so that fusing is opt-in
 /// per container: a caller that wants per-span elements (because it measures
 /// them, or hangs something off them) keeps them by saying nothing.
+///
+/// WHAT FUSES. A child fuses when it is text and nothing else: no handler,
+/// no window region, and no style beyond `color`, `font-weight` and
+/// `flex-shrink` -- tested BY DIFFERENCE from the default style, so a style
+/// field added later declines rather than fusing silently. One box property
+/// is admitted on top of that: a span's own HORIZONTAL padding
+/// (`padding-left` / `padding-right`, each a non-negative px length), and
+/// only when this container itself declares `white-space: nowrap` (or `pre`)
+/// and declares no `text-overflow`. A run carrying such padding is drawn by
+/// the inset element (`gpui_app::InsetRunText`), which leaves EXACTLY the
+/// padded gap between its shaped segments and rounds the whole run once; a
+/// `StyledText` highlight cannot carry a gap, which is why padding never
+/// fused before that element existed. The one-line condition is what keeps
+/// it a pure layout change: the inset element draws one line and never
+/// truncates, so it is only used where the unfused spans could not wrap or
+/// elide either. `fusable_child_text` holds the full rule.
 pub const INLINE_TEXT_RUNS_ATTRIBUTE: &str = "data-inline-text-runs";
 
 /// One span of a fused inline formatting context: how many BYTES of the
 /// fused string it covers, and the inline properties it is drawn with
 /// (`None` on any of them keeps the inherited value).
 ///
-/// The properties here are the ones a `HighlightStyle` can carry per range
+/// The properties here are the ones the fused element can state per range
 /// AND that the unfused path already draws, which is what bounds the set:
-/// fusing must change where glyphs land and nothing else. See
-/// `fusable_child_text`.
+/// fusing must change where glyphs land and nothing else. `color` and
+/// `font_weight` are stated by a `HighlightStyle`; the horizontal insets by
+/// the inset element (`gpui_app::InsetRunText`), since a highlight cannot
+/// carry a gap. See `fusable_child_text`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineTextRun {
     /// The span's length in BYTES of the fused string, not characters:
@@ -356,16 +374,96 @@ pub struct InlineTextRun {
     pub color: Option<String>,
     /// The span's `font-weight`, verbatim; the caller parses it.
     pub font_weight: Option<String>,
+    /// The span's own `padding-left`, verbatim, carried as a LEADING INSET:
+    /// the gap the inset element leaves before the span's text. `None` when
+    /// the span declares none. It is only ever `Some` in a context that
+    /// promised one line, and only for a value `parse_inset_px` accepts (see
+    /// `fusable_child_text`); the consumer parses it with that same function.
+    /// Carried verbatim, like `color` and `font_weight`, so the plan type
+    /// stays `Eq` and the one parser stays the single source of truth.
+    pub inset_left: Option<String>,
+    /// The span's own `padding-right`, verbatim: the TRAILING inset, the gap
+    /// after the span's text. Carried under exactly the rules of
+    /// `inset_left`.
+    pub inset_right: Option<String>,
 }
 
-/// A child that may be fused: its text, or `None` if it must stay its own
-/// element.
+impl InlineTextRun {
+    /// The leading inset in px, `0.0` when there is none.
+    pub fn inset_left_px(&self) -> f32 {
+        self.inset_left.as_deref().and_then(parse_inset_px).unwrap_or(0.0)
+    }
+
+    /// The trailing inset in px, `0.0` when there is none.
+    pub fn inset_right_px(&self) -> f32 {
+        self.inset_right.as_deref().and_then(parse_inset_px).unwrap_or(0.0)
+    }
+
+    /// Does this run carry a non-zero horizontal inset? A run that does
+    /// cannot be drawn as a `StyledText` highlight, which has no notion of
+    /// a gap, and needs the inset element (`gpui_app::InsetRunText`).
+    pub fn has_inset(&self) -> bool {
+        self.inset_left_px() > 0.0 || self.inset_right_px() > 0.0
+    }
+}
+
+/// A span padding that can be reproduced EXACTLY as an inset: a finite,
+/// non-negative length in px (`"7px"`, or a bare `"7"`).
+///
+/// The grammar is `gpui_app::parse_px`'s, character for character (trim,
+/// strip one `px` suffix, parse the rest as `f32`), narrowed to finite
+/// non-negative values. It must not be any LOOSER than that: a padding the
+/// unfused path's `parse_px` rejects is not drawn at all, so an inset made
+/// of it would add a gap the unfused span does not have. `"7 px"` is the
+/// case to remember -- `parse_px` rejects it, so this does too.
+///
+/// Anything else -- `em`, `%`, `auto`, a negative or non-finite value -- is
+/// `None`, and a span whose padding is `None` here keeps its own element.
+/// That is deliberate: the unfused path either draws such a value in some
+/// other way or ignores it, and the inset element must never guess which.
+pub fn parse_inset_px(s: &str) -> Option<f32> {
+    let s = s.trim();
+    let num = s.strip_suffix("px").unwrap_or(s);
+    num.parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// Does `context` PROMISE ONE LINE of text: does it declare
+/// `white-space: nowrap` or `pre` (the two values the unfused path draws as
+/// `whitespace_nowrap`, `gpui_app::apply_styles_to_div`) and declare no
+/// `text-overflow` at all?
+///
+/// Only such a context may carry a span's horizontal padding as an inset.
+/// The inset element shapes each segment as exactly ONE line and never
+/// truncates, so in a context that may wrap or elide it would draw
+/// something the unfused spans do not. In a context that promised one line
+/// the unfused spans cannot wrap or elide either, so the inset element
+/// changes where glyphs land and nothing else.
+///
+/// What it reads is the context's OWN declaration. A `text-overflow`
+/// inherited from an ancestor is not in the plan node and is not seen here;
+/// that is why the declaration is opt-in, and a caller that elides chips
+/// must not declare them.
+fn promises_one_line(context: &RenderNode) -> bool {
+    let nowrap = context
+        .styles
+        .white_space
+        .as_deref()
+        .is_some_and(|ws| matches!(ws.trim(), "nowrap" | "pre"));
+    nowrap && context.styles.text_overflow.is_none()
+}
+
+/// A child of the inline formatting context `context` that may be fused:
+/// its text, or `None` if it must stay its own element.
 ///
 /// A span qualifies only when it is text and NOTHING else — no handler, no
 /// window region, no box styling. Anything else can be positioned, hit-tested
 /// or painted in its own right, and fusing it away would change behaviour
-/// rather than just layout.
-fn fusable_child_text(child: &RenderNode) -> Option<&str> {
+/// rather than just layout. The one box property a span may carry is its
+/// own HORIZONTAL padding, and only when `context` promised one line
+/// (`promises_one_line`); `context` is passed for that check alone.
+fn fusable_child_text<'a>(context: &RenderNode, child: &'a RenderNode) -> Option<&'a str> {
     if child.has_click_handler || child.has_input_handler || !child.event_names.is_empty() {
         return None;
     }
@@ -390,9 +488,11 @@ fn fusable_child_text(child: &RenderNode) -> Option<&str> {
     // other style simply keeps its own element.
     //
     // WHAT BOUNDS THIS SET is a two-part test, not taste. Fusing replaces N
-    // text elements with one `StyledText` plus one highlight per range, so a
-    // property may join the set only when (1) a `HighlightStyle` can state
-    // it per range, and (2) the UNFUSED path already draws it — otherwise
+    // text elements with one fused element -- a `StyledText` plus one
+    // highlight per range, or the inset element below -- so a property may
+    // join the set only when (1) the fused element can state it per range
+    // (for an inline property, a `HighlightStyle` can), and (2) the UNFUSED
+    // path already draws it — otherwise
     // fusing would start drawing something the spans do not draw today, and
     // it would no longer be a pure layout change. `color` and `font-weight`
     // pass both; `flex_shrink` is meaningless once there is one element and
@@ -410,21 +510,54 @@ fn fusable_child_text(child: &RenderNode) -> Option<&str> {
     // applied -- and was removed from the parser instead, because `gpui-pre`
     // has no letter-spacing to apply; see `docs/shim-design.md`.)
     //
-    // A BOX PROPERTY MUST NEVER BE ADDED HERE, and `padding_left` is the one
-    // to think about, because it is how a caller spaces two text runs inside
-    // a box. A highlight cannot carry it: fusing two runs separated by
-    // padding CONCATENATES THEM AND DELETES THE SPACE. Measured on this
-    // host 2026-10-21 against codetracer 3fce565eb, an editor inline-value
-    // chip separates its name from its value by ~8.5 pt and BOTH front-ends
-    // draw that gap, so fusing such a chip would be an 8.5 pt regression in
-    // exchange for removing one rounding of at most 2 device px.
-    // `inline_runs_decline_a_span_with_leading_padding` is the guard.
+    // NO BOX PROPERTY MAY BE CARRIED BY A HIGHLIGHT, and `padding_left` is
+    // the one to think about, because it is how a caller spaces two text
+    // runs inside a box. A `HighlightStyle` cannot carry it: fusing two runs
+    // separated by padding into one `StyledText` CONCATENATES THEM AND
+    // DELETES THE SPACE. Measured 2026-10-21 against codetracer 3fce565eb,
+    // an editor inline-value chip separates its name from its value by
+    // ~8.5 pt and BOTH front-ends draw that gap, so losing it would be an
+    // 8.5 pt regression in exchange for removing one rounding of at most
+    // 2 device px.
+    //
+    // HORIZONTAL PADDING NOW FUSES ANYWAY, because it is no longer carried
+    // by a highlight. A span's own `padding-left` / `padding-right` rides on
+    // its run as an INSET, and a run with an inset is drawn by the inset
+    // element (`gpui_app::InsetRunText`), which leaves exactly that gap --
+    // snapped to the device-pixel grid as taffy snaps the unfused span's
+    // padding -- between the shaped segments. Under the two-part test above:
+    // (1) the fused element can state it per range: yes, the inset element
+    // does, which is what it exists for; (2) the unfused path draws it: yes,
+    // `apply_styles_to_div` applies `padding_left` / `padding_right`.
+    //
+    // It fuses only under BOTH of these, and declines otherwise:
+    //   * the CONTEXT promised one line (`promises_one_line`: it declares
+    //     `white-space: nowrap` or `pre` and no `text-overflow`). The inset
+    //     element draws one line and never truncates, so this is what keeps
+    //     it a pure layout change; and
+    //   * each padding is a finite non-negative px length (`parse_inset_px`).
+    //     A value that does not parse must decline: the inset would have to
+    //     guess what the unfused path makes of it.
+    // Every OTHER box property still declines, and still by difference: the
+    // `padding` shorthand (four sides), `padding-top` / `-bottom` (they
+    // change the box's height), margins, backgrounds, and anything added
+    // later. `inline_chunks_keep_a_padded_span_in_a_context_that_may_wrap`
+    // and its neighbours are the guards.
     let mut probe = child.styles.clone();
     probe.text_color = None;
     probe.flex_shrink = None;
     probe.font_weight = None;
+    let pads = [probe.padding_left.take(), probe.padding_right.take()];
     if probe != GpuiStyles::default() {
         return None;
+    }
+    if pads.iter().any(Option::is_some) {
+        if !promises_one_line(context) {
+            return None;
+        }
+        if pads.iter().flatten().any(|p| parse_inset_px(p).is_none()) {
+            return None;
+        }
     }
     let own_text = child.text.as_deref().filter(|t| !t.is_empty());
     match (own_text, child.children.as_slice()) {
@@ -555,30 +688,65 @@ pub fn inline_chunks(plan: &RenderNode) -> Option<Vec<InlineChunk>> {
 
     // Close the run accumulated so far: a real fusion at two spans or more,
     // otherwise the single span goes back to being its own element.
-    fn flush(chunks: &mut Vec<InlineChunk>, plan: &RenderNode, pending: &mut Vec<(usize, &str)>) {
-        if pending.len() >= 2 {
-            let start = pending[0].0;
-            let mut text = String::new();
-            let mut runs = Vec::with_capacity(pending.len());
-            for (i, piece) in pending.iter() {
-                text.push_str(piece);
-                runs.push(InlineTextRun {
-                    len: piece.len(),
-                    color: plan.children[*i].styles.text_color.clone(),
-                    font_weight: plan.children[*i].styles.font_weight.clone(),
-                });
-            }
-            chunks.push(InlineChunk::Fused(FusedRun { start, text, runs }));
-        } else {
+    //
+    // A run that carries an inset is drawn by the inset element, which
+    // shapes each segment as ONE line: GPUI's `shape_line` cannot take a
+    // hard break. Such a run whose text holds one is therefore split back
+    // into what the rule made of it before insets existed: every PADDED
+    // span keeps its own element, and the plain spans between them still
+    // fuse (they hold no inset, so a `StyledText` draws their break). A
+    // break therefore never makes a row fuse less than it used to.
+    fn flush<'a>(
+        chunks: &mut Vec<InlineChunk>,
+        plan: &RenderNode,
+        pending: &mut Vec<(usize, &'a str)>,
+    ) {
+        if pending.len() < 2 {
             for (i, _) in pending.iter() {
                 chunks.push(InlineChunk::Own(*i));
             }
+            pending.clear();
+            return;
         }
+        let start = pending[0].0;
+        let mut text = String::new();
+        let mut runs = Vec::with_capacity(pending.len());
+        for (i, piece) in pending.iter() {
+            let styles = &plan.children[*i].styles;
+            text.push_str(piece);
+            runs.push(InlineTextRun {
+                len: piece.len(),
+                color: styles.text_color.clone(),
+                font_weight: styles.font_weight.clone(),
+                inset_left: styles.padding_left.clone(),
+                inset_right: styles.padding_right.clone(),
+            });
+        }
+        let one_line = !text.contains(['\n', '\r']);
+        if one_line || !runs.iter().any(InlineTextRun::has_inset) {
+            chunks.push(InlineChunk::Fused(FusedRun { start, text, runs }));
+            pending.clear();
+            return;
+        }
+        // Split at every span that declares a padding at all (a zero one
+        // included, which the rule before insets refused too). `plain`
+        // never holds a padded span, so the recursion cannot come back here.
+        let mut plain: Vec<(usize, &'a str)> = Vec::new();
+        for &(i, piece) in pending.iter() {
+            let styles = &plan.children[i].styles;
+            if styles.padding_left.is_some() || styles.padding_right.is_some() {
+                flush(chunks, plan, &mut plain);
+                chunks.push(InlineChunk::Own(i));
+            } else {
+                plain.push((i, piece));
+            }
+        }
+        flush(chunks, plan, &mut plain);
         pending.clear();
     }
 
     for (i, child) in plan.children.iter().enumerate() {
-        match fusable_child_text(child) {
+        match fusable_child_text(plan, child) {
             Some(piece) => pending.push((i, piece)),
             None => {
                 flush(&mut chunks, plan, &mut pending);
@@ -767,17 +935,23 @@ mod tests {
                 InlineTextRun {
                     len: 3,
                     color: Some("#569cd6".into()),
-                    font_weight: None
+                    font_weight: None,
+                    inset_left: None,
+                    inset_right: None
                 },
                 InlineTextRun {
                     len: 5,
                     color: Some("#d4d4d4".into()),
-                    font_weight: None
+                    font_weight: None,
+                    inset_left: None,
+                    inset_right: None
                 },
                 InlineTextRun {
                     len: 1,
                     color: Some("#ffd700".into()),
-                    font_weight: None
+                    font_weight: None,
+                    inset_left: None,
+                    inset_right: None
                 },
             ]
         );
@@ -826,20 +1000,25 @@ mod tests {
         assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
     }
 
-    /// THE GUARD ON THE INLINE-VALUE CHIP. A span with leading padding must
-    /// NOT fuse, because a `HighlightStyle` cannot carry padding: fusing
-    /// would concatenate the two runs and silently delete the space between
-    /// them. Measured on aarch64-darwin 2026-10-21 against codetracer
-    /// 3fce565eb, an editor chip's name and value are ~8.5 pt apart and BOTH
-    /// front-ends draw that gap, so this is a real regression and not a
-    /// hypothetical one. If a later pass wants chips to fuse, the gap has to
-    /// stop being padding first -- deleting this test is not the way.
+    /// THE GUARD ON THE PADDING GAP. A span with leading padding must NOT
+    /// fuse in a context that has not promised one line (no `white-space:
+    /// nowrap` / `pre` on the container, as here). A `StyledText` highlight
+    /// cannot carry padding, and the inset element that can draws only one
+    /// line and never truncates -- so outside a one-line context there is
+    /// nothing that reproduces the gap exactly, and fusing would either
+    /// delete it (measured on aarch64-darwin 2026-10-21 against codetracer
+    /// 3fce565eb: an editor chip's name and value are ~8.5 pt apart and BOTH
+    /// front-ends draw that gap) or draw one line where the spans may wrap.
+    /// The positive half -- the same padding fusing in a nowrap context with
+    /// the gap carried as an inset -- is
+    /// `inline_chunks_fuse_a_nowrap_chips_name_and_padded_value`.
     #[test]
-    fn inline_runs_decline_a_span_with_leading_padding() {
+    fn inline_runs_decline_a_padded_span_outside_a_one_line_context() {
         let plan = highlighted_row(true, &[("name", "#9cdcfe"), ("value", "#d4d4d4")],
                                    |span| {
             span.styles.insert("padding-left".into(), "7px".into());
         });
+        assert_eq!(plan.styles.white_space, None, "the context promised nothing");
         assert_eq!(inline_text_runs(&plan), None);
     }
 
@@ -1206,15 +1385,46 @@ mod tests {
     }
 
     /// EVERY DECLINE GUARD ABOVE STILL DECLINES PER SPAN, not just per row.
-    /// A span with leading padding inside an otherwise fusable row must now
-    /// keep its own element -- the guard's point was that fusing would
-    /// delete the gap, and segmenting must not quietly reintroduce that.
+    /// In a context that has NOT promised one line, a span with leading
+    /// padding inside an otherwise fusable row keeps its own element -- the
+    /// guard's point is that nothing could reproduce the gap there, and
+    /// segmenting must not quietly reintroduce the deletion. The POSITIVE
+    /// CONTROL at the end shows the same row in a nowrap context fusing
+    /// whole with the 5 px carried as an inset, so the `own@1` is caused by
+    /// the missing one-line promise and nothing else.
     #[test]
-    fn inline_chunks_keep_a_padded_span_as_its_own_element() {
+    fn inline_chunks_keep_a_padded_span_as_its_own_element_outside_a_one_line_context() {
+        let plan = padded_row(None);
+        // "a" is a run of one, so it keeps its element too; the padded "("
+        // is its own; "bc" fuses. The 5 px is preserved either way.
+        assert_eq!(shape(&plan), vec!["own@0", "own@1", "fused@2:bc"]);
+
+        let plan = padded_row(Some("nowrap"));
+        assert_eq!(shape(&plan), vec!["fused@0:a(bc"]);
+        let Some(InlineChunk::Fused(run)) = inline_chunks(&plan).and_then(|c| c.into_iter().next())
+        else {
+            panic!("must fuse");
+        };
+        assert_eq!(run.runs[1].inset_left.as_deref(), Some("5px"));
+        assert!(run.runs[1].has_inset());
+        assert!(!run.runs[0].has_inset() && !run.runs[2].has_inset());
+    }
+
+    /// The row the padded-span tests read (`inline_chunks_keep_a_padded_span_
+    /// as_its_own_element_...`, `inline_chunks_split_a_broken_inset_run_...`):
+    /// "a", a 5 px-padded "(", "b", "c", in a flex context that declares
+    /// `white_space` when it is `Some`.
+    fn padded_row(white_space: Option<&str>) -> RenderNode {
         let mut tree = Tree::new();
         let mut host = Node::new_element("div");
+        // A flex row, as every real caller is, so the fixture stays valid
+        // under a container rule that refuses a block container.
+        host.styles.insert("display".into(), "flex".into());
         host.attributes
             .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        if let Some(ws) = white_space {
+            host.styles.insert("white-space".into(), ws.into());
+        }
         let host_id = tree.insert(host);
         for (text, pad) in [("a", false), ("(", true), ("b", false), ("c", false)] {
             let mut span = Node::new_element("span");
@@ -1227,10 +1437,240 @@ mod tests {
             tree.append_child(span_id, text_id);
             tree.append_child(host_id, span_id);
         }
-        let plan = build_render_plan(&tree, host_id).expect("plan");
-        // "a" is a run of one, so it keeps its element too; the padded "("
-        // is its own; "bc" fuses. The 5 px is preserved either way.
-        assert_eq!(shape(&plan), vec!["own@0", "own@1", "fused@2:bc"]);
+        build_render_plan(&tree, host_id).expect("plan")
+    }
+
+    // ---- HORIZONTAL INSETS (`padding-left` / `padding-right`) ---------
+    //
+    // The editor's inline-value chip, as codetracer's `leaves.nim` builds
+    // it: a box holding an optional "view more" box, the name, and the
+    // value spaced 7 px off the name by its own `padding-left`. These tests
+    // pin the rule under which that padding now fuses (the context promised
+    // one line) and every case in which it still must not.
+
+    /// A chip-shaped declared context. `white_space` / `text_overflow` are
+    /// the CONTAINER's declarations; `more` puts the "view more" box (a
+    /// sized box holding an `<img>`) before the name; `value_style` is
+    /// applied last to the value span so a test can vary its padding.
+    fn chip(
+        white_space: Option<&str>,
+        text_overflow: Option<&str>,
+        more: bool,
+        value_style: &[(&str, &str)],
+    ) -> RenderNode {
+        let mut tree = Tree::new();
+        let mut host = Node::new_element("div");
+        host.styles.insert("display".into(), "flex".into());
+        host.styles.insert("padding-left".into(), "7px".into());
+        host.styles.insert("background-color".into(), "#2a2a2a".into());
+        if let Some(ws) = white_space {
+            host.styles.insert("white-space".into(), ws.into());
+        }
+        if let Some(to) = text_overflow {
+            host.styles.insert("text-overflow".into(), to.into());
+        }
+        host.attributes
+            .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        let host_id = tree.insert(host);
+        if more {
+            let mut more_box = Node::new_element("div");
+            more_box.styles.insert("width".into(), "30px".into());
+            more_box
+                .attributes
+                .insert("data-ct-inline-more".into(), "x".into());
+            let more_id = tree.insert(more_box);
+            let mut eye = Node::new_element("img");
+            eye.attributes.insert("src".into(), "/eye.svg".into());
+            let eye_id = tree.insert(eye);
+            tree.append_child(more_id, eye_id);
+            tree.append_child(host_id, more_id);
+        }
+        let mut name = Node::new_element("div");
+        name.styles.insert("color".into(), "#9cdcfe".into());
+        name.styles.insert("flex-shrink".into(), "0".into());
+        let name_id = tree.insert(name);
+        let name_text = tree.insert(Node::new_text("x"));
+        tree.append_child(name_id, name_text);
+        tree.append_child(host_id, name_id);
+        let mut value = Node::new_element("div");
+        value.styles.insert("color".into(), "#d4d4d4".into());
+        value.styles.insert("font-weight".into(), "600".into());
+        value.styles.insert("flex-shrink".into(), "0".into());
+        for (k, v) in value_style {
+            value.styles.insert((*k).into(), (*v).into());
+        }
+        let value_id = tree.insert(value);
+        let value_text = tree.insert(Node::new_text("1"));
+        tree.append_child(value_id, value_text);
+        tree.append_child(host_id, value_id);
+        build_render_plan(&tree, host_id).expect("plan")
+    }
+
+    /// THE CHIP THIS CAPABILITY EXISTS FOR. A nowrap chip's name and its
+    /// 7 px-padded value fuse into ONE run, so the chip's text is rounded
+    /// once instead of once per span.
+    #[test]
+    fn inline_chunks_fuse_a_nowrap_chips_name_and_padded_value() {
+        let plan = chip(Some("nowrap"), None, false, &[("padding-left", "7px")]);
+        assert_eq!(shape(&plan), vec!["fused@0:x1"]);
+        let (text, runs) = inline_text_runs(&plan).expect("the chip fuses whole");
+        assert_eq!(text, "x1");
+        assert_eq!(
+            runs,
+            vec![
+                InlineTextRun {
+                    len: 1,
+                    color: Some("#9cdcfe".into()),
+                    font_weight: None,
+                    inset_left: None,
+                    inset_right: None,
+                },
+                InlineTextRun {
+                    len: 1,
+                    color: Some("#d4d4d4".into()),
+                    font_weight: Some("600".into()),
+                    // THE GAP IS KEPT: carried as the value's leading inset.
+                    inset_left: Some("7px".into()),
+                    inset_right: None,
+                },
+            ]
+        );
+        assert_eq!(runs[1].inset_left_px(), 7.0);
+        assert!(runs[1].has_inset() && !runs[0].has_inset());
+    }
+
+    /// With the "view more" box first, the box keeps its own element (it is
+    /// a sized box holding an image) and the name and value fuse after it.
+    #[test]
+    fn inline_chunks_fuse_a_chips_text_after_its_view_more_box() {
+        let plan = chip(Some("nowrap"), None, true, &[("padding-left", "7px")]);
+        assert_eq!(shape(&plan), vec!["own@0", "fused@1:x1"]);
+        let chunks = inline_chunks(&plan).expect("must chunk");
+        let InlineChunk::Fused(run) = &chunks[1] else {
+            panic!("the name and value fuse");
+        };
+        assert_eq!(run.runs[1].inset_left.as_deref(), Some("7px"));
+    }
+
+    /// A TRAILING inset rides on its run as `inset_right`.
+    #[test]
+    fn inline_chunks_carry_a_trailing_inset() {
+        let plan = chip(Some("nowrap"), None, false, &[("padding-right", "3")]);
+        let (_, runs) = inline_text_runs(&plan).expect("must fuse");
+        assert_eq!(runs[1].inset_right.as_deref(), Some("3"));
+        assert_eq!(runs[1].inset_right_px(), 3.0);
+        assert_eq!(runs[1].inset_left, None);
+    }
+
+    /// A run that would carry an inset but holds a HARD LINE BREAK is not
+    /// fused: the inset element shapes each segment as one line. Its spans
+    /// keep their own elements, as before insets existed. The control: the
+    /// same break WITHOUT padding still fuses as it always did (a
+    /// `StyledText` draws the break itself).
+    #[test]
+    fn inline_chunks_keep_an_inset_run_that_holds_a_line_break() {
+        let mut plan = chip(Some("nowrap"), None, false, &[("padding-left", "7px")]);
+        plan.children[0].children[0].text = Some("a\nb".into());
+        assert_eq!(inline_chunks(&plan), None);
+        let mut control = chip(Some("nowrap"), None, false, &[]);
+        control.children[0].children[0].text = Some("a\nb".into());
+        assert_eq!(shape(&control), vec!["fused@0:a\nb1"]);
+    }
+
+    /// A broken inset run is split back into what the rule made of it
+    /// before insets existed, not dropped whole: the padded span keeps its
+    /// own element and the plain spans after it still fuse, break and all.
+    /// The control is the same row without the break, which fuses whole
+    /// with the padding as an inset.
+    #[test]
+    fn inline_chunks_split_a_broken_inset_run_at_its_padded_spans() {
+        let plan = padded_row(Some("pre"));
+        assert_eq!(shape(&plan), vec!["fused@0:a(bc"]);
+        let mut plan = padded_row(Some("pre"));
+        plan.children[2].children[0].text = Some("b\nx".into());
+        assert_eq!(shape(&plan), vec!["own@0", "own@1", "fused@2:b\nxc"]);
+        let Some(chunks) = inline_chunks(&plan) else {
+            panic!("the plain spans still fuse");
+        };
+        let InlineChunk::Fused(run) = &chunks[2] else {
+            panic!("chunk 2 is the fused tail");
+        };
+        assert!(!run.runs.iter().any(InlineTextRun::has_inset));
+    }
+
+    /// A zero padding is carried but is no inset at all, so such a run is
+    /// drawn exactly as an unpadded one.
+    #[test]
+    fn inline_chunks_treat_a_zero_padding_as_no_inset() {
+        let plan = chip(Some("nowrap"), None, false, &[("padding-left", "0px")]);
+        let (_, runs) = inline_text_runs(&plan).expect("must fuse");
+        assert!(!runs.iter().any(InlineTextRun::has_inset));
+    }
+
+    /// `white-space: pre` promises one line as well as `nowrap` does.
+    #[test]
+    fn inline_chunks_fuse_a_padded_span_in_a_pre_context() {
+        let plan = chip(Some("pre"), None, false, &[("padding-left", "7px")]);
+        assert_eq!(shape(&plan), vec!["fused@0:x1"]);
+    }
+
+    /// The SAME chip without the one-line promise must keep the padded
+    /// value as its own element: a context that may wrap or truncate is
+    /// one the inset element cannot draw.
+    #[test]
+    fn inline_chunks_keep_a_padded_span_in_a_context_that_may_wrap() {
+        let plan = chip(None, None, false, &[("padding-left", "7px")]);
+        assert_eq!(inline_chunks(&plan), None);
+        let plan = chip(Some("normal"), None, false, &[("padding-left", "7px")]);
+        assert_eq!(inline_chunks(&plan), None);
+    }
+
+    /// A nowrap context that ALSO declares `text-overflow` may truncate,
+    /// which the inset element never does, so the padded span declines.
+    #[test]
+    fn inline_chunks_keep_a_padded_span_in_a_context_that_may_truncate() {
+        let plan = chip(Some("nowrap"), Some("ellipsis"), false, &[("padding-left", "7px")]);
+        assert_eq!(inline_chunks(&plan), None);
+    }
+
+    /// A padding that is not a non-negative px length cannot be reproduced
+    /// as an exact inset, so the span declines rather than guess.
+    #[test]
+    fn inline_chunks_keep_a_span_whose_padding_does_not_parse() {
+        for bad in ["1em", "-3px", "auto", "", "NaNpx", "infpx", "50%", "7 px"] {
+            let plan = chip(Some("nowrap"), None, false, &[("padding-left", bad)]);
+            assert_eq!(inline_chunks(&plan), None, "padding-left {bad:?}");
+            let plan = chip(Some("nowrap"), None, false, &[("padding-right", bad)]);
+            assert_eq!(inline_chunks(&plan), None, "padding-right {bad:?}");
+        }
+    }
+
+    /// Only HORIZONTAL padding is an inset: `padding-top` changes the
+    /// span's box height, which a run on one line cannot state.
+    #[test]
+    fn inline_chunks_keep_a_span_with_vertical_padding() {
+        for side in ["padding-top", "padding-bottom"] {
+            let plan = chip(Some("nowrap"), None, false, &[(side, "2px")]);
+            assert_eq!(inline_chunks(&plan), None, "{side}");
+        }
+    }
+
+    /// The `padding` SHORTHAND pads all four sides, so it still declines
+    /// even when it is a plain px length in a nowrap context.
+    #[test]
+    fn inline_chunks_keep_a_span_with_the_padding_shorthand() {
+        let plan = chip(Some("nowrap"), None, false, &[("padding", "7px")]);
+        assert_eq!(inline_chunks(&plan), None);
+    }
+
+    /// Test-by-difference still holds for everything the inset does not
+    /// carry: a margin, or the SPAN's own `white-space`, still declines.
+    #[test]
+    fn inline_chunks_keep_a_padded_span_with_any_other_style() {
+        for (k, v) in [("margin-left", "7px"), ("white-space", "nowrap"), ("background", "#333")] {
+            let plan = chip(Some("nowrap"), None, false, &[("padding-left", "7px"), (k, v)]);
+            assert_eq!(inline_chunks(&plan), None, "{k}: {v}");
+        }
     }
 
     /// THE CONTAINER-SIDE COUNTERPART OF THE PADDED-SPAN GUARD. A flex
