@@ -24,12 +24,21 @@
 //!
 //! `-[NSWindow constrainFrameRect:toScreen:]` is AppKit's documented hook
 //! for keeping a window inside the usable area of a screen. AppKit calls
-//! it for a titled window on the paths gpui uses to place this window —
-//! `initWithContentRect:styleMask:backing:defer:screen:` at creation
-//! (`gpui-pre-macos-0.3.5/src/window.rs:1067`) and `setFrameTopLeftPoint:`
-//! immediately after it (`:1299`) — and returns a rect shrunk and moved
-//! to fit the screen's visible frame. Apple documents overriding it as
-//! the supported way for a window to opt out.
+//! it for a titled window that is ON screen, and returns a rect shrunk and
+//! moved to fit the screen's visible frame. Apple documents overriding it
+//! as the supported way for a window to opt out.
+//!
+//! Where it bites on gpui's path was measured, not assumed, by
+//! `tests/test_mac_window_frame.rs` (stock `NSWindow`, this host's AppKit):
+//! `initWithContentRect:styleMask:backing:defer:screen:`
+//! (`gpui-pre-macos-0.3.5/src/window.rs:1067`) leaves the frame alone,
+//! because the window is not yet on screen; the `makeKeyAndOrderFront:` /
+//! `orderFront:` that follows it inside the same `MacWindow::open`
+//! (`:1292-1296`) is what fits the frame to the visible frame; the
+//! `setFrameTopLeftPoint:` right after it (`:1302`), which asks for the
+//! top of the full screen frame, is constrained to keep the title bar
+//! below the menu bar; and a later `setFrame:display:` on the on-screen
+//! window is constrained again.
 //!
 //! gpui does not override it. `build_window_class`
 //! (`gpui-pre-macos-0.3.5/src/window.rs:435`) adds 27 methods to
@@ -222,10 +231,10 @@ static OVERRIDE: OnceLock<ConstrainOverride> = OnceLock::new();
 ///
 /// Idempotent, and safe to call before any window exists — which is where
 /// it must be called from, because the first constraining happens inside
-/// `initWithContentRect:…`, before any pointer to the window is available
-/// to the embedder. There is therefore no narrower, per-instance place to
-/// put this: by the time an instance exists, its frame has already been
-/// clamped once.
+/// gpui's `MacWindow::open`, when it orders the new window on screen,
+/// before any pointer to the window is available to the embedder. There is
+/// therefore no narrower, per-instance place to put this: by the time an
+/// instance reaches the embedder, its frame has already been clamped once.
 ///
 /// Returns what it did; see `ConstrainOverride`.
 pub fn install_unconstrained_window_frame() -> ConstrainOverride {

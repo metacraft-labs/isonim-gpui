@@ -28,6 +28,16 @@ nim-check-renderer:
 rust-test:
     cd rust && cargo test
 
+# macOS: `GPUIWindow` keeps a frame larger than the display instead of being
+# fitted to its visible frame (`rust/gpui-nim-shim/src/mac_window_frame.rs`).
+# Needs a live GUI session with a screen: it opens real AppKit windows, and it
+# FAILS rather than skips without one, because then it cannot show the clamp
+# it guards against. `ci/run-suite.sh --with-gpui` runs it as part of
+# `cargo test --features gpui-backend`; this recipe runs it alone. Off macOS
+# the binary reports that it has nothing to test.
+rust-test-window-frame:
+    cd rust && cargo test -p gpui-nim-shim --features gpui-backend --test test_mac_window_frame
+
 # Run Nim tests (requires Rust shim to be built: just rust-build)
 test:
     nim c -r --hints:off tests/test_nimcache_is_worktree_local.nim

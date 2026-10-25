@@ -133,6 +133,17 @@ core-foundation-sys = { version = "0.8.6", optional = true }
 # `atexit`, to drop the font-smoothing key again when the process ends.
 libc = { version = "0.2", optional = true }
 
+# `src/mac_window_frame.rs`'s regression test. Its own `main` rather than
+# libtest's, because AppKit creates windows only on the main thread and
+# libtest runs every `#[test]` on a worker. Off macOS it compiles to a `main`
+# that reports it has nothing to test. `gpui-backend` because that is the
+# feature whose launch path installs the override (`gpui_app.rs`), and it is
+# the `cargo test --features gpui-backend` arm that runs it.
+[[test]]
+name = "test_mac_window_frame"
+harness = false
+required-features = ["gpui-backend"]
+
 [dev-dependencies]
 serial_test = "3"
 serde_json = "1"

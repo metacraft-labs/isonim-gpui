@@ -2038,8 +2038,9 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     // `mac_window_frame.rs` for the measurement and the scope.
     //
     // BEFORE `run`, and that is load-bearing: the first constraining
-    // happens inside `initWithContentRect:…`, so an override installed
-    // once a window exists is already too late for that window's frame.
+    // happens inside gpui's `MacWindow::open`, when it orders the new
+    // window on screen, so an override installed once a window exists is
+    // already too late for that window's frame.
     #[cfg(target_os = "macos")]
     let window_frame_override = crate::mac_window_frame::install_unconstrained_window_frame();
     #[cfg(target_os = "macos")]

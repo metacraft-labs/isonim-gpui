@@ -159,7 +159,15 @@ The task-manager demo's end-to-end tests live in `isonim-examples/tests/`
 just rust-test                                   # lib + integration tests (stub mode)
 cd rust/gpui-nim-shim && cargo test              # same, from crate dir
 cd rust/gpui-nim-shim && cargo test --features gpui-backend -- --test-threads=1
+just rust-test-window-frame                      # macOS only, needs a GUI session
 ```
+
+`just rust-test-window-frame` runs `tests/test_mac_window_frame.rs`, which
+opens real AppKit windows larger than the main screen and checks that a
+`GPUIWindow` keeps the frame it asked for once the shim's override is
+installed, while a stock `NSWindow` and a `GPUIWindow` created before the
+install are fitted to the screen. It is also part of `cargo test --features gpui-backend`, so
+that command needs a macOS GUI session too.
 
 > Note: with `--features gpui-backend`, use `--test-threads=1` to avoid mutex
 > contention on the global shadow tree.
