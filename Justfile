@@ -146,7 +146,7 @@ test-all: check-exported-symbols rust-test test test-cross test-integration test
 # §18, *pin the image, or the manifest measures whichever build ran last*.
 # PLAT-38 fixed this for `test-gui-keyboard` and recorded the same hazard
 # here; closing it is PLAT-37's, and this is it.
-test-gui *ARGS:
+test-gui *ARGS: test-virtual-pointer
     #!/usr/bin/env bash
     set -uo pipefail
     (cd rust && cargo build --features gpui-backend) || exit $?
@@ -155,6 +155,10 @@ test-gui *ARGS:
     # Restored WHATEVER the outcome, for the reason above.
     (cd rust && cargo build) || true
     exit $rc
+
+# The input device's button protocol is part of every real-window lane.
+test-virtual-pointer:
+    bash scripts/test-virtual-pointer.sh
 
 test-gui-wayland *ARGS:
     just test-gui {{ARGS}}

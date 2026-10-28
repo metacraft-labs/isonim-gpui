@@ -13,8 +13,8 @@
  * Commands, one per line on stdin:
  *
  *   abs X Y        move to output position (X, Y) — absolute, in pixels
- *   down           press the left button
- *   up             release it
+ *   down [BUTTON]  press left (default) or right
+ *   up [BUTTON]    release left (default) or right; unknown buttons fail
  *   wheel N        turn the wheel N notches (positive: down, toward the
  *                  user) — each a discrete step of 15, the value a mouse
  *                  wheel's click carries. A WHEEL, not a touchpad: GPUI
@@ -99,19 +99,28 @@ int main(int argc, char **argv) {
   wl_display_roundtrip(display);
 
   char line[256];
+  int exit_code = 0;
   while (fgets(line, sizeof line, stdin)) {
     double a = 0, b = 0;
+    char command[32] = "", button[32] = "", extra;
+    int fields = sscanf(line, "%31s %31s %c", command, button, &extra);
     if (sscanf(line, "abs %lf %lf", &a, &b) == 2) {
       zwlr_virtual_pointer_v1_motion_absolute(ptr, now_ms(), (uint32_t)a,
                                               (uint32_t)b, extent_w, extent_h);
       zwlr_virtual_pointer_v1_frame(ptr);
-    } else if (strncmp(line, "down", 4) == 0) {
-      zwlr_virtual_pointer_v1_button(ptr, now_ms(), BTN_LEFT,
-                                     WL_POINTER_BUTTON_STATE_PRESSED);
-      zwlr_virtual_pointer_v1_frame(ptr);
-    } else if (strncmp(line, "up", 2) == 0) {
-      zwlr_virtual_pointer_v1_button(ptr, now_ms(), BTN_LEFT,
-                                     WL_POINTER_BUTTON_STATE_RELEASED);
+    } else if (strcmp(command, "down") == 0 || strcmp(command, "up") == 0) {
+      // An unsupported name must not silently become a different button.
+      uint32_t code = BTN_LEFT;
+      if (fields == 2 && strcmp(button, "right") == 0) {
+        code = BTN_RIGHT;
+      } else if (fields > 2 || (fields == 2 && strcmp(button, "left") != 0)) {
+        fprintf(stderr, "virtual_pointer: unknown button '%s' (use left or right)\n", button);
+        exit_code = 2;
+        break;
+      }
+      zwlr_virtual_pointer_v1_button(ptr, now_ms(), code,
+          strcmp(command, "down") == 0 ? WL_POINTER_BUTTON_STATE_PRESSED
+                                      : WL_POINTER_BUTTON_STATE_RELEASED);
       zwlr_virtual_pointer_v1_frame(ptr);
     } else if (sscanf(line, "wheel %lf", &a) == 1) {
       int notches = (int)a;
@@ -141,5 +150,5 @@ int main(int argc, char **argv) {
   zwlr_virtual_pointer_v1_destroy(ptr);
   wl_display_roundtrip(display);
   wl_display_disconnect(display);
-  return 0;
+  return exit_code;
 }
