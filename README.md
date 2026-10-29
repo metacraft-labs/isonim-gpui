@@ -25,6 +25,13 @@ via `NimRootView`. The `gpui-backend` Cargo feature gates actual GPUI
 rendering; without it the shim provides the shadow tree API only (for testing
 and CI).
 
+To keep featureless and windowed builds side by side, use separate Cargo
+`--target-dir` directories and compile Nim with `-d:gpuiShimPath=<path>`,
+using the library's absolute path. This selects that library on Linux, macOS
+and Windows;
+an unavailable explicit path fails to load instead of falling back to the
+shared build.
+
 ## Prerequisites
 
 - [Nix](https://nixos.org/) with flakes enabled

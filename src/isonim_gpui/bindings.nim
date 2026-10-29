@@ -20,31 +20,25 @@ type
 const shimTargetDir = currentSourcePath().parentDir.parentDir.parentDir /
   "rust" / "target" / "debug"
 
+const gpuiShimPath {.strdefine.} = ""
+  ## `-d:gpuiShimPath=<file>` pins the shim this binary loads to one file
+  ## on every platform. Featureless and windowed tests can then coexist
+  ## without swapping the shared `rust/target/debug` library beneath users.
+
 when defined(macosx):
-  const localShimLib = shimTargetDir / "libgpui_nim_shim.dylib"
-  when fileExists(localShimLib):
-    const shimLib = localShimLib
-  else:
-    const shimLib = "libgpui_nim_shim.dylib"
+  const shimFileName = "libgpui_nim_shim.dylib"
 elif defined(windows):
-  const localShimLib = shimTargetDir / "gpui_nim_shim.dll"
-  when fileExists(localShimLib):
-    const shimLib = localShimLib
-  else:
-    const shimLib = "gpui_nim_shim.dll"
+  const shimFileName = "gpui_nim_shim.dll"
 else:
-  const gpuiShimPath {.strdefine.} = ""
-    ## `-d:gpuiShimPath=<file>` pins the shim this binary loads to one file,
-    ## instead of the shared `rust/target/debug` one. A window lane that needs
-    ## the WINDOWED shim builds its binary with this rather than swapping the
-    ## shared file under every other process that loads it.
-  const localShimLib = shimTargetDir / "libgpui_nim_shim.so"
-  when gpuiShimPath.len > 0:
-    const shimLib = gpuiShimPath
-  elif fileExists(localShimLib):
-    const shimLib = localShimLib
-  else:
-    const shimLib = "libgpui_nim_shim.so"
+  const shimFileName = "libgpui_nim_shim.so"
+
+const localShimLib = shimTargetDir / shimFileName
+when gpuiShimPath.len > 0:
+  const shimLib = gpuiShimPath
+elif fileExists(localShimLib):
+  const shimLib = localShimLib
+else:
+  const shimLib = shimFileName
 
 # --- The event payload (PLAT-38) ---
 
