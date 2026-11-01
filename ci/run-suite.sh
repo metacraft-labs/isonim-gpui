@@ -288,6 +288,7 @@ run_gate "gate: Rust exports == Nim bindings" ./tools/check_bindings.sh
 # with "could not import: gpui_bump_generation". Traps §18.
 run_gate "gate: Nim bindings == built shim exports" ./tools/check_exported_symbols.sh
 run_gate "gate: explicit shim path controls the loader" bash ci/test-shim-path.sh
+run_gate "gate: the shim input digest sees every input state" bash ci/test-shim-input-digest.sh
 run_gate "gate: trap-13 assertion-helper sweep" python3 tools/trap13-assertion-helper-sweep.py tests src
 
 # --- 1. The Rust shim --------------------------------------------------

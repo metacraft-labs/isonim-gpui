@@ -261,10 +261,19 @@ plat37-shims:
         nm -D --defined-only "$1" | awk '{print $NF}'
       fi
     }
+    # THE STAMP DIGEST IS TAKEN BEFORE THE FIRST BUILD, so a source edited while
+    # cargo runs reads as stale afterwards rather than being vouched for by a
+    # shim that may not contain it. A consumer that stages one of these shims
+    # recomputes the same digest and refuses a mismatch; see the header of
+    # `tools/shim_input_digest.sh`.
+    input_digest="$(bash tools/shim_input_digest.sh "$PWD")"
     for spec in "featureless:" "windowed:--features gpui-backend" "headless:--features gpui-headless"; do
       config="${spec%%:*}"
       flags="${spec#*:}"
       echo "=== ${config} ${flags:-(default)} ==="
+      # Removed first, so a build that fails leaves no stamp vouching for the
+      # previous shim against this tree.
+      rm -f "$out/${config}.build-stamp"
       # THE UPLIFTED ARTEFACT IS DELETED BEFORE EVERY BUILD, because cargo
       # decides freshness from its fingerprints and the dep-info mtimes, never
       # from the bytes of the output. `target/debug/libgpui_nim_shim.so` is a
@@ -287,6 +296,8 @@ plat37-shims:
       link_closure "${staged}" > "$out/${config}.links.txt" 2>&1 || true
       exported_gpui_symbols "${staged}" | grep '^gpui_' | sort -u \
         > "$out/${config}.symbols.txt"
+      bash tools/write_shim_stamp.sh "$out/${config}.build-stamp" "$PWD/${staged}" \
+        "${input_digest}" "${config}"
       echo "  $(wc -c <"${staged}") bytes, \
     $(wc -l <"$out/${config}.links.txt") link entries, \
     $(wc -l <"$out/${config}.symbols.txt") gpui_ symbols"
@@ -298,6 +309,17 @@ plat37-shims:
     rm -f "rust/target/debug/libgpui_nim_shim.${dylib_ext}" \
       "rust/target/debug/deps/libgpui_nim_shim.${dylib_ext}"
     (cd rust && cargo build -p gpui-nim-shim)
+    # THE STAMPS CLAIM THE DIGEST TAKEN BEFORE THE FIRST BUILD, so they are true
+    # only if the build left the inputs alone. cargo rewrites an out-of-date
+    # `Cargo.lock`, and that is an input; left alone, a consumer would refuse
+    # these shims and name this recipe as the remedy, with nothing here to say
+    # why a successful run had not cleared it.
+    if [ "$(bash tools/shim_input_digest.sh "$PWD")" != "${input_digest}" ]; then
+      rm -f "$out"/*.build-stamp
+      echo "FAIL: the shim inputs changed during this build, so no stamp was kept." >&2
+      echo "  Review the changes (git status), then run this recipe again." >&2
+      exit 1
+    fi
     # Three configurations that produced the same bytes are one build under
     # three names — the stale-artefact state above — so that is refused here
     # rather than discovered by a differential that compared a build with
@@ -305,6 +327,7 @@ plat37-shims:
     sums="$(for c in featureless windowed headless; do
       cksum <"$out/libgpui_nim_shim.${c}.${dylib_ext}"; done | sort -u | wc -l)"
     if [ "${sums}" -ne 3 ]; then
+      rm -f "$out"/*.build-stamp
       echo "FAIL: the three staged shims are not three distinct builds" >&2
       exit 1
     fi
