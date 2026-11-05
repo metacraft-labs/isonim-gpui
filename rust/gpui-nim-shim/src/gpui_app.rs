@@ -481,6 +481,7 @@ impl Render for NimRootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Check and clear the repaint flag (so we know the frame is current).
         let _ = window::take_repaint_request();
+        drop_evicted_images(window);
 
         // Start a background polling timer that checks REPAINT_REQUESTED
         // and calls cx.notify() to trigger re-renders. We only start this
@@ -637,6 +638,53 @@ fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
                 )),
             );
         })
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+thread_local! {
+    /// The `RenderImage`s the `img` elements' pixels were decoded into, by
+    /// setting (`NodeImage::generation`), newest last; and the ones evicted,
+    /// waiting for a window to release their atlas tiles (`drop_evicted_images`).
+    static IMAGE_CACHE: std::cell::RefCell<Vec<(u64, std::sync::Arc<gpui::RenderImage>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static EVICTED_IMAGES: std::cell::RefCell<Vec<std::sync::Arc<gpui::RenderImage>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many decoded images are kept: the frames a scrub moves between.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const IMAGE_CACHE_SIZE: usize = 8;
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn cached_render_image(image: &crate::tree::NodeImage) -> std::sync::Arc<gpui::RenderImage> {
+    IMAGE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(i) = cache.iter().position(|(g, _)| *g == image.generation) {
+            let entry = cache.remove(i);
+            let render = entry.1.clone();
+            cache.push(entry);
+            return render;
+        }
+        let buffer = image::RgbaImage::from_raw(image.width, image.height, (*image.bgra).clone())
+            .unwrap_or_else(|| image::RgbaImage::new(image.width.max(1), image.height.max(1)));
+        let render = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buffer)]));
+        cache.push((image.generation, render.clone()));
+        while cache.len() > IMAGE_CACHE_SIZE {
+            let (_, old) = cache.remove(0);
+            EVICTED_IMAGES.with(|e| e.borrow_mut().push(old));
+        }
+        render
+    })
+}
+
+/// Release the atlas tiles of the images the cache let go of. Called by the
+/// root views' render, which hold the window.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn drop_evicted_images(window: &mut Window) {
+    let evicted: Vec<_> = EVICTED_IMAGES.with(|e| std::mem::take(&mut *e.borrow_mut()));
+    for old in evicted {
+        let _ = window.drop_image(old);
+    }
 }
 
 /// Build the ROOT of the render plan, with the keyboard attached.
@@ -819,6 +867,21 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
                 }
             }
             el.into_any_element()
+        }
+        GpuiElementKind::Img if plan.image.is_some() => {
+            // THE PIXELS THE APPLICATION SET (`gpui_set_image_rgba`), drawn
+            // stretched to the element's box. The decoded image is cached by
+            // the setting's generation: GPUI uploads an image once per
+            // `RenderImage` id, so a new one per frame would upload (and keep)
+            // the same pixels again on every repaint.
+            let image = plan.image.as_ref().unwrap();
+            let render = cached_render_image(image);
+            let mut el = div();
+            el = apply_styles_to_div(el, &plan.styles);
+            el.child(
+                gpui::StyledImage::object_fit(img(render).size_full(), gpui::ObjectFit::Fill),
+            )
+            .into_any_element()
         }
         GpuiElementKind::Img => {
             // Placeholder: render a colored rect with alt text label.

@@ -39,6 +39,9 @@ gpui-backend = [
     "dep:core-foundation",
     "dep:core-foundation-sys",
     "dep:libc",
+    # The `img` element's pixels (`gpui_set_image_rgba`) become a
+    # `RenderImage`, which holds `image::Frame`s.
+    "image",
 ]
 # RS-M14 Phase 2: enable the headless RGBA rendering path via Zed's
 # `HeadlessAppContext::with_platform` + `Window::render_to_image`. Coexists

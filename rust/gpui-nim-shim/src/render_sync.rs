@@ -308,6 +308,10 @@ pub struct RenderNode {
     pub attributes: BTreeMap<String, String>,
     /// Children render nodes (recursive).
     pub children: Vec<RenderNode>,
+    /// The pixels of an `img` element (`gpui_set_image_rgba`), shared with
+    /// the shadow node; `None` for every other element and for an image
+    /// nobody set.
+    pub image: Option<crate::tree::NodeImage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -833,6 +837,7 @@ pub fn build_render_plan(tree: &Tree, root_id: NodeId) -> Option<RenderNode> {
         .collect();
 
     Some(RenderNode {
+        image: node.image.clone(),
         node_id: root_id.0,
         kind,
         tag,
@@ -2167,6 +2172,7 @@ mod tests {
     #[test]
     fn test_count_render_nodes() {
         let plan = RenderNode {
+            image: None,
             node_id: 1,
             kind: GpuiElementKind::Div,
             tag: "div".into(),
@@ -2178,6 +2184,7 @@ mod tests {
                 attributes: BTreeMap::new(),
             children: vec![
                 RenderNode {
+            image: None,
                     node_id: 2,
                     kind: GpuiElementKind::TextContainer,
                     tag: "span".into(),
@@ -2190,6 +2197,7 @@ mod tests {
                     children: vec![],
                 },
                 RenderNode {
+            image: None,
                     node_id: 3,
                     kind: GpuiElementKind::Div,
                     tag: "div".into(),
@@ -2200,6 +2208,7 @@ mod tests {
                     event_names: vec![],
                 attributes: BTreeMap::new(),
                     children: vec![RenderNode {
+            image: None,
                         node_id: 4,
                         kind: GpuiElementKind::TextNode,
                         tag: "#text".into(),

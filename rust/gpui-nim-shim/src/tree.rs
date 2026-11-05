@@ -80,6 +80,18 @@ pub fn tag_to_gpui_kind(tag: &str) -> GpuiElementKind {
     }
 }
 
+/// Pixels an `img` element shows (`gpui_set_image_rgba`): BGRA8888 — the
+/// order GPUI's `RenderImage` keeps — `width * height * 4` bytes, shared so a
+/// render plan carries them without a copy. `generation` names one setting,
+/// so a renderer that caches the decoded image knows when it changed.
+#[derive(Debug, Clone)]
+pub struct NodeImage {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: std::sync::Arc<Vec<u8>>,
+    pub generation: u64,
+}
+
 /// A single node in the shadow tree.
 #[derive(Debug)]
 pub struct Node {
@@ -150,6 +162,10 @@ pub struct Node {
     /// between *"a key that reaches nothing"* and *"a key that reaches
     /// everything"*.
     pub delivery_count: u64,
+
+    /// The pixels an `img` element shows, when the application set any
+    /// (`gpui_set_image_rgba`); `None` draws the element's placeholder.
+    pub image: Option<NodeImage>,
 }
 
 /// One event, as the element store recorded it arriving.
@@ -214,6 +230,7 @@ impl Node {
             focus_trap: false,
             last_event: None,
             delivery_count: 0,
+            image: None,
         }
     }
 
@@ -233,6 +250,7 @@ impl Node {
             focus_trap: false,
             last_event: None,
             delivery_count: 0,
+            image: None,
         }
     }
 

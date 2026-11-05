@@ -492,6 +492,17 @@ proc removeAttribute*(r: GpuiRenderer; node: GpuiElement; name: string) =
 proc setTextContent*(r: GpuiRenderer; node: GpuiElement; text: string) =
   gpui_set_text_content(node, text.cstring)
 
+proc setImageRgba*(r: GpuiRenderer; node: GpuiElement; pixels: string;
+                   width, height: int): bool =
+  ## Draw `pixels` — `width * height` RGBA8888 pixels — in `node`, an `img`
+  ## element, stretched to its box. False (and the placeholder) when the
+  ## bytes are not `width * height * 4` long.
+  if width <= 0 or height <= 0 or pixels.len != width * height * 4:
+    discard gpui_set_image_rgba(node, nil, 0, 0, 0)
+    return false
+  gpui_set_image_rgba(node, unsafeAddr pixels[0], csize_t(pixels.len),
+                      uint32(width), uint32(height)) == 1
+
 proc setStyle*(r: GpuiRenderer; node: GpuiElement; prop, value: string) =
   let gpuiProp = mapStyleProperty(prop)
   let gpuiValue = mapStyleValue(prop, value)

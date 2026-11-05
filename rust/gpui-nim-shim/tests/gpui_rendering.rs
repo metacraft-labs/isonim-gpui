@@ -191,6 +191,7 @@ fn test_render_plan_to_gpui_text_node() {
 
         let _window = cx.add_window(|_window, _cx| {
             let plan = RenderNode {
+            image: None,
                 node_id: 999,
                 kind: GpuiElementKind::TextNode,
                 tag: "#text".to_string(),
@@ -221,6 +222,7 @@ fn test_render_plan_to_gpui_styled_div() {
 
         let _window = cx.add_window(|_window, _cx| {
             let plan = RenderNode {
+            image: None,
                 node_id: 100,
                 kind: GpuiElementKind::Div,
                 tag: "div".to_string(),
@@ -239,6 +241,7 @@ fn test_render_plan_to_gpui_styled_div() {
                 event_names: vec![],
                 attributes: Default::default(),
                 children: vec![RenderNode {
+            image: None,
                     node_id: 101,
                     kind: GpuiElementKind::TextNode,
                     tag: "#text".to_string(),
@@ -270,6 +273,7 @@ fn test_render_plan_to_gpui_img_placeholder() {
 
         let _window = cx.add_window(|_window, _cx| {
             let plan = RenderNode {
+            image: None,
                 node_id: 200,
                 kind: GpuiElementKind::Img,
                 tag: "img".to_string(),
@@ -300,6 +304,7 @@ fn test_render_plan_to_gpui_svg_placeholder() {
 
         let _window = cx.add_window(|_window, _cx| {
             let plan = RenderNode {
+            image: None,
                 node_id: 300,
                 kind: GpuiElementKind::Svg,
                 tag: "svg".to_string(),
@@ -330,6 +335,7 @@ fn test_render_plan_to_gpui_text_container() {
 
         let _window = cx.add_window(|_window, _cx| {
             let plan = RenderNode {
+            image: None,
                 node_id: 400,
                 kind: GpuiElementKind::TextContainer,
                 tag: "span".to_string(),

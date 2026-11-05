@@ -145,6 +145,14 @@ proc gpui_remove_attribute*(node: GpuiElement; name: cstring)
 proc gpui_set_text_content*(node: GpuiElement; text: cstring)
   {.importc: "gpui_set_text_content".}
 
+proc gpui_set_image_rgba*(node: GpuiElement; data: pointer; len: csize_t;
+                          width, height: uint32): cint
+  {.importc: "gpui_set_image_rgba".}
+  ## The pixels an `img` element shows: `width * height` RGBA8888 pixels,
+  ## `len` bytes, copied; stretched to the element's box. Answers 1 when
+  ## they were set, 0 when they were refused (the element then draws its
+  ## placeholder).
+
 proc gpui_set_style*(node: GpuiElement; prop, value: cstring)
   {.importc: "gpui_set_style".}
 

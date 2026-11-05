@@ -315,6 +315,72 @@ pub extern "C" fn gpui_remove_attribute(node: *mut GpuiElement, name: *const c_c
 }
 
 // ---------------------------------------------------------------------------
+// 7b. setImageRgba — the pixels an `img` element shows
+// ---------------------------------------------------------------------------
+
+static IMAGE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The attribute an `img` element with pixels carries: `<width>x<height>`, so
+/// a reader of the render plan sees which elements draw a picture and at
+/// what size.
+pub const IMAGE_SIZE_ATTRIBUTE: &str = "data-gpui-image";
+
+/// Give `node` (an `img` element) the `width` x `height` RGBA8888 pixels at
+/// `data` (`len` bytes, `width * height * 4`) to draw, stretched to the
+/// element's box. The bytes are copied. A null `data`, an empty extent or a
+/// length that does not match clears the picture (the element then draws its
+/// placeholder) and answers 0; a picture set answers 1.
+#[no_mangle]
+pub extern "C" fn gpui_set_image_rgba(
+    node: *mut GpuiElement,
+    data: *const u8,
+    len: usize,
+    width: u32,
+    height: u32,
+) -> i32 {
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return 0;
+    }
+    let expected = (width as usize) * (height as usize) * 4;
+    let image = if data.is_null() || width == 0 || height == 0 || len != expected {
+        None
+    } else {
+        let src = unsafe { std::slice::from_raw_parts(data, len) };
+        let mut bgra = Vec::with_capacity(len);
+        for px in src.chunks_exact(4) {
+            bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        }
+        Some(crate::tree::NodeImage {
+            width,
+            height,
+            bgra: std::sync::Arc::new(bgra),
+            generation: IMAGE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        })
+    };
+    let set = image.is_some();
+    let mut tree = lock_tree();
+    if let Some(n) = tree.get_mut(node_id) {
+        match &image {
+            Some(im) => {
+                n.attributes.insert(
+                    IMAGE_SIZE_ATTRIBUTE.to_string(),
+                    format!("{}x{}", im.width, im.height),
+                );
+            }
+            None => {
+                n.attributes.remove(IMAGE_SIZE_ATTRIBUTE);
+            }
+        }
+        n.image = image;
+        window::request_repaint();
+        if set { 1 } else { 0 }
+    } else {
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 8. setTextContent
 // ---------------------------------------------------------------------------
 
