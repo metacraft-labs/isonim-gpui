@@ -1568,13 +1568,13 @@ fn wire_pointer_listeners(mut el: Div, plan: &crate::render_sync::RenderNode) ->
     let node_id = crate::tree::NodeId(plan.node_id);
     if has("mousedown") {
         el = el.on_mouse_down(MouseButton::Left, move |event, _window, _cx| {
-            crate::input::deliver_pointer(
+            crate::input::deliver_press(
                 node_id,
                 "mousedown",
                 crate::input::GPUI_EVENT_POINTER_DOWN,
                 f32::from(event.position.x),
                 f32::from(event.position.y),
-                None,
+                event.click_count,
                 crate::input::modifier_bits(&event.modifiers),
             );
         });
@@ -1594,13 +1594,13 @@ fn wire_pointer_listeners(mut el: Div, plan: &crate::render_sync::RenderNode) ->
     }
     if has("auxdown") {
         el = el.on_mouse_down(MouseButton::Middle, move |event, _window, _cx| {
-            crate::input::deliver_pointer(
+            crate::input::deliver_press(
                 node_id,
                 "auxdown",
                 crate::input::GPUI_EVENT_POINTER_AUX,
                 f32::from(event.position.x),
                 f32::from(event.position.y),
-                None,
+                event.click_count,
                 crate::input::modifier_bits(&event.modifiers),
             );
         });

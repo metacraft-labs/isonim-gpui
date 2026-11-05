@@ -69,7 +69,7 @@ pub const GPUI_EVENT_OTHER: u32 = 0;
 pub const GPUI_EVENT_KEY_DOWN: u32 = 1;
 /// A key coming up.
 pub const GPUI_EVENT_KEY_UP: u32 = 2;
-/// The left button went down; `key` is `"x,y"`, the window position.
+/// The left button went down; `key` is `"x,y,count"`, the window position.
 pub const GPUI_EVENT_POINTER_DOWN: u32 = 3;
 /// The pointer moved; `key` is `"x,y"`.
 pub const GPUI_EVENT_POINTER_MOVE: u32 = 4;
@@ -82,7 +82,7 @@ pub const GPUI_EVENT_POINTER_WHEEL: u32 = 6;
 /// drag (`mousedown`) never receives a right-click as one.
 pub const GPUI_EVENT_POINTER_CONTEXT: u32 = 7;
 /// The MIDDLE button went down (a node listening for `auxdown`); `key` is
-/// `"x,y"`.
+/// `"x,y,count"`.
 pub const GPUI_EVENT_POINTER_AUX: u32 = 8;
 /// The held modifiers changed — a modifier key went down or up ON ITS OWN,
 /// which no keydown reports (`gpui::ModifiersChangedEvent`); `key` is empty
@@ -317,6 +317,27 @@ pub fn deliver_pointer(
     let reached = deliver(node_id, event, Some((kind, key.clone(), modifiers, false)));
     // `ISONIM_GPUI_TRACE_POINTER=1`: one line per pointer event and how many
     // listeners it reached — for diagnosing a window lane's pointer path.
+    if std::env::var_os("ISONIM_GPUI_TRACE_POINTER").is_some() {
+        eprintln!("pointer {} {} node {} reached {}", event, key, node_id.0, reached);
+    }
+    reached
+}
+
+/// A button press, carrying the platform's click count as a third key field
+/// (`x,y,count`): `MouseDownEvent.click_count`, which follows the OS's interval
+/// and distance. An application's own count needs it as an upper bound.
+pub fn deliver_press(
+    node_id: NodeId,
+    event: &str,
+    kind: u32,
+    x: f32,
+    y: f32,
+    click_count: usize,
+    modifiers: u32,
+) -> u32 {
+    let (ox, oy) = crate::window::content_origin();
+    let key = format!("{:.1},{:.1},{}", x - ox, y - oy, click_count);
+    let reached = deliver(node_id, event, Some((kind, key.clone(), modifiers, false)));
     if std::env::var_os("ISONIM_GPUI_TRACE_POINTER").is_some() {
         eprintln!("pointer {} {} node {} reached {}", event, key, node_id.0, reached);
     }

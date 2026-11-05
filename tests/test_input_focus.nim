@@ -106,7 +106,7 @@ suite "PLAT-38 — the payload ABI":
                  ("wheel", GpuiEventPointerWheel, "15.0,43.0,0.0,-48.0"),
                  # The right and middle buttons, each a kind of its own.
                  ("contextmenu", GpuiEventPointerContext, "16.0,44.0"),
-                 ("auxdown", GpuiEventPointerAux, "17.0,45.0")]
+                 ("auxdown", GpuiEventPointerAux, "17.0,45.0,2")]
     for (name, kind, key) in cases:
       var payload = GpuiEventPayload(kind: kind, modifiers: 0,
                                      key: key.cstring, repeat: 0)
@@ -114,7 +114,7 @@ suite "PLAT-38 — the payload ABI":
     ck kinds == @[gekPointerDown, gekPointerMove, gekPointerUp, gekWheel,
                   gekContextMenu, gekAuxDown]
     ck seen[4].valid and seen[4].x == 16.0 and seen[4].y == 44.0
-    ck seen[5].valid and seen[5].x == 17.0
+    ck seen[5].valid and seen[5].x == 17.0 and seen[5].clickCount == 2
     ck seen[0].valid and seen[0].x == 12.5 and seen[0].y == 40.0
     ck seen[3].valid and seen[3].dy == -48.0 and seen[3].x == 15.0
     # Not a pointer event, or a key that is not a position: not valid.

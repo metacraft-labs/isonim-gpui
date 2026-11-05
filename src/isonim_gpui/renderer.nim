@@ -388,19 +388,24 @@ type
     valid*: bool
     x*, y*: float
     dx*, dy*: float
+    clickCount*: int
+      ## A left or middle press: the platform's click count, 0 when absent.
 
 func pointerOf*(ev: GpuiEvent): GpuiPointer =
   ## Decode the position the shim spelled into a pointer event's key
-  ## (`input.rs`, `deliver_pointer`): `"x,y"`, or `"x,y,dx,dy"` for a wheel.
+  ## (`input.rs`, `deliver_pointer`): `"x,y"`, `"x,y,count"` for a left or middle
+  ## press (the platform's click count), or `"x,y,dx,dy"` for a wheel.
   if ev.kind notin {gekPointerDown, gekPointerMove, gekPointerUp, gekWheel,
                     gekContextMenu, gekAuxDown}:
     return GpuiPointer()
   let parts = ev.key.split(',')
-  if parts.len != 2 and parts.len != 4:
+  if parts.len notin {2, 3, 4}:
     return GpuiPointer()
   try:
     result = GpuiPointer(valid: true, x: parseFloat(parts[0]),
                          y: parseFloat(parts[1]))
+    if parts.len == 3:
+      result.clickCount = parseInt(parts[2])
     if parts.len == 4:
       result.dx = parseFloat(parts[2])
       result.dy = parseFloat(parts[3])
