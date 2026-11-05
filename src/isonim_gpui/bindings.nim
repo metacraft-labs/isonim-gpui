@@ -576,6 +576,16 @@ proc gpui_reset_windows*()
 # Render plan inspection
 # ===========================================================================
 
+proc gpui_set_window_cursor*(name: cstring)
+  {.importc: "gpui_set_window_cursor".}
+  ## The cursor that wins over every element's own: a CSS name, or `""` to
+  ## clear it.
+
+proc gpui_window_cursor*(): pointer
+  {.importc: "gpui_window_cursor".}
+  ## The window-level cursor now set, `""` for none. Free with
+  ## `gpui_free_string`.
+
 proc gpui_render_plan_json*(root: GpuiElement): pointer
   {.importc: "gpui_render_plan_json".}
 

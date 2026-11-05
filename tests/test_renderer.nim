@@ -10,6 +10,8 @@
 ## To verify compilation only (no Rust shim needed):
 ##   nim check --nimcache:nimcache/test_renderer tests/test_renderer.nim
 
+import std/strutils
+
 import isonim_gpui/renderer
 import isonim_gpui/bindings
 import isonim_gpui/window
@@ -365,6 +367,30 @@ block styleApplication:
   r.setStyle(el, "border-radius", "4px")
   r.setStyle(el, "cursor", "pointer")
 
+
+  # Every cursor name reaches the plan; one outside the set is reported there.
+  block:
+    let root = r.createElement("div")
+    for name in ["default", "pointer", "text", "col-resize", "row-resize",
+                 "grab", "grabbing", "not-allowed"]:
+      let child = r.createElement("div")
+      r.setStyle(child, "cursor", name)
+      r.appendChild(root, child)
+    let plan = r.renderPlanJson(root)
+    for name in ["grabbing", "not-allowed", "col-resize"]:
+      assert ("\"cursor\":\"" & name & "\"") in plan, name
+    assert "cursor_unknown" notin plan
+    let odd = r.createElement("div")
+    r.setStyle(odd, "cursor", "hand")
+    r.appendChild(root, odd)
+    assert "\"cursor_unknown\":\"hand\"" in r.renderPlanJson(root)
+
+  # The window-level cursor: set for a gesture, cleared at its end.
+  assert r.windowCursor() == ""
+  r.setWindowCursor("grabbing")
+  assert r.windowCursor() == "grabbing"
+  r.setWindowCursor("")
+  assert r.windowCursor() == ""
   # If we got here without crashing, style mapping works
   gpui_reset_tree()
   echo "test_renderer: style application passed"

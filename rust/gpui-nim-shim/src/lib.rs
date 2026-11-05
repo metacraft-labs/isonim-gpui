@@ -1446,6 +1446,44 @@ pub extern "C" fn gpui_render_plan_json(root: *mut GpuiElement) -> *mut c_char {
     }
 }
 
+static WINDOW_CURSOR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The cursor that wins over every element's own while it is set; `None`
+/// when no gesture holds one.
+pub(crate) fn window_cursor() -> Option<String> {
+    WINDOW_CURSOR
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Set the window-level cursor (a CSS name), or clear it with null or `""`.
+/// Set while a gesture is in flight; cleared on its release and on its cancel.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_cursor(name: *const c_char) {
+    let wanted = if name.is_null() {
+        None
+    } else {
+        let text = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+        (!text.is_empty()).then(|| text.into_owned())
+    };
+    let mut slot = WINDOW_CURSOR.lock().unwrap_or_else(|p| p.into_inner());
+    if *slot != wanted {
+        *slot = wanted;
+        drop(slot);
+        window::REPAINT_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The window-level cursor now set, `""` for none. Free with
+/// `gpui_free_string`.
+#[no_mangle]
+pub extern "C" fn gpui_window_cursor() -> *mut c_char {
+    std::ffi::CString::new(window_cursor().unwrap_or_default())
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 /// Free a string returned by `gpui_render_plan_json`.
 #[no_mangle]
 pub extern "C" fn gpui_free_string(ptr: *mut c_char) {
@@ -1576,6 +1614,11 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(text_decoration, "text_decoration");
         push_style!(line_height, "line_height");
         push_style!(cursor, "cursor");
+        if let Some(ref name) = s.cursor {
+            if !render_sync::is_known_cursor(name) {
+                style_entries.push(format!("\"cursor_unknown\":\"{}\"", json_escape(name)));
+            }
+        }
         push_style!(display, "display");
         push_style!(position, "position");
         push_style!(white_space, "white_space");

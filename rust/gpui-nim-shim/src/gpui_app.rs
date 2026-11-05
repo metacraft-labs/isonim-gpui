@@ -19,8 +19,8 @@ use crate::window;
 // recursion in the compiler.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 use gpui::{
-    div, img, px, rgb, rgba, size, AbsoluteLength, AnyElement, App, AppContext as _, Application,
-    AsyncApp, Bounds, Context, Decorations, Div, FontWeight, HighlightStyle, Hsla,
+    canvas, div, img, px, rgb, rgba, size, AbsoluteLength, AnyElement, App, AppContext as _, Application,
+    AsyncApp, Bounds, Context, CursorStyle, Decorations, Div, FontWeight, HighlightStyle, Hsla,
     InteractiveElement, IntoElement, MouseButton, ParentElement, QuitMode, Render, Rgba, Styled,
     StyledText, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowDecorations,
     WindowOptions,
@@ -551,6 +551,7 @@ impl Render for NimRootView {
         match crate::render_sync::build_render_plan(&tree, root_id) {
             Some(plan) => {
                 drop(tree); // release lock before building GPUI elements
+                let cursor_override = window_cursor_override().into_any_element();
                 let element = if self.frame.is_framed() || self.title_bar > 0.0 {
                     let title_bar = (self.title_bar > 0.0).then(|| {
                         let win_id = active_window_id();
@@ -580,7 +581,11 @@ impl Render for NimRootView {
                 // PLAT-42: the render-path half of the frame budget. GPUI's
                 // layout and paint follow and are not in this number.
                 crate::frame_stats::complete_frame(started.elapsed().as_nanos() as u64);
-                element
+                div()
+                    .size_full()
+                    .child(element)
+                    .child(cursor_override)
+                    .into_any_element()
             }
             None => with_keyboard(div().size_full().child("Empty shadow tree"), &handle)
                 .into_any_element(),
@@ -766,7 +771,7 @@ pub fn frame_client_window(
     handle: &gpui::FocusHandle,
 ) -> AnyElement {
     use crate::frame::{Edge, FRAME_BORDER};
-    use gpui::{BoxShadow, CursorStyle, ResizeEdge};
+    use gpui::{BoxShadow, ResizeEdge};
     let (cw, ch) = frame.content_size();
     let side = |band: f32| if band > 0.0 { band - FRAME_BORDER } else { 0.0 };
     let border = |band: f32| if band > 0.0 { FRAME_BORDER } else { 0.0 };
@@ -835,6 +840,37 @@ pub fn frame_client_window(
 
 /// Recursively convert a RenderNode to GPUI AnyElement.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+/// The GPUI cursor a CSS name means.
+fn cursor_style_of(name: &str) -> Option<CursorStyle> {
+    Some(match name {
+        "default" => CursorStyle::Arrow,
+        "pointer" => CursorStyle::PointingHand,
+        "text" => CursorStyle::IBeam,
+        "col-resize" => CursorStyle::ResizeColumn,
+        "row-resize" => CursorStyle::ResizeRow,
+        "grab" => CursorStyle::OpenHand,
+        "grabbing" => CursorStyle::ClosedHand,
+        "not-allowed" => CursorStyle::OperationNotAllowed,
+        _ => return None,
+    })
+}
+
+/// Paints nothing and, while the application has set a window-level cursor
+/// (`gpui_set_window_cursor`), makes it win over every element's own: a drag's
+/// shape holds wherever the pointer goes.
+fn window_cursor_override() -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        |_, _, window, _| {
+            if let Some(style) = crate::window_cursor().as_deref().and_then(cursor_style_of) {
+                window.set_window_cursor_style(style);
+            }
+        },
+    )
+    .absolute()
+    .size_0()
+}
+
 pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement {
     use crate::tree::GpuiElementKind;
 
@@ -1751,11 +1787,10 @@ pub fn apply_styles_to_div(
         }
     }
 
-    // Cursor
-    if let Some(ref cursor) = styles.cursor {
-        if cursor == "pointer" {
-            el = el.cursor_pointer();
-        }
+    // Cursor: the eight CSS names. An unknown one is the render plan's to
+    // report (`render_sync::is_known_cursor`), so it changes nothing here.
+    if let Some(style) = styles.cursor.as_deref().and_then(cursor_style_of) {
+        el = el.cursor(style);
     }
 
     // THE STYLES BELOW WERE PARSED INTO THE PLAN AND NEVER DRAWN until

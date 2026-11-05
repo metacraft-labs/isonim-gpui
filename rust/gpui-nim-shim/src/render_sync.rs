@@ -901,6 +901,21 @@ pub mod gpui_render {
 // Tests (no GPUI dependency required)
 // ---------------------------------------------------------------------------
 
+/// Whether a `cursor` style is one of the eight names the window can show.
+pub fn is_known_cursor(name: &str) -> bool {
+    matches!(
+        name,
+        "default"
+            | "pointer"
+            | "text"
+            | "col-resize"
+            | "row-resize"
+            | "grab"
+            | "grabbing"
+            | "not-allowed"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

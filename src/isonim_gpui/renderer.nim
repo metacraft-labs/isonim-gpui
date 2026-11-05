@@ -741,6 +741,19 @@ proc getTag*(node: GpuiElement): string =
 # Render plan inspection (G3-G — integration testing)
 # ===========================================================================
 
+proc setWindowCursor*(r: GpuiRenderer; name: string) =
+  ## A window-level cursor for a gesture in flight: it wins over every
+  ## element's `cursor` until cleared with `""`.
+  gpui_set_window_cursor(name.cstring)
+
+proc windowCursor*(r: GpuiRenderer): string =
+  ## The window-level cursor now set, `""` for none.
+  let raw = gpui_window_cursor()
+  if raw == nil:
+    return ""
+  result = $cast[cstring](raw)
+  gpui_free_string(raw)
+
 proc renderPlanJson*(r: GpuiRenderer; root: GpuiElement): string =
   ## Build a render plan from the shadow tree rooted at `root` and return
   ## it as a JSON string. Returns "" if the node is nil or missing.
