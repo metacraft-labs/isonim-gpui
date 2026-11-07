@@ -198,6 +198,14 @@ static:
   assert compiles(gpui_key_latency_ns(0.uint64))
   assert compiles(gpui_frame_stats_reset())
 
+  # --- Laid-out bounds, image pixels and the window-level cursor ---
+  var xywh: array[4, float64]
+  assert compiles(gpui_layout_bounds(nil, addr xywh))
+  assert compiles(gpui_layout_bounds_reset())
+  assert compiles(gpui_set_image_rgba(nil, nil, 0.csize_t, 0'u32, 0'u32))
+  assert compiles(gpui_set_window_cursor(cstring""))
+  assert compiles(gpui_window_cursor())
+
   # --- Element event dispatcher (the element-callback registry) ---
   var disp: proc(callbackId: int32; payload: ptr GpuiEventPayload) {.cdecl.}
   assert compiles(gpui_set_event_dispatcher(disp))

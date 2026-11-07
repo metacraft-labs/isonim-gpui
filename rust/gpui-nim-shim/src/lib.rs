@@ -53,6 +53,10 @@ pub mod input;
 pub mod clipboard;
 // PLAT-42: frame timing. Feature-less for `input`'s reason.
 pub mod frame_stats;
+// CTF-P1b (CodeTracer): where the window laid an opted-in element out, read
+// back for a host comparing its layout with another renderer's. Feature-less
+// for `input`'s reason.
+pub mod layout_bounds;
 pub mod render_sync;
 #[allow(dead_code)]
 pub mod tree;
@@ -1605,6 +1609,7 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(justify, "justify");
         push_style!(border_width, "border_width");
         push_style!(border_color, "border_color");
+        push_style!(border_style, "border_style");
         push_style!(shadow, "shadow");
         push_style!(opacity, "opacity");
         push_style!(overflow, "overflow");
@@ -1626,6 +1631,7 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(flex_shrink, "flex_shrink");
         // 2026-09-29: the styles the window now draws, so the plan says so.
         push_style!(flex_grow, "flex_grow");
+        push_style!(flex_basis, "flex_basis");
         push_style!(border_top_width, "border_top_width");
         push_style!(border_right_width, "border_right_width");
         push_style!(border_bottom_width, "border_bottom_width");

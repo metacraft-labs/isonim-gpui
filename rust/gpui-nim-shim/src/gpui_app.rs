@@ -1039,6 +1039,8 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
         }
     }
 
+    el = with_layout_probe(el, plan);
+
     // Wire click events
     if plan.has_click_handler {
         let node_id = crate::tree::NodeId(plan.node_id);
@@ -1049,6 +1051,41 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
 
     el = wire_pointer_listeners(el, plan);
     wire_window_region(el, plan)
+}
+
+/// An element that declares `data-layout-probe` gets one more child: an
+/// absolutely positioned, full-size `canvas` that paints nothing and, during
+/// prepaint, records its bounds -- the element's padding box, in window
+/// coordinates -- into `layout_bounds` (read back by `gpui_layout_bounds`;
+/// that module says why and what exactly is measured). An absolute child is
+/// outside its parent's flex layout, so the probe does not move what it
+/// measures. Every other element is returned unchanged.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn with_layout_probe(el: Div, plan: &crate::render_sync::RenderNode) -> Div {
+    if !crate::layout_bounds::wants_probe(&plan.attributes) {
+        return el;
+    }
+    let node_id = plan.node_id;
+    el.child(
+        canvas(
+            move |bounds, _window, _cx| {
+                crate::layout_bounds::record(
+                    node_id,
+                    crate::layout_bounds::LaidOut {
+                        x: f32::from(bounds.origin.x),
+                        y: f32::from(bounds.origin.y),
+                        w: f32::from(bounds.size.width),
+                        h: f32::from(bounds.size.height),
+                    },
+                );
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    )
 }
 
 /// The single text element one FUSED RUN of a declared inline formatting
@@ -1854,6 +1891,13 @@ pub fn apply_styles_to_div(
         }
     }
 
+    // `flex-basis: Npx`: the item's starting size on its line's main axis.
+    if let Some(v) = styles.flex_basis.as_deref().and_then(parse_px) {
+        if v >= 0.0 {
+            el = el.flex_basis(px(v));
+        }
+    }
+
     // min-width, as a pixel value — what lets a flex child shrink below its
     // content (`min-width: 0`) so an ellipsis can apply.
     if let Some(ref mw) = styles.min_w {
@@ -1905,6 +1949,12 @@ pub fn apply_styles_to_div(
     }
     if let Some(color) = styles.border_color.as_deref().and_then(parse_color) {
         el = el.border_color(color);
+    }
+    // `border-style: dashed` (a notice outlined rather than filled); any
+    // other value keeps GPUI's solid border, as a browser does for the
+    // styles it is not asked to vary here.
+    if styles.border_style.as_deref().map(str::trim) == Some("dashed") {
+        el = el.border_dashed();
     }
     // `font-family`: the face this element's text is set in.
     if let Some(ref family) = styles.font_family {

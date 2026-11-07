@@ -86,6 +86,9 @@ pub struct GpuiStyles {
     pub border_bottom_width: Option<String>,
     pub border_left_width: Option<String>,
     pub border_color: Option<String>,
+    /// `border-style`: `dashed` draws the border dashed (GPUI's
+    /// `BorderStyle::Dashed`); anything else, or none, solid.
+    pub border_style: Option<String>,
     pub shadow: Option<String>,
     pub opacity: Option<String>,
     pub overflow: Option<String>,
@@ -104,6 +107,11 @@ pub struct GpuiStyles {
     /// `flex-grow: 1` — the element takes the free space on its parent's
     /// main axis (a row's band that must reach the parent's right edge).
     pub flex_grow: Option<String>,
+    /// `flex-basis` in pixels: the size a flex item starts from before its
+    /// line grows or shrinks it (CSS Flexbox §7.3.3), apart from its
+    /// `width`, so an item capped by `max-width` still shrinks in proportion
+    /// to its whole content as a browser's does.
+    pub flex_basis: Option<String>,
     /// Per-side padding (`padding-left`, ...), each overriding `p` on its
     /// own side.
     pub padding_top: Option<String>,
@@ -191,6 +199,7 @@ impl GpuiStyles {
             "bottom" => self.bottom = Some(v),
             "left" => self.left = Some(v),
             "border-color" | "border_color" => self.border_color = Some(v),
+            "border-style" | "border_style" => self.border_style = Some(v),
             "shadow" | "box-shadow" | "box_shadow" => self.shadow = Some(v),
             "opacity" => self.opacity = Some(v),
             "overflow" => self.overflow = Some(v),
@@ -206,6 +215,7 @@ impl GpuiStyles {
             "text-overflow" | "text_overflow" => self.text_overflow = Some(v),
             "flex-shrink" | "flex_shrink" => self.flex_shrink = Some(v),
             "flex-grow" | "flex_grow" => self.flex_grow = Some(v),
+            "flex-basis" | "flex_basis" => self.flex_basis = Some(v),
             "padding-top" | "padding_top" => self.padding_top = Some(v),
             "padding-right" | "padding_right" => self.padding_right = Some(v),
             "padding-bottom" | "padding_bottom" => self.padding_bottom = Some(v),
@@ -1938,6 +1948,8 @@ mod tests {
         for (k, v) in [
             ("border-left-width", "3px"),
             ("border-top-width", "1px"),
+            ("border-style", "dashed"),
+            ("flex-basis", "320px"),
             ("padding-left", "10px"),
             ("padding-bottom", "2px"),
             ("flex-grow", "1"),
@@ -1951,6 +1963,8 @@ mod tests {
         assert_eq!(styles.border_left_width.as_deref(), Some("3px"));
         assert_eq!(styles.border_top_width.as_deref(), Some("1px"));
         assert_eq!(styles.border_right_width, None);
+        assert_eq!(styles.border_style.as_deref(), Some("dashed"));
+        assert_eq!(styles.flex_basis.as_deref(), Some("320px"));
         assert_eq!(styles.padding_left.as_deref(), Some("10px"));
         assert_eq!(styles.padding_bottom.as_deref(), Some("2px"));
         assert_eq!(styles.padding_top, None);

@@ -559,6 +559,25 @@ proc sameNode*(a, b: GpuiElement): bool =
 proc childCount*(node: GpuiElement): int =
   int(gpui_child_count(node))
 
+const LayoutProbeAttribute* = "data-layout-probe"
+  ## The attribute an element opts into `layoutBounds` with.
+
+proc layoutBounds*(node: GpuiElement;
+                   x, y, w, h: var float): bool =
+  ## Where the window last laid `node` out (its padding box, window
+  ## coordinates, logical pixels), read off GPUI's own layout. False -- and
+  ## the outputs untouched -- for a node that does not carry
+  ## `LayoutProbeAttribute`, that no frame has laid out yet, or in a build
+  ## without the GPUI backend. See the shim's `layout_bounds` module.
+  if node == nil: return false
+  var xywh: array[4, float64]
+  if gpui_layout_bounds(node, addr xywh) == 0'u8: return false
+  x = xywh[0]
+  y = xywh[1]
+  w = xywh[2]
+  h = xywh[3]
+  true
+
 proc textContent*(node: GpuiElement): string =
   let needed = gpui_get_text_content(node, nil, 0)
   if needed == 0:

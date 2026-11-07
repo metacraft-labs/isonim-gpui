@@ -293,6 +293,36 @@ applied: `font-style` (there is no `italic` in the shim).
 `inline_runs_decline_a_span_with_a_font_style` keeps it out of inline-run
 fusion until it is drawn.
 
+### Dashed Borders
+
+`border-style: dashed` draws the element's border dashed (GPUI's
+`BorderStyle::Dashed`); any other value, or none, keeps the solid border. Only
+`dashed` is parsed into a drawing; it is the one non-solid style a consumer
+asks for (CodeTracer's tab-strip notices are outlined, not filled).
+
+### Flex Basis
+
+`flex-basis: Npx` sets a flex item's starting size on its line's main axis
+(CSS Flexbox §7.3.3) apart from its `width`. A browser shrinks the items of an
+overflowing line in proportion to their flex base size, which for an item
+capped by `max-width` is its whole content, not the cap; with `flex-basis` set
+to the content and `max-width` to the cap, GPUI's layout (Taffy) shrinks the
+same way.
+
+### Laid-out Bounds
+
+The shadow tree and the render plan say what an element is; where the window
+put it is GPUI's layout, computed after the plan is handed over. An element
+that carries the attribute `data-layout-probe` gets one more child, an
+absolutely positioned full-size `canvas` that paints nothing and records the
+element's padding box in window coordinates during prepaint (an absolute child
+takes no part in the flex layout, so the probe does not move what it
+measures). `gpui_layout_bounds(node, out)` (Nim: `renderer.layoutBounds`)
+reads the latest frame's bounds back; `gpui_layout_bounds_reset` forgets
+them. Without the GPUI backend nothing is laid out and every read answers 0.
+The store is `layout_bounds.rs`, feature-less like `input` and
+`frame_stats`, so the exported symbol set does not depend on the features.
+
 ### Inline-Run Fusion and Horizontal Insets
 
 A container that declares `data-inline-text-runs` has its text-only

@@ -244,6 +244,19 @@ proc gpui_key_latency_ns*(index: uint64): uint64
   {.importc: "gpui_key_latency_ns".}
 proc gpui_frame_stats_reset*() {.importc: "gpui_frame_stats_reset".}
 
+# --- laid-out bounds (CTF-P1b) ---
+#
+# Where the window laid an element out, read off GPUI's own layout. Only an
+# element carrying the attribute `data-layout-probe` is recorded; see the
+# shim's `layout_bounds` module for what exactly is measured (the padding box,
+# window coordinates, logical pixels).
+
+proc gpui_layout_bounds*(node: GpuiElement; outXywh: ptr array[4, float64]): uint8
+  {.importc: "gpui_layout_bounds".}
+  ## Writes x, y, width, height to `outXywh` and answers 1, or answers 0 for
+  ## an element no frame has laid out (or that did not opt in).
+proc gpui_layout_bounds_reset*() {.importc: "gpui_layout_bounds_reset".}
+
 # --- the element store, read back ---
 
 proc gpui_last_event_key*(node: GpuiElement; buf: pointer; bufLen: uint64): uint64
