@@ -245,6 +245,75 @@ fi
 
 COMPOSITOR_LOG="$XDG_RUNTIME_DIR/$COMPOSITOR.log"
 
+# --- The session bus (headless) ---------------------------------------
+#
+# Headless: a PRIVATE session bus, started here from the dev shell's own
+# dbus with the dev shell's own `session.conf`. Without it the run depends
+# on the host in a way nothing in this repository declares:
+#
+#   * nixpkgs' `sway` is a wrapper that, when DBUS_SESSION_BUS_ADDRESS is
+#     empty, re-execs sway under `dbus-run-session`. That starts
+#     `dbus-daemon --session`, whose compiled-in default configuration is
+#     `/etc/dbus-1/session.conf` -- a HOST file. The CI guests have no such
+#     file, so there sway never started and the `gui-tests` job failed
+#     before any test ran (isonim-gpui CI run 36644786213, 2026-09-30):
+#         dbus[54940]: Failed to start message bus: Failed to open
+#         "/etc/dbus-1/session.conf": No such file or directory
+#   * where a session bus DOES exist (a desktop workstation), sway and the
+#     GPUI window under test joined the USER'S bus, so a local run and a CI
+#     run were not the same experiment.
+#
+# With the address exported, the sway wrapper takes its "bus already
+# present" branch and execs sway itself, so COMPOSITOR_PID stays sway's
+# PID and the cleanup below stops the compositor and this bus separately.
+#
+# Nested (`--window`): keep the host's bus, for the reason the runtime
+# directory above is kept.
+DBUS_DAEMON_PID=""
+stop_session_bus() {
+  if [[ -n "${DBUS_DAEMON_PID:-}" ]]; then
+    kill "$DBUS_DAEMON_PID" 2>/dev/null || true
+    DBUS_DAEMON_PID=""
+  fi
+}
+if [[ "$USE_HEADLESS" == "1" ]]; then
+  if ! _dbus_daemon="$(command -v dbus-daemon)"; then
+    echo "Error: dbus-daemon not found. Ensure dbus is in your nix dev shell." >&2
+    rm -rf "$XDG_RUNTIME_DIR"
+    exit 1
+  fi
+  _dbus_session_conf="$(dirname "$(readlink -f "$_dbus_daemon")")/../share/dbus-1/session.conf"
+  if [[ ! -f "$_dbus_session_conf" ]]; then
+    echo "Error: no session.conf beside $_dbus_daemon (looked for $_dbus_session_conf)" >&2
+    rm -rf "$XDG_RUNTIME_DIR"
+    exit 1
+  fi
+  # `--fork` returns once the bus is listening; the address is printed
+  # first and the PID second (dbus-daemon(1), --print-address/--print-pid).
+  if ! _dbus_out="$(dbus-daemon --config-file="$_dbus_session_conf" \
+    --address="unix:path=$XDG_RUNTIME_DIR/bus" --nopidfile --fork \
+    --print-address=1 --print-pid=1)"; then
+    echo "Error: could not start a private session bus with $_dbus_session_conf" >&2
+    rm -rf "$XDG_RUNTIME_DIR"
+    exit 1
+  fi
+  DBUS_SESSION_BUS_ADDRESS="$(sed -n 1p <<<"$_dbus_out")"
+  DBUS_DAEMON_PID="$(sed -n 2p <<<"$_dbus_out")"
+  if [[ -z "$DBUS_SESSION_BUS_ADDRESS" ]] || ! [[ "$DBUS_DAEMON_PID" =~ ^[0-9]+$ ]]; then
+    echo "Error: unexpected dbus-daemon output: $_dbus_out" >&2
+    [[ "$DBUS_DAEMON_PID" =~ ^[0-9]+$ ]] && kill "$DBUS_DAEMON_PID" 2>/dev/null
+    rm -rf "$XDG_RUNTIME_DIR"
+    exit 1
+  fi
+  export DBUS_SESSION_BUS_ADDRESS
+  echo "Private session bus: $DBUS_SESSION_BUS_ADDRESS (PID $DBUS_DAEMON_PID)"
+  # `--fork` detaches the daemon from this script, so nothing else stops
+  # it if the script exits before `cleanup` is installed below -- and
+  # under `set -e` any failing command between here and there is such an
+  # exit. `trap cleanup EXIT` replaces this; `cleanup` stops the bus too.
+  trap stop_session_bus EXIT
+fi
+
 # Comma-joined list of the wayland sockets already present, so
 # `wait_for_socket` can tell a pre-existing one from the compositor's.
 # Empty in headless mode, where the runtime dir is private and new.
@@ -312,6 +381,7 @@ if ! SOCKET="$(wait_for_socket "$SEEN")"; then
   echo "--- $COMPOSITOR log ---" >&2
   cat "$COMPOSITOR_LOG" >&2 || true
   kill "$COMPOSITOR_PID" 2>/dev/null || true
+  stop_session_bus
   [[ "${CLEANUP_XDG:-0}" == "1" ]] && rm -rf "$XDG_RUNTIME_DIR"
   exit 1
 fi
@@ -368,6 +438,9 @@ cleanup() {
     fi
     wait "$COMPOSITOR_PID" 2>/dev/null || true
   fi
+
+  # After the compositor, which is a client of it.
+  stop_session_bus
 
   if [[ "${CLEANUP_XDG:-0}" == "1" ]]; then
     rm -rf "$XDG_RUNTIME_DIR"

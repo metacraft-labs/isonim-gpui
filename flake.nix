@@ -82,6 +82,12 @@
               pkgs.mesa
               pkgs.libglvnd
               pkgs.sway
+              # `scripts/wayland-run-test.sh` gives headless sway a private
+              # session bus with THIS dbus's `share/dbus-1/session.conf`,
+              # because the sway wrapper's own fallback (`dbus-run-session`)
+              # reads `/etc/dbus-1/session.conf` from the host, and the CI
+              # guests have none. It reached the shell only transitively.
+              pkgs.dbus
               pkgs.wayland-utils
               pkgs.wf-recorder
               # RS-M14b: `scripts/wayland-capture-frame.sh` reads the
