@@ -303,11 +303,30 @@ run_gate "gate: the shim input digest sees every input state" bash ci/test-shim-
 run_gate "gate: trap-13 assertion-helper sweep" python3 tools/trap13-assertion-helper-sweep.py tests src
 
 # --- 1. The Rust shim --------------------------------------------------
+# A failing cargo step must show its CAUSE, not just its summary. The
+# filtered views below (`tail -5`, the `^test result|^running|^error` grep)
+# keep a passing log short, but on a failure they reduce a link error to
+# "error: linking with `cc` failed: exit status: 1" and drop rustc's
+# `note:` block -- the linker command line and the undefined symbols or
+# missing `-l` libraries it reports. That is how the linux-arm64
+# `--with-gpui` lane failed on CI with no diagnosable output. Print the
+# tail of the captured output (the whole of it when shorter) whenever the
+# step exits non-zero. Pass/fail and case counting are untouched: this
+# only adds output.
+CARGO_FAILURE_TAIL_LINES=200
+show_cargo_failure() { # step-name, rc, captured-output
+	[ "$2" -eq 0 ] && return 0
+	echo "--- $1 FAILED (rc=$2); last $CARGO_FAILURE_TAIL_LINES lines of its output:"
+	printf '%s\n' "$3" | tail -n "$CARGO_FAILURE_TAIL_LINES"
+	echo "--- end of $1 output"
+}
+
 echo ""
 echo "--- rust: cargo build"
 cargo_out="$(cd rust && cargo build 2>&1)"
 cargo_rc=$?
 printf '%s\n' "$cargo_out" | tail -5
+show_cargo_failure "rust: cargo build" "$cargo_rc" "$cargo_out"
 [ "$cargo_rc" -eq 0 ] || failed_steps+=("rust: cargo build (rc=$cargo_rc)")
 REPORT+=("$(printf '%-46s rc=%-3s cases=%s' "rust: cargo build" "$cargo_rc" "n/a")")
 
@@ -316,6 +335,7 @@ echo "--- rust: cargo test"
 cargo_out="$(cd rust && cargo test 2>&1)"
 cargo_rc=$?
 printf '%s\n' "$cargo_out" | grep -E '^test result|^running|^error' || true
+show_cargo_failure "rust: cargo test" "$cargo_rc" "$cargo_out"
 [ "$cargo_rc" -eq 0 ] || failed_steps+=("rust: cargo test (rc=$cargo_rc)")
 rust_cases="$(printf '%s\n' "$cargo_out" |
 	sed -n 's/^test result: ok\. \([0-9]\{1,\}\) passed.*/\1/p' |
@@ -339,6 +359,7 @@ if [ "$WITH_GPUI" -eq 1 ]; then
 		cargo_out="$(cd rust && cargo test --features "$feat" 2>&1)"
 		cargo_rc=$?
 		printf '%s\n' "$cargo_out" | grep -E '^test result|^running|^error' || true
+		show_cargo_failure "rust: cargo test --features $feat" "$cargo_rc" "$cargo_out"
 		[ "$cargo_rc" -eq 0 ] || failed_steps+=("rust: cargo test --features $feat (rc=$cargo_rc)")
 		feat_cases="$(printf '%s\n' "$cargo_out" |
 			sed -n 's/^test result: ok\. \([0-9]\{1,\}\) passed.*/\1/p' |
