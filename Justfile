@@ -12,6 +12,13 @@ rust-check-gpui:
 rust-build:
     cd rust && cargo build
 
+# Build the project: the default (feature-less) Rust shim, the one artefact
+# this repository ships — the Nim side is a source library. This is what
+# `repro build`'s `default` collection builds, and the standard recipe
+# `.github/workflows/ci-reprobuild.yml` cross-checks it against; without it
+# that step failed with "Justfile does not contain recipe `build`".
+build: rust-build
+
 # Build the Rust shim in release mode
 rust-build-release:
     cd rust && cargo build --release
