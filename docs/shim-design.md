@@ -288,10 +288,42 @@ unknown-property arm and is ignored like any other unsupported CSS.
 does not space glyphs itself. Adding a property to the parser and the dump
 belongs in the same change that makes the element builder apply it.
 
-One known exception predates the rule and is parsed and reported but not
-applied: `font-style` (there is no `italic` in the shim).
-`inline_runs_decline_a_span_with_a_font_style` keeps it out of inline-run
-fusion until it is drawn.
+### Text Align
+
+`text-align` aligns a text element's lines in its box: `left` / `start`,
+`center` and `right` / `end` (left-to-right text), applied to the element's
+text style (`parse_text_align` in `gpui_app.rs`;
+<https://www.w3.org/TR/css-text-3/#text-align-property>); `justify`, which
+GPUI cannot draw, and anything else are ignored. Before 2026-11-08 it was not
+parsed at all, so a centred notice's wrapped lines were drawn flush left. A
+span inside an inline run fuses as before: with no width of its own, its
+alignment draws nothing.
+
+### Font Style
+
+`font-style` is applied to the drawn element's text style: `italic` and
+`oblique` (with or without an angle, which GPUI has no use for) ask for the
+family's italic face, `normal` for its upright one, and any other value is
+ignored, so the inherited style stays (`parse_font_style` in `gpui_app.rs`;
+<https://www.w3.org/TR/css-fonts-4/#font-style-prop>). It was the one
+exception to the rule above, parsed and reported but never drawn, until
+2026-11-08.
+
+GPUI **selects** a face; it does not **synthesise** one. Its Linux text
+system (`gpui-pre-wgpu`, `cosmic_text_system.rs` `find_best_match`) scores
+each face of the family by style and weight and takes the closest, and its
+own test `font_properties_describe_the_selected_face` asserts that an
+italic request on a family with no italic face returns the upright face.
+So a family that ships an italic (Space Mono: `SpaceMono-Italic.ttf`) is
+drawn italic, and one that does not (Space Grotesk, the design system's
+interface face, ships Light to Bold upright only) is drawn **upright**. A
+browser draws the second case differently: with `font-synthesis: style`
+(the initial value) it slants the upright face. A consumer that must match
+a browser's italic Space Grotesk therefore cannot get it from this shim
+today; it would take a skewed glyph rasterisation in GPUI's text system.
+
+`font-style` fuses in inline runs, like `font-weight`: a `HighlightStyle`
+carries it per range (`inline_runs_fuse_spans_that_differ_only_in_style`).
 
 ### Dashed Borders
 
@@ -308,6 +340,43 @@ overflowing line in proportion to their flex base size, which for an item
 capped by `max-width` is its whole content, not the cap; with `flex-basis` set
 to the content and `max-width` to the cap, GPUI's layout (Taffy) shrinks the
 same way.
+
+### Flex Shrink
+
+`flex-shrink: N` (any non-negative number) is the item's shrink factor: an
+overfull line is shrunk in proportion to factor times flex basis (CSS
+Flexbox §9.7, <https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths>),
+which Taffy implements. Until 2026-11-08 only `0` was applied and any other
+factor was parsed and dropped, so an item meant to give way a hundred times
+faster than its neighbour (CodeTracer's session-group counts, `flex: 0 100
+auto`) shrank at the default 1. A negative or unparsable value is ignored.
+`test_flex_shrink_factor_is_applied_to_the_layout` (`tests/gpui_rendering.rs`)
+reads the laid-out widths back.
+
+### Mask Image
+
+`mask-image: url(<file>)` (also `-webkit-mask-image`) paints the element's
+`background` colour THROUGH an SVG file's alpha instead of over the whole
+box, which is how a web stylesheet draws a one-colour icon in a theme's ink
+(`background-color: currentColor; mask-image: url(...)`;
+<https://www.w3.org/TR/css-masking-1/#the-mask-image>). The builder adds an
+absolutely positioned GPUI `svg()` child that fills the box and is tinted with
+the colour (`with_mask_image` in `gpui_app.rs`). What it does not do, and why
+none of it matters to its consumers: it masks the background only, not the
+element's children or border; it fills the box (`mask-size: contain`,
+`mask-position: center` when the mask's aspect is the box's); `none`, a
+gradient or several layers leave the background unmasked.
+
+Why a mask rather than an `img` of a recoloured SVG: GPUI rasterises an `img`
+SVG at twice its intrinsic size (`SMOOTH_SVG_SCALE_FACTOR`), un-premultiplies
+it, and on a 1x window minifies it with straight-alpha filtering, so the
+transparent black around a shape darkens every antialiased edge. Measured
+2026-11-08 on CodeTracer's "+" (a 1px cross, `#b0b0b0` at 0.7 on a `#333333`
+disc): the browser draws its arms at 94 and its centre at 117; the `img` drew
+64 and 93, the values a premultiplied colour blended as straight alpha gives.
+`svg()` renders the alpha mask at the box's device size, so there is no
+minification. The `img` path keeps the defect for a picture that is not a
+mask; it is GPUI's, not this shim's.
 
 ### Laid-out Bounds
 
@@ -331,7 +400,7 @@ once instead of once per span. The governing rule is the
 `inlineTextRunsAttribute` doc comment in `src/isonim_gpui/renderer.nim`;
 `fusable_child_text` in `render_sync.rs` implements it.
 
-A `StyledText` highlight carries colour and weight but no padding, so a
+A `StyledText` highlight carries colour, weight and style but no padding, so a
 span's padding used to keep that span out of every fused run. A span's own
 `padding-left` / `padding-right` (a non-negative px length) now fuses when
 the container declares `white-space: nowrap` or `pre` and no
@@ -357,6 +426,7 @@ Required parsers for style values:
 | `parse_color` | "#ff0000", "rgb(255,0,0)", "red" | `rgb(0xff0000)` / `Hsla` |
 | `parse_float` | "0.5", "1.0" | `f32` |
 | `parse_font_weight` | "bold", "400", "normal" | `FontWeight` enum |
+| `parse_font_style` | "italic", "oblique 10deg", "normal" | `FontStyle` (or `None`: inherit) |
 
 ### Pre-Mapped Properties (Nim Side)
 
@@ -377,8 +447,8 @@ Rust side.
 | `span`, `p`, `h1`-`h6`, `label`, `strong`, `em` | `div()` + text child | Text styling via `text_xl()`, `font_weight()`, etc. |
 | `button` | `div()` + event handlers | Styled as clickable, with hover states |
 | `input`, `textarea` | `div()` (placeholder) | Full input support requires gpui-component integration |
-| `img` | `img()` | With `.uri(src)` for the image source |
-| `svg` | `svg()` | With `.path(src)` for the SVG source |
+| `img`, `svg` with a `src` | flex `div()` holding `img(path)` | `file_image`: the picture fills a box that carries the element's own styles (size, `opacity`, margins, `flex-shrink`, ...); a raster file is decoded, anything else is rendered as SVG. See "Pictures" below |
+| `img` with pixels (`gpui_set_image_rgba`) | flex `div()` holding `img(RenderImage)` | stretched to the element's box, which carries its styles. See "Pictures" below |
 | `ul`, `ol`, `li` | `div()` | Lists are flexbox columns with children |
 | `form`, `fieldset` | `div()` | Containers with no special behavior |
 
@@ -398,6 +468,32 @@ Text in GPUI is not an element -- it is a child of a div. The render-sync handle
 For styled text (different colors, weights within a paragraph), GPUI provides
 `StyledText` with `TextRun`s. This maps to multiple text shadow nodes with
 different style attributes.
+
+### Pictures
+
+Both `img` arms draw the picture in a box (`picture_box` in `gpui_app.rs`)
+that carries the element's own styles, and the picture fills the box
+(`size_full`). The box is a **flex** container on purpose. Once a picture has
+loaded, GPUI's `Img` states its intrinsic aspect ratio in its own layout
+style (`gpui-pre` `elements/img.rs`, `request_layout`); in GPUI's default
+block `div()`, Taffy then lets that ratio, not the box, decide the picture's
+height, so a picture taller than its box was laid out taller than the size
+the element states (a 10x16 SVG at 6x8 came out 6x9.5) and drew over its
+neighbours. As a flex item the picture resolves `size_full` against the box
+on both axes, which is what a browser does for an `<img>` with both `width`
+and `height` stated. The pixel-buffer arm had the block box from its first
+version; the file arm took it on 2026-11-08 and regressed CodeTracer's
+flow-loop arrows and execution mark the same day, which is how it was found.
+
+`test_a_non_square_picture_lands_at_its_declared_size`
+(`tests/gpui_rendering.rs`, `cargo test --features gpui-backend`) reads the
+picture's LAID-OUT bounds back from a `TestAppContext` window, for portrait
+and landscape SVGs and a pixel buffer, after the picture has loaded. It
+reads them through `picture_debug_selector`, a GPUI `debug_selector` on the
+picture that records nothing unless GPUI is built with `test-support`. With
+a block box it fails on the three cases whose picture is taller than its box.
+A check of the box's style fields alone cannot see this: the box keeps the
+stated size while the picture inside it does not.
 
 ---
 

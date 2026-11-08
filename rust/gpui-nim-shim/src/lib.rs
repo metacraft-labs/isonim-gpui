@@ -1617,6 +1617,8 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(font_weight, "font_weight");
         push_style!(font_style, "font_style");
         push_style!(text_decoration, "text_decoration");
+        push_style!(text_align, "text_align");
+        push_style!(mask_image, "mask_image");
         push_style!(line_height, "line_height");
         push_style!(cursor, "cursor");
         if let Some(ref name) = s.cursor {

@@ -891,18 +891,7 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
             // could not draw an icon at all (CodeTracer's GPUI debugger
             // controls draw the desktop's SVG marks through it).
             let src = plan.attributes.get("src").cloned().unwrap_or_default();
-            let mut el = img(std::path::PathBuf::from(src));
-            if let Some(ref w) = plan.styles.w {
-                if let Some(px_value) = parse_px(w) {
-                    el = el.w(px(px_value));
-                }
-            }
-            if let Some(ref h) = plan.styles.h {
-                if let Some(px_value) = parse_px(h) {
-                    el = el.h(px(px_value));
-                }
-            }
-            el.into_any_element()
+            file_image(&src, plan.node_id, &plan.styles).into_any_element()
         }
         GpuiElementKind::Img if plan.image.is_some() => {
             // THE PIXELS THE APPLICATION SET (`gpui_set_image_rgba`), drawn
@@ -912,10 +901,10 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
             // the same pixels again on every repaint.
             let image = plan.image.as_ref().unwrap();
             let render = cached_render_image(image);
-            let mut el = div();
-            el = apply_styles_to_div(el, &plan.styles);
-            el.child(
-                gpui::StyledImage::object_fit(img(render).size_full(), gpui::ObjectFit::Fill),
+            picture_box(
+                gpui::StyledImage::object_fit(img(render), gpui::ObjectFit::Fill),
+                plan.node_id,
+                &plan.styles,
             )
             .into_any_element()
         }
@@ -1127,9 +1116,12 @@ fn run_highlight(run: &crate::render_sync::InlineTextRun) -> HighlightStyle {
     // span with no weight of its own leaves the field `None` and inherits,
     // exactly as it does unfused.
     let font_weight = run.font_weight.as_deref().map(parse_font_weight);
+    // `font-style` likewise, through the unfused path's own parser.
+    let font_style = run.font_style.as_deref().and_then(parse_font_style);
     HighlightStyle {
         color,
         font_weight,
+        font_style,
         ..Default::default()
     }
 }
@@ -1685,17 +1677,68 @@ fn wire_pointer_listeners(mut el: Div, plan: &crate::render_sync::RenderNode) ->
     el
 }
 
+/// A picture from a file (`img` / `svg` with a `src`), in a box that carries
+/// the element's OWN styles -- its size, and also its `opacity`, margins and
+/// `flex-shrink`, which an icon beside text needs (a close mark at 0.4, a
+/// pin 4.8px before its neighbour, a mark that must not be squeezed by a
+/// full tab). The picture fills the box (`picture_box`). Until 2026-11-08
+/// this arm applied only `width` and `height` to GPUI's `img` and dropped
+/// the rest.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn file_image(src: &str, node_id: u64, styles: &crate::render_sync::GpuiStyles) -> Div {
+    picture_box(img(std::path::PathBuf::from(src)), node_id, styles)
+}
+
+/// The key under which a test reads where the window laid out the PICTURE of
+/// element `node_id` (`VisualTestContext::debug_bounds`). `debug_selector`
+/// is a no-op unless GPUI is built with `test-support`, so a production
+/// build records nothing and does not even format the key.
+pub fn picture_debug_selector(node_id: u64) -> String {
+    format!("isonim-gpui-picture-{node_id}")
+}
+
+/// The box an `img` element is drawn in: a FLEX container carrying the
+/// element's own styles, with the picture filling it.
+///
+/// The box must be a flex container, not GPUI's default block `div()`. GPUI's
+/// `Img` states the picture's intrinsic aspect ratio in its own style once
+/// the picture has loaded (`gpui-pre` `elements/img.rs`, `request_layout`),
+/// and in a BLOCK container Taffy lets that ratio, not the box's height,
+/// decide the picture's height: a 6x10 box holding a 10x16 SVG laid the
+/// picture out larger than the box and it overflowed (CodeTracer's flow-loop
+/// arrows drew at about 10x16 in a 12px button, its execution mark 7x9
+/// instead of 6x8; measured 2026-11-08). As a flex item, the picture's
+/// `size_full` resolves against the box on both axes and the ratio is
+/// ignored, which is what CSS does for an `<img>` with both `width` and
+/// `height` stated. `test_a_non_square_picture_lands_at_its_declared_size`
+/// (`tests/gpui_rendering.rs`) reads the laid-out bounds back.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn picture_box(
+    picture: gpui::Img,
+    node_id: u64,
+    styles: &crate::render_sync::GpuiStyles,
+) -> Div {
+    apply_styles_to_div(div().flex(), styles).child(
+        picture
+            .size_full()
+            .debug_selector(|| picture_debug_selector(node_id)),
+    )
+}
+
 /// Apply GpuiStyles to a div builder.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn apply_styles_to_div(
     mut el: Div,
     styles: &crate::render_sync::GpuiStyles,
 ) -> Div {
-    // Background color
-    if let Some(ref bg) = styles.bg {
-        if let Some(color) = parse_color(bg) {
-            el = el.bg(color);
-        }
+    // Background color -- painted over the whole box, or, under a
+    // `mask-image`, only through the mask (`with_mask_image`).
+    let mask = styles.mask_image.as_deref().and_then(parse_mask_url);
+    if let Some(color) = styles.bg.as_deref().and_then(parse_color) {
+        el = match mask {
+            Some(path) => with_mask_image(el, path, color),
+            None => el.bg(color),
+        };
     }
 
     // Width
@@ -1875,9 +1918,17 @@ pub fn apply_styles_to_div(
         }
     }
 
+    // `flex-shrink: N`, a non-negative shrink factor: how fast the item gives
+    // way on an overfull line, weighted by its flex basis (CSS Flexbox §9.7,
+    // https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths). Until
+    // 2026-11-08 only `0` was applied, so a factor such as the `100` that
+    // makes one item give way long before its neighbour was parsed and
+    // dropped. A negative or unparsable value is ignored, as in CSS.
     if let Some(ref shrink) = styles.flex_shrink {
-        if shrink.trim() == "0" {
-            el = el.flex_shrink_0();
+        if let Ok(s) = shrink.trim().parse::<f32>() {
+            if s >= 0.0 && s.is_finite() {
+                el = el.flex_shrink(s);
+            }
         }
     }
 
@@ -1977,6 +2028,20 @@ pub fn apply_styles_to_div(
     if let Some(ref weight) = styles.font_weight {
         el = el.font_weight(parse_font_weight(weight));
     }
+    // `font-style`: `italic` / `oblique` select the family's italic face and
+    // `normal` its upright one (`parse_font_style`). GPUI matches a face; it
+    // does not synthesise one, so a family with no italic face (Space
+    // Grotesk) is drawn upright -- see docs/shim-design.md, "Font Style".
+    if let Some(style) = styles.font_style.as_deref().and_then(parse_font_style) {
+        el.text_style().font_style = Some(style);
+    }
+    // `text-align`: where the element's text lines sit in its box -- a
+    // wrapped notice centred line by line, a column's figures at its right
+    // (`parse_text_align`). GPUI aligns each laid-out line in the element's
+    // width, as CSS does.
+    if let Some(align) = styles.text_align.as_deref().and_then(parse_text_align) {
+        el.text_style().text_align = Some(align);
+    }
     // `text-decoration: underline`: a menu's access key, a link.
     if styles
         .text_decoration
@@ -2019,6 +2084,86 @@ pub fn parse_font_weight(s: &str) -> FontWeight {
             .parse::<f32>()
             .map(FontWeight)
             .unwrap_or(FontWeight::NORMAL),
+    }
+}
+
+/// A CSS `font-style` as GPUI's (https://www.w3.org/TR/css-fonts-4/#font-style-prop):
+/// `normal`, `italic`, and `oblique` with or without an angle (GPUI has no
+/// angle; an oblique request matches an italic or oblique face). `None` for
+/// anything else, which keeps the inherited style, as a browser ignores an
+/// invalid declaration.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_font_style(s: &str) -> Option<gpui::FontStyle> {
+    let s = s.trim();
+    match s.split_whitespace().next()? {
+        "normal" if s == "normal" => Some(gpui::FontStyle::Normal),
+        "italic" if s == "italic" => Some(gpui::FontStyle::Italic),
+        "oblique" => Some(gpui::FontStyle::Oblique),
+        _ => None,
+    }
+}
+
+/// A CSS `text-align` as GPUI's (https://www.w3.org/TR/css-text-3/#text-align-property):
+/// `left` / `start`, `center`, `right` / `end` (left-to-right text). `None`
+/// for anything else (`justify` among them, which GPUI cannot draw), which
+/// keeps the inherited alignment.
+/// The file a CSS `mask-image` names (https://www.w3.org/TR/css-masking-1/#the-mask-image):
+/// `url("path")`, `url('path')` or `url(path)`. `None` for anything else --
+/// `none`, a gradient, several layers -- which leaves the background
+/// unmasked, as a browser does with a declaration it cannot use.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_mask_url(s: &str) -> Option<&str> {
+    let inner = s.trim().strip_prefix("url(")?.strip_suffix(')')?.trim();
+    let path = match inner.as_bytes().first() {
+        Some(b'"') => inner.strip_prefix('"')?.strip_suffix('"')?,
+        Some(b'\'') => inner.strip_prefix('\'')?.strip_suffix('\'')?,
+        _ => inner,
+    };
+    if path.is_empty() || path.contains(['(', ')', ',']) {
+        return None;
+    }
+    Some(path)
+}
+
+/// The element's background painted THROUGH a mask: an SVG file's alpha,
+/// filling the box, in `color` -- CSS `background-color` under `mask-image`
+/// (https://www.w3.org/TR/css-masking-1/#the-mask-image), which is how a
+/// web front-end draws a one-colour icon in a theme's ink. GPUI's `svg()`
+/// renders the alpha mask at the box's DEVICE size and tints it, so the
+/// icon's edges are those of the shape at that size. An `img` of the same
+/// file is rasterised at twice its intrinsic size, un-premultiplied and
+/// minified on a 1x window with straight-alpha filtering, which darkens every
+/// antialiased edge (measured 2026-11-08: a 1px stroke of `#b0b0b0` at 0.7
+/// drew 64 over a 51 ground where the browser draws 94); see
+/// docs/shim-design.md, "Mask Image".
+///
+/// The mask is an absolutely positioned child under the element's own
+/// children, so it masks the BACKGROUND only: the element's children and
+/// border are drawn as usual (a browser would mask them too; no consumer puts
+/// either on a masked element). It fills the box, which is
+/// `mask-size: contain; mask-position: center` when the mask's aspect is the
+/// box's. A file that is not an SVG GPUI can parse draws nothing (and is
+/// logged by GPUI).
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn with_mask_image(el: Div, path: &str, color: Hsla) -> Div {
+    el.child(
+        gpui::svg()
+            .external_path(path.to_string())
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .text_color(color),
+    )
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_text_align(s: &str) -> Option<gpui::TextAlign> {
+    match s.trim() {
+        "left" | "start" => Some(gpui::TextAlign::Left),
+        "center" => Some(gpui::TextAlign::Center),
+        "right" | "end" => Some(gpui::TextAlign::Right),
+        _ => None,
     }
 }
 
@@ -2549,7 +2694,11 @@ mod tests {
     // Do NOT use `use super::*` here because it would bring gpui traits
     // (re-exported via use statements) that include a `test` proc macro
     // which shadows `#[test]` and causes infinite macro recursion.
-    use super::{active_window_id, launch_gpui_app, parse_line_height};
+    use super::{
+        active_window_id, apply_styles_to_div, file_image, launch_gpui_app, parse_font_style,
+        parse_line_height, parse_mask_url, parse_text_align, run_highlight,
+    };
+    use gpui::Styled as _;
 
     #[test]
     fn test_launch_gpui_app_exists() {
@@ -2576,5 +2725,125 @@ mod tests {
         );
         assert_eq!(parse_line_height("normal"), None);
         assert_eq!(parse_line_height("0px"), None);
+    }
+
+    #[test]
+    fn test_font_style_keywords_and_an_oblique_angle() {
+        assert_eq!(parse_font_style("italic"), Some(gpui::FontStyle::Italic));
+        assert_eq!(parse_font_style(" normal "), Some(gpui::FontStyle::Normal));
+        assert_eq!(parse_font_style("oblique"), Some(gpui::FontStyle::Oblique));
+        assert_eq!(parse_font_style("oblique 10deg"), Some(gpui::FontStyle::Oblique));
+        // Invalid declarations are ignored (the inherited style stays).
+        assert_eq!(parse_font_style("italics"), None);
+        assert_eq!(parse_font_style("italic bold"), None);
+        assert_eq!(parse_font_style(""), None);
+    }
+
+    /// The element builder APPLIES `font-style`: it is in the drawn
+    /// element's text style, not only in the render plan's report.
+    #[test]
+    fn test_font_style_is_applied_to_the_drawn_element() {
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.font_style = Some("italic".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(el.text_style().font_style, Some(gpui::FontStyle::Italic));
+        styles.font_style = Some("normal".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(el.text_style().font_style, Some(gpui::FontStyle::Normal));
+        // Unset or invalid: nothing stated, the parent's style is inherited.
+        styles.font_style = Some("sideways".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(el.text_style().font_style, None);
+        let mut el = apply_styles_to_div(gpui::div(), &Default::default());
+        assert_eq!(el.text_style().font_style, None);
+    }
+
+    /// `text-align` is APPLIED to the drawn element's text style, and an
+    /// alignment GPUI cannot draw leaves it unstated.
+    #[test]
+    fn test_text_align_is_applied_to_the_drawn_element() {
+        assert_eq!(parse_text_align("center"), Some(gpui::TextAlign::Center));
+        assert_eq!(parse_text_align(" end "), Some(gpui::TextAlign::Right));
+        assert_eq!(parse_text_align("start"), Some(gpui::TextAlign::Left));
+        assert_eq!(parse_text_align("justify"), None);
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.text_align = Some("right".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(el.text_style().text_align, Some(gpui::TextAlign::Right));
+        styles.text_align = Some("justify".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(el.text_style().text_align, None);
+    }
+
+    /// A picture from a file is drawn in a box with the element's own
+    /// styles: not only its size but its opacity, margins and
+    /// `flex-shrink: 0`, which the bare `img` arm used to drop.
+    #[test]
+    fn test_file_image_box_carries_the_elements_own_styles() {
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.w = Some("9.6px".into());
+        styles.h = Some("9.6px".into());
+        styles.opacity = Some("0.4".into());
+        styles.flex_shrink = Some("0".into());
+        styles.margin_right = Some("4.8px".into());
+        let mut el = file_image("/nonexistent.svg", 1, &styles);
+        let style = el.style();
+        assert_eq!(style.opacity, Some(0.4));
+        assert_eq!(style.flex_shrink, Some(0.0));
+        assert_eq!(
+            style.size.width,
+            Some(gpui::Length::Definite(gpui::px(9.6).into()))
+        );
+        assert_eq!(
+            style.margin.right,
+            Some(gpui::Length::Definite(gpui::px(4.8).into()))
+        );
+    }
+
+    /// A fused run states its span's style in its highlight, through the
+    /// same parser, so a span draws in the same style fused or not.
+    #[test]
+    fn test_fused_run_highlight_carries_the_font_style() {
+        let run = crate::render_sync::InlineTextRun {
+            len: 3,
+            color: None,
+            font_weight: None,
+            font_style: Some("italic".into()),
+            inset_left: None,
+            inset_right: None,
+        };
+        assert_eq!(run_highlight(&run).font_style, Some(gpui::FontStyle::Italic));
+        let upright = crate::render_sync::InlineTextRun { font_style: None, ..run };
+        assert_eq!(run_highlight(&upright).font_style, None);
+    }
+
+    #[test]
+    fn test_mask_url_spellings_and_refusals() {
+        assert_eq!(parse_mask_url("url(\"/a/plus.svg\")"), Some("/a/plus.svg"));
+        assert_eq!(parse_mask_url(" url('/a/plus.svg') "), Some("/a/plus.svg"));
+        assert_eq!(parse_mask_url("url(/a/plus.svg)"), Some("/a/plus.svg"));
+        // Nothing the builder could draw: the background stays unmasked.
+        assert_eq!(parse_mask_url("none"), None);
+        assert_eq!(parse_mask_url("url()"), None);
+        assert_eq!(parse_mask_url("url(\"/a.svg\"), url(\"/b.svg\")"), None);
+        assert_eq!(parse_mask_url("linear-gradient(red, blue)"), None);
+        assert_eq!(parse_mask_url("url(\"/a.svg)"), None);
+    }
+
+    /// Under a usable `mask-image` the background is NOT painted over the
+    /// box (it is painted through the mask, by a child); without one, or
+    /// with one the builder cannot use, it is.
+    #[test]
+    fn test_masked_background_is_not_painted_over_the_box() {
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.bg = Some("#b0b0b0".into());
+        let mut plain = apply_styles_to_div(gpui::div(), &styles);
+        assert!(plain.style().background.is_some());
+        styles.mask_image = Some("url(\"/tmp/plus.svg\")".into());
+        let mut masked = apply_styles_to_div(gpui::div(), &styles);
+        assert!(masked.style().background.is_none());
+        styles.mask_image = Some("none".into());
+        let mut unusable = apply_styles_to_div(gpui::div(), &styles);
+        assert!(unusable.style().background.is_some());
     }
 }

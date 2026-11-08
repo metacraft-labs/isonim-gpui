@@ -17,7 +17,8 @@
 // infinite recursion in the compiler.
 use gpui::{div, AppContext, TestAppContext};
 use gpui_nim_shim::gpui_app::{
-    apply_styles_to_div, parse_color, parse_px, render_plan_to_gpui, NimRootView,
+    apply_styles_to_div, parse_color, parse_px, picture_debug_selector, render_plan_to_gpui,
+    NimRootView,
 };
 use gpui_nim_shim::render_sync::{build_render_plan, count_render_nodes, GpuiStyles, RenderNode};
 use gpui_nim_shim::tree::{EventListener, GpuiElementKind, Node, NodeId};
@@ -1263,5 +1264,192 @@ fn test_a_one_line_chip_is_rounded_once_not_per_span() {
         // 7 px short of `once`.
         let w = chip_width(cx, chip_plan(true, name, value));
         assert_eq!(w, once, "a declared nowrap chip must be rounded once");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// A picture lands at the size its element states, whatever its own aspect.
+// ---------------------------------------------------------------------------
+
+/// A row like the ones CodeTracer draws an icon in (`display: flex`,
+/// `align-items: center`, wider and taller than the icon), holding one
+/// picture element.
+struct PictureProbe {
+    plan: RenderNode,
+}
+
+impl gpui::Render for PictureProbe {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{ParentElement, Styled};
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w(gpui::px(200.0))
+            .h(gpui::px(40.0))
+            .child(render_plan_to_gpui(&self.plan))
+    }
+}
+
+/// An `img` element of the shadow tree, sized `w` x `h` px, built through
+/// the same render-plan path an application's element takes.
+fn picture_plan(w: u32, h: u32, src: Option<&str>) -> RenderNode {
+    reset_global_tree();
+    let mut tree = gpui_nim_shim::lock_tree();
+    let mut node = Node::new_element("img");
+    node.styles.insert("width".into(), format!("{w}px"));
+    node.styles.insert("height".into(), format!("{h}px"));
+    node.styles.insert("flex-shrink".into(), "0".into());
+    if let Some(src) = src {
+        node.attributes.insert("src".into(), src.into());
+    }
+    let id = tree.insert(node);
+    build_render_plan(&tree, id).expect("plan")
+}
+
+/// Where the window laid out the picture of `plan` (logical px), after the
+/// picture has loaded: GPUI states a picture's intrinsic aspect ratio in its
+/// layout only once its data is there, so the first frame cannot show the
+/// defect this guards against.
+fn picture_bounds(cx: &mut TestAppContext, plan: RenderNode) -> gpui::Bounds<gpui::Pixels> {
+    let node_id = plan.node_id;
+    let (_view, vcx) = cx.add_window_view(move |_window, _cx| PictureProbe { plan });
+    let selector: &'static str = Box::leak(picture_debug_selector(node_id).into_boxed_str());
+    vcx.run_until_parked();
+    vcx.refresh().expect("window");
+    vcx.run_until_parked();
+    vcx.debug_bounds(selector)
+        .expect("the picture was drawn and its bounds recorded")
+}
+
+/// A NON-SQUARE picture, drawn in a box of a different aspect, LANDS AT THE
+/// BOX's size: its laid-out bounds are read back from the window, not its
+/// styles. This is the case that regressed on 2026-11-08: with the picture
+/// in a block box, GPUI let the picture's own aspect ratio size it, so the
+/// picture was laid out at a size its element never stated (a 10x16 arrow
+/// at 6x8 came out 6x9.5) and drew over its neighbours. Both orientations,
+/// a file SVG and an application's pixel buffer (the two arms that draw an
+/// `img`). Without the fix, the three cases whose picture is taller than its
+/// box fail: 6x8 -> 6x9.5, 7x9 -> 7x9.5 and the pixel buffer 6x8 -> 6x9.5.
+#[test]
+#[serial]
+fn test_a_non_square_picture_lands_at_its_declared_size() {
+    run_gpui_test("test_a_non_square_picture_lands_at_its_declared_size", |cx| {
+        let dir = std::env::temp_dir().join(format!("isonim-gpui-picture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let svg = |name: &str, w: u32, h: u32| {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" \
+                     viewBox=\"0 0 {w} {h}\"><path d=\"M{w} 0 L0 {hh} L{w} {h}\" \
+                     stroke=\"#fff\" fill=\"none\"/></svg>",
+                    hh = h / 2
+                ),
+            )
+            .expect("write svg");
+            path.to_string_lossy().into_owned()
+        };
+        let portrait = svg("portrait.svg", 10, 16);
+        let landscape = svg("landscape.svg", 16, 10);
+        // The shape of CodeTracer's execution mark (`highlight_line_arrow.svg`,
+        // 8x11), which it states at 7x9.
+        let mark = svg("mark.svg", 8, 11);
+
+        // Every case is measured before any is judged, so a failure names
+        // all the cases that land wrong, not only the first.
+        let mut wrong = Vec::new();
+        let mut judge = |what: String, b: gpui::Bounds<gpui::Pixels>, w: u32, h: u32| {
+            let got = (f32::from(b.size.width), f32::from(b.size.height));
+            if got != (w as f32, h as f32) {
+                wrong.push(format!("{what} stated at {w}x{h} laid out at {}x{}", got.0, got.1));
+            }
+        };
+        for (src, w, h) in [(&portrait, 6, 10), (&portrait, 6, 8), (&landscape, 10, 6),
+                            (&landscape, 8, 6), (&mark, 7, 9)] {
+            judge(src.clone(), picture_bounds(cx, picture_plan(w, h, Some(src))), w, h);
+        }
+
+        // The pixel-buffer arm: a 10x16 image the application set, stated
+        // at 6x8.
+        let mut plan = picture_plan(6, 8, None);
+        plan.image = Some(gpui_nim_shim::tree::NodeImage {
+            width: 10,
+            height: 16,
+            bgra: std::sync::Arc::new(vec![0xff; 10 * 16 * 4]),
+            generation: 1,
+        });
+        judge("a 10x16 pixel buffer".into(), picture_bounds(cx, plan), 6, 8);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(wrong.is_empty(), "pictures not at their stated size:\n  {}", wrong.join("\n  "));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// `flex-shrink: N` shrinks an overfull line in proportion to factor x basis.
+// ---------------------------------------------------------------------------
+
+/// A 200px row holding two items, each a 150px flex basis, shrinking at the
+/// factors given -- styled through `apply_styles_to_div`, the element
+/// builder's own path.
+struct ShrinkProbe {
+    factors: (&'static str, &'static str),
+}
+
+impl gpui::Render for ShrinkProbe {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{InteractiveElement, ParentElement, Styled};
+        let item = |shrink: &str, name: &'static str| {
+            let styles = GpuiStyles {
+                flex_basis: Some("150px".into()),
+                flex_shrink: Some(shrink.into()),
+                min_w: Some("0px".into()),
+                h: Some("10px".into()),
+                ..Default::default()
+            };
+            apply_styles_to_div(div(), &styles).debug_selector(move || name.into())
+        };
+        div()
+            .flex()
+            .flex_row()
+            .w(gpui::px(200.0))
+            .h(gpui::px(20.0))
+            .child(item(self.factors.0, "first"))
+            .child(item(self.factors.1, "second"))
+    }
+}
+
+fn shrunk_widths(cx: &mut TestAppContext, factors: (&'static str, &'static str)) -> (f32, f32) {
+    let (_view, vcx) = cx.add_window_view(move |_window, _cx| ShrinkProbe { factors });
+    vcx.run_until_parked();
+    let w = |vcx: &mut gpui::VisualTestContext, name: &'static str| {
+        f32::from(vcx.debug_bounds(name).expect("drawn").size.width)
+    };
+    (w(vcx, "first"), w(vcx, "second"))
+}
+
+/// The 100px overflow is taken in proportion to shrink factor x basis
+/// (https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths): at 1 and
+/// 3 the second item gives three quarters of it. Before 2026-11-08 the
+/// builder applied only `0`, so both shrank at the default 1 (100 / 100).
+/// `0` still freezes an item at its basis.
+#[test]
+#[serial]
+fn test_flex_shrink_factor_is_applied_to_the_layout() {
+    run_gpui_test("test_flex_shrink_factor_is_applied_to_the_layout", |cx| {
+        assert_eq!(shrunk_widths(cx, ("1", "1")), (100.0, 100.0), "control: equal factors");
+        assert_eq!(shrunk_widths(cx, ("1", "3")), (125.0, 75.0));
+        assert_eq!(shrunk_widths(cx, ("0", "1")), (150.0, 50.0));
+        // Ignored, as CSS ignores an invalid declaration: the default 1.
+        assert_eq!(shrunk_widths(cx, ("-2", "1")), (100.0, 100.0));
     });
 }

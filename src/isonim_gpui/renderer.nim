@@ -174,6 +174,7 @@ const stylePropertyMap = {
   "background-color": "bg",
   "background": "bg",
   "color": "text_color",
+  "mask-image": "mask_image",   # `background` painted through an SVG's alpha
 
   # Typography
   "font-size": "text_size",

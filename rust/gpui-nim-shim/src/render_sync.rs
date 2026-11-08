@@ -97,6 +97,13 @@ pub struct GpuiStyles {
     pub font_style: Option<String>,
     /// `text-decoration`: `underline` underlines the element's text.
     pub text_decoration: Option<String>,
+    /// `text-align`: where a text element's lines sit in its box
+    /// (`gpui_app::parse_text_align`).
+    pub text_align: Option<String>,
+    /// `mask-image: url(<svg file>)`: the element's background colour is
+    /// painted through the SVG's alpha instead of over its whole box
+    /// (`gpui_app::parse_mask_url`).
+    pub mask_image: Option<String>,
     pub line_height: Option<String>,
     pub cursor: Option<String>,
     pub display: Option<String>,
@@ -207,6 +214,8 @@ impl GpuiStyles {
             "font-weight" | "font_weight" => self.font_weight = Some(v),
             "font-style" | "font_style" => self.font_style = Some(v),
             "text-decoration" | "text_decoration" => self.text_decoration = Some(v),
+            "text-align" | "text_align" => self.text_align = Some(v),
+            "mask-image" | "mask_image" | "-webkit-mask-image" => self.mask_image = Some(v),
             "line-height" | "line_height" => self.line_height = Some(v),
             "cursor" => self.cursor = Some(v),
             "display" => self.display = Some(v),
@@ -375,8 +384,9 @@ pub const INLINE_TEXT_RUNS_ATTRIBUTE: &str = "data-inline-text-runs";
 ///
 /// The properties here are the ones the fused element can state per range
 /// AND that the unfused path already draws, which is what bounds the set:
-/// fusing must change where glyphs land and nothing else. `color` and
-/// `font_weight` are stated by a `HighlightStyle`; the horizontal insets by
+/// fusing must change where glyphs land and nothing else. `color`,
+/// `font_weight` and `font_style` are stated by a `HighlightStyle`; the
+/// horizontal insets by
 /// the inset element (`gpui_app::InsetRunText`), since a highlight cannot
 /// carry a gap. See `fusable_child_text`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +398,9 @@ pub struct InlineTextRun {
     pub color: Option<String>,
     /// The span's `font-weight`, verbatim; the caller parses it.
     pub font_weight: Option<String>,
+    /// The span's `font-style`, verbatim; the caller parses it
+    /// (`gpui_app::parse_font_style`, the parser the unfused path uses).
+    pub font_style: Option<String>,
     /// The span's own `padding-left`, verbatim, carried as a LEADING INSET:
     /// the gap the inset element leaves before the span's text. `None` when
     /// the span declares none. It is only ever `Some` in a context that
@@ -508,21 +521,19 @@ fn fusable_child_text<'a>(context: &RenderNode, child: &'a RenderNode) -> Option
     // (for an inline property, a `HighlightStyle` can), and (2) the UNFUSED
     // path already draws it — otherwise
     // fusing would start drawing something the spans do not draw today, and
-    // it would no longer be a pure layout change. `color` and `font-weight`
-    // pass both; `flex_shrink` is meaningless once there is one element and
-    // so is safe to ignore.
+    // it would no longer be a pure layout change. `color`, `font-weight` and
+    // `font-style` pass both; `flex_shrink` is meaningless once there is one
+    // element and so is safe to ignore.
     //
-    // `font-style` passes (1) and FAILS (2), which is why it is absent
-    // although a `HighlightStyle` carries it. `GpuiStyles` parses and stores
-    // `font-style` (`lib.rs` push_style) but nothing ever applies it: there
-    // is no `italic` anywhere in this shim, so an unfused italic span is
-    // drawn upright today. Fusing it would make the same markup render
-    // italic only when it happens to fuse. The unapplied property is the
-    // defect to fix, and fixing it is what would let `font-style` join this
-    // set; `inline_runs_decline_a_span_with_a_font_style` is the guard until
-    // then. (`letter-spacing` had the same shape -- parsed, reported, never
-    // applied -- and was removed from the parser instead, because `gpui-pre`
-    // has no letter-spacing to apply; see `docs/shim-design.md`.)
+    // `font-style` joined the set once the unfused path learned to draw it
+    // (`apply_styles_to_div`, through `gpui_app::parse_font_style`): before
+    // that it passed (1) and failed (2) -- parsed and reported but never
+    // applied -- and fusing it would have made the same markup render
+    // italic only when it happened to fuse.
+    // `inline_runs_fuse_spans_that_differ_only_in_style` is its guard.
+    // (`letter-spacing` had the same parsed-but-unapplied shape and was
+    // removed from the parser instead, because `gpui-pre` has no
+    // letter-spacing to apply; see `docs/shim-design.md`.)
     //
     // NO BOX PROPERTY MAY BE CARRIED BY A HIGHLIGHT, and `padding_left` is
     // the one to think about, because it is how a caller spaces two text
@@ -561,6 +572,12 @@ fn fusable_child_text<'a>(context: &RenderNode, child: &'a RenderNode) -> Option
     probe.text_color = None;
     probe.flex_shrink = None;
     probe.font_weight = None;
+    probe.font_style = None;
+    // `text-align` aligns a box's lines in its width; a span with no width of
+    // its own is as wide as its text, so its alignment draws nothing and it
+    // fuses as it did before the property was parsed (a sized span still
+    // declines, on its width).
+    probe.text_align = None;
     let pads = [probe.padding_left.take(), probe.padding_right.take()];
     if probe != GpuiStyles::default() {
         return None;
@@ -749,6 +766,7 @@ pub fn inline_chunks(plan: &RenderNode) -> Option<Vec<InlineChunk>> {
                 len: piece.len(),
                 color: styles.text_color.clone(),
                 font_weight: styles.font_weight.clone(),
+                font_style: styles.font_style.clone(),
                 inset_left: styles.padding_left.clone(),
                 inset_right: styles.padding_right.clone(),
             });
@@ -983,6 +1001,7 @@ mod tests {
                     len: 3,
                     color: Some("#569cd6".into()),
                     font_weight: None,
+                    font_style: None,
                     inset_left: None,
                     inset_right: None
                 },
@@ -990,6 +1009,7 @@ mod tests {
                     len: 5,
                     color: Some("#d4d4d4".into()),
                     font_weight: None,
+                    font_style: None,
                     inset_left: None,
                     inset_right: None
                 },
@@ -997,6 +1017,7 @@ mod tests {
                     len: 1,
                     color: Some("#ffd700".into()),
                     font_weight: None,
+                    font_style: None,
                     inset_left: None,
                     inset_right: None
                 },
@@ -1070,20 +1091,23 @@ mod tests {
         assert_eq!(inline_text_runs(&plan), None);
     }
 
-    /// `font-style` is NOT in the fusable set although a `HighlightStyle`
-    /// carries it, because nothing in this shim applies `font-style` to an
-    /// unfused span -- there is no `italic` call anywhere. Fusing it would
-    /// make the same markup render italic only when it happened to fuse,
-    /// which would turn fusing from a layout change into a drawing change.
-    /// When the unfused path learns to draw it, this test is the one to
-    /// revisit, together with the comment in `fusable_child_text`.
+    /// TWO SPANS THAT DIFFER ONLY IN STYLE FUSE, and the style rides along
+    /// on the run, as the weight does. `font-style` joined the fusable set
+    /// when the unfused path learned to draw it (`apply_styles_to_div`); a
+    /// `HighlightStyle` states it per range, so fusing stays a layout change.
+    /// The style is carried verbatim, unset where the span sets none.
     #[test]
-    fn inline_runs_decline_a_span_with_a_font_style() {
+    fn inline_runs_fuse_spans_that_differ_only_in_style() {
+        // `highlighted_row` hands its closure the FIRST span only.
         let plan = highlighted_row(true, &[("let", "#569cd6"), (" x", "#d4d4d4")],
                                    |span| {
             span.styles.insert("font-style".into(), "italic".into());
         });
-        assert_eq!(inline_text_runs(&plan), None);
+        let (text, runs) = inline_text_runs(&plan).expect("must fuse");
+        assert_eq!(text, "let x");
+        assert_eq!(runs[0].font_style, Some("italic".into()));
+        assert_eq!(runs[1].font_style, None, "inherits when unset");
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
     }
 
     /// A span that can be clicked is not just text: fusing it away would
@@ -1574,6 +1598,7 @@ mod tests {
                     len: 1,
                     color: Some("#9cdcfe".into()),
                     font_weight: None,
+                    font_style: None,
                     inset_left: None,
                     inset_right: None,
                 },
@@ -1581,6 +1606,7 @@ mod tests {
                     len: 1,
                     color: Some("#d4d4d4".into()),
                     font_weight: Some("600".into()),
+                    font_style: None,
                     // THE GAP IS KEPT: carried as the value's leading inset.
                     inset_left: Some("7px".into()),
                     inset_right: None,
@@ -1986,6 +2012,33 @@ mod tests {
         );
         let plain = Node::new_element("span");
         assert_eq!(GpuiStyles::from_node(&plain).text_decoration, None);
+    }
+
+    #[test]
+    fn test_styles_mask_image() {
+        // Parsed under the standard and the prefixed spelling (the web
+        // stylesheets state both); an element that names none has none.
+        for key in ["mask-image", "-webkit-mask-image", "mask_image"] {
+            let mut node = Node::new_element("div");
+            node.styles.insert(key.into(), "url(\"/a.svg\")".into());
+            assert_eq!(GpuiStyles::from_node(&node).mask_image.as_deref(), Some("url(\"/a.svg\")"));
+        }
+        assert_eq!(GpuiStyles::from_node(&Node::new_element("div")).mask_image, None);
+    }
+
+    #[test]
+    fn test_styles_text_align() {
+        // A notice's wrapped lines are centred, a column's figures set to
+        // its right (`text-align`); the key is parsed into its own field
+        // under either spelling, and an element that names none has none.
+        let mut node = Node::new_element("span");
+        node.styles.insert("text-align".into(), "center".into());
+        assert_eq!(GpuiStyles::from_node(&node).text_align.as_deref(), Some("center"));
+        let mut mapped = Node::new_element("span");
+        mapped.styles.insert("text_align".into(), "right".into());
+        assert_eq!(GpuiStyles::from_node(&mapped).text_align.as_deref(), Some("right"));
+        let plain = Node::new_element("span");
+        assert_eq!(GpuiStyles::from_node(&plain).text_align, None);
     }
 
     /// `letter-spacing` IS NOT PARSED, because nothing draws it: `gpui-pre`
