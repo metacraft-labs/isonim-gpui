@@ -325,6 +325,46 @@ today; it would take a skewed glyph rasterisation in GPUI's text system.
 `font-style` fuses in inline runs, like `font-weight`: a `HighlightStyle`
 carries it per range (`inline_runs_fuse_spans_that_differ_only_in_style`).
 
+### Font Variant Numeric
+
+`font-variant-numeric` chooses the figures a text's digits take, and the shim
+applies it as the OpenType features the CSS table names for each keyword
+(<https://www.w3.org/TR/css-fonts-4/#font-variant-numeric-prop>):
+`tabular-nums` is `tnum`, `proportional-nums` `pnum`, `lining-nums` `lnum`,
+`oldstyle-nums` `onum`, `diagonal-fractions` `frac`, `stacked-fractions`
+`afrc`, `ordinal` `ordn` and `slashed-zero` `zero`, each switched on in the
+element's text style (`parse_font_variant_numeric` in `gpui_app.rs`).
+`normal` switches all of them off. A value with an unknown word, a word
+twice or two words of one group (`lining-nums oldstyle-nums`) is ignored, as
+a browser ignores an invalid declaration, so the inherited features stay.
+
+`gpui-pre` carries OpenType features per font (`TextStyle.font_features`,
+`FontFeatures`), and its Linux text system hands them to cosmic-text's shaper
+for each face it loads (`gpui-pre-wgpu` `cosmic_text_system.rs`,
+`cosmic_font_features`), so a face without the feature draws as before.
+GPUI's features REPLACE the inherited set instead of adding to it; no other
+property of this shim sets features, so the two cannot disagree today.
+
+Why it matters: a browser sets tabular digits one advance wide, and a
+layout sized by them (a count, a recording button's number, a column of
+ages) is narrower or wider than the same text in proportional figures. Space
+Grotesk's proportional "1" is 416 units of its 1000-unit em and its "0" 641;
+its `tnum` digits are all 620. Before 2026-11-08 the property was not parsed,
+so CodeTracer's Agent Harbor recording buttons were 0.5-2 px off the
+browser's and the active initiative tab cut its title a character early.
+`test_tabular_nums_sets_every_digit_one_advance` (`tests/gpui_rendering.rs`)
+shapes the digits with the platform's real text system and the committed
+Space Grotesk fixture (`tests/fixtures/fonts/`, SIL OFL 1.1): every digit
+must be 62 px at 100 px with the property, and the control without it keeps
+the face's different advances. Without the shim applying the features the
+test fails on the first digit (64.1 px).
+
+A `HighlightStyle` has no font features, so a span that sets the property
+does not fuse into an inline run (`fusable_child_text`); its neighbours
+still fuse with each other
+(`inline_chunks_keep_a_span_with_numeric_figures_own`). A CONTAINER that
+sets it passes it to a fused run like any inherited text style.
+
 ### Dashed Borders
 
 `border-style: dashed` draws the element's border dashed (GPUI's
@@ -360,23 +400,51 @@ reads the laid-out widths back.
 box, which is how a web stylesheet draws a one-colour icon in a theme's ink
 (`background-color: currentColor; mask-image: url(...)`;
 <https://www.w3.org/TR/css-masking-1/#the-mask-image>). The builder adds an
-absolutely positioned GPUI `svg()` child that fills the box and is tinted with
-the colour (`with_mask_image` in `gpui_app.rs`). What it does not do, and why
-none of it matters to its consumers: it masks the background only, not the
-element's children or border; it fills the box (`mask-size: contain`,
-`mask-position: center` when the mask's aspect is the box's); `none`, a
-gradient or several layers leave the background unmasked.
+absolutely positioned child that fills the box and, when painted,
+rasterises the SVG at the box's DEVICE size (GPUI's own resvg rasteriser,
+`SvgRenderer::render_parsed` with an exact size) into a picture of the
+colour whose alpha is the mask's coverage (`mask_picture`), and paints that
+picture one texel per device pixel (`Window::paint_image`, a polychrome
+sprite; `with_mask_image` in `gpui_app.rs`). Pictures are cached per file,
+device size and colour (64, evicted ones released like the `img` cache's).
+What it does not do, and why none of it matters to its consumers: it masks
+the background only, not the element's children or border; it fills the box
+(`mask-size: contain`, `mask-position: center` when the mask's aspect is the
+box's); `none`, a gradient or several layers leave the background unmasked.
 
-Why a mask rather than an `img` of a recoloured SVG: GPUI rasterises an `img`
-SVG at twice its intrinsic size (`SMOOTH_SVG_SCALE_FACTOR`), un-premultiplies
-it, and on a 1x window minifies it with straight-alpha filtering, so the
-transparent black around a shape darkens every antialiased edge. Measured
-2026-11-08 on CodeTracer's "+" (a 1px cross, `#b0b0b0` at 0.7 on a `#333333`
-disc): the browser draws its arms at 94 and its centre at 117; the `img` drew
-64 and 93, the values a premultiplied colour blended as straight alpha gives.
-`svg()` renders the alpha mask at the box's device size, so there is no
-minification. The `img` path keeps the defect for a picture that is not a
-mask; it is GPUI's, not this shim's.
+Why not GPUI's `svg()`, which the shim used until 2026-11-08: it paints a
+MONOCHROME sprite, and GPUI's monochrome-sprite shader is its glyph shader.
+`fs_mono_sprite` (`gpui-pre-wgpu` `shaders.wgsl`) passes every coverage value
+through `apply_contrast_and_gamma_correction`: the text system's light-on-dark
+contrast enhancement (`ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST`, default 1.0,
+scaled by how dark the ink is) and its gamma-1.8 alpha correction
+(`ZED_FONTS_GAMMA`). A browser composites a mask at its linear coverage.
+Measured 2026-11-08 on CodeTracer's "+" (a 1px cross on the half pixel,
+`#b0b0b0` at 0.7 over a `#333333` disc): the browser draws the
+half-covered arm pixels 94 and the three-quarter-covered centre 117, which
+is `51 + 125 x 0.7 x 0.5` and `x 0.75`; `svg()` drew 105 and 121, which is
+that shader's correction of 0.5 and 0.75 to 0.617 and 0.800 for a
+brightness-0.69 ink, to the unit. It was neither the rasterisation scale
+(`svg()` rasterises at twice the device size and its 2:1 bilinear
+minification averages to the exact coverage on axis-aligned edges) nor
+premultiplication. Changing the two environment variables would change every
+glyph the window draws as well, so the mask leaves that pipeline instead.
+
+Why not an `img` of a recoloured SVG either: GPUI rasterises an `img` SVG at
+twice its intrinsic size (`SMOOTH_SVG_SCALE_FACTOR`), un-premultiplies it,
+and on a 1x window minifies it with straight-alpha filtering, so the
+transparent black around a shape darkens every antialiased edge (the same
+"+" drew 64 and 93). The mask picture is rasterised at the device size and
+sampled texel for texel, so there is no minification. The `img` path keeps
+that defect for a picture that is not a mask; it is GPUI's, not this shim's.
+
+`test_mask_picture_is_the_ink_at_linear_coverage` (`gpui_app.rs`) checks
+the picture: the "+" at 12x12 has alpha 128 (+-1, resvg's rounding) on its
+arms and 191 at its centre, where the corrected values would be 157 and
+204. That the picture reaches the window as a polychrome sprite is shown by
+the windows themselves (CodeTracer's CTF-P1b story captures), not by a test
+here: no Linux test path in this repository reads a GPUI frame back short of
+the headless-sway GUI lane.
 
 ### Laid-out Bounds
 
@@ -427,6 +495,7 @@ Required parsers for style values:
 | `parse_float` | "0.5", "1.0" | `f32` |
 | `parse_font_weight` | "bold", "400", "normal" | `FontWeight` enum |
 | `parse_font_style` | "italic", "oblique 10deg", "normal" | `FontStyle` (or `None`: inherit) |
+| `parse_font_variant_numeric` | "tabular-nums", "slashed-zero lining-nums", "normal" | `FontFeatures` (or `None`: inherit) |
 
 ### Pre-Mapped Properties (Nim Side)
 

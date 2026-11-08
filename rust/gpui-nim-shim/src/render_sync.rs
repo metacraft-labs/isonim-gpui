@@ -95,6 +95,10 @@ pub struct GpuiStyles {
     pub font_family: Option<String>,
     pub font_weight: Option<String>,
     pub font_style: Option<String>,
+    /// `font-variant-numeric`: which figures the text's digits take, as
+    /// OpenType features (`tabular-nums` is `tnum`;
+    /// `gpui_app::parse_font_variant_numeric`).
+    pub font_variant_numeric: Option<String>,
     /// `text-decoration`: `underline` underlines the element's text.
     pub text_decoration: Option<String>,
     /// `text-align`: where a text element's lines sit in its box
@@ -213,6 +217,9 @@ impl GpuiStyles {
             "font-family" | "font_family" => self.font_family = Some(v),
             "font-weight" | "font_weight" => self.font_weight = Some(v),
             "font-style" | "font_style" => self.font_style = Some(v),
+            "font-variant-numeric" | "font_variant_numeric" => {
+                self.font_variant_numeric = Some(v)
+            }
             "text-decoration" | "text_decoration" => self.text_decoration = Some(v),
             "text-align" | "text_align" => self.text_align = Some(v),
             "mask-image" | "mask_image" | "-webkit-mask-image" => self.mask_image = Some(v),
@@ -534,6 +541,14 @@ fn fusable_child_text<'a>(context: &RenderNode, child: &'a RenderNode) -> Option
     // (`letter-spacing` had the same parsed-but-unapplied shape and was
     // removed from the parser instead, because `gpui-pre` has no
     // letter-spacing to apply; see `docs/shim-design.md`.)
+    //
+    // `font-variant-numeric` fails (1) and is deliberately NOT blanked: the
+    // unfused path draws it (`apply_styles_to_div` sets the element's
+    // OpenType features), but a `HighlightStyle` has no font features, so
+    // a fused run would draw a `tabular-nums` span's digits proportional.
+    // Such a span keeps its own element, and the spans around it still
+    // fuse with each other.
+    // `inline_chunks_keep_a_span_with_numeric_figures_own` is its guard.
     //
     // NO BOX PROPERTY MAY BE CARRIED BY A HIGHLIGHT, and `padding_left` is
     // the one to think about, because it is how a caller spaces two text
@@ -1108,6 +1123,37 @@ mod tests {
         assert_eq!(runs[0].font_style, Some("italic".into()));
         assert_eq!(runs[1].font_style, None, "inherits when unset");
         assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+    }
+
+    /// A span that asks for tabular figures keeps its own element: a
+    /// `HighlightStyle` carries no OpenType features, so fusing it would
+    /// draw its digits proportional. Its neighbours still fuse.
+    #[test]
+    fn inline_chunks_keep_a_span_with_numeric_figures_own() {
+        let plan = highlighted_row(
+            true,
+            &[("1/4", "#909090"), (" done", "#d4d4d4"), (" today", "#d4d4d4")],
+            |span| {
+                span.styles
+                    .insert("font-variant-numeric".into(), "tabular-nums".into());
+            },
+        );
+        assert_eq!(
+            plan.children[0].styles.font_variant_numeric.as_deref(),
+            Some("tabular-nums"),
+            "the property is parsed onto the span"
+        );
+        assert_eq!(inline_text_runs(&plan), None, "the row no longer fuses end to end");
+        let chunks = inline_chunks(&plan).expect("its neighbours still fuse");
+        assert_eq!(chunks[0], InlineChunk::Own(0));
+        match &chunks[1] {
+            InlineChunk::Fused(run) => {
+                assert_eq!(run.start, 1);
+                assert_eq!(run.text, " done today");
+            }
+            other => panic!("expected the two plain spans fused, got {other:?}"),
+        }
+        assert_eq!(chunks.len(), 2);
     }
 
     /// A span that can be clicked is not just text: fusing it away would

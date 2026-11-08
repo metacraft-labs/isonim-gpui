@@ -181,6 +181,7 @@ const stylePropertyMap = {
   "font-family": "font_family",
   "font-weight": "font_weight",
   "font-style": "font_style",
+  "font-variant-numeric": "font_variant_numeric",  # OpenType figure features (`tnum`)
   "text-align": "text_align",
   "line-height": "line_height",
 

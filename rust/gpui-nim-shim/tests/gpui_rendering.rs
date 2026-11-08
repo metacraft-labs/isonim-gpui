@@ -1453,3 +1453,87 @@ fn test_flex_shrink_factor_is_applied_to_the_layout() {
         assert_eq!(shrunk_widths(cx, ("-2", "1")), (100.0, 100.0));
     });
 }
+
+// ---------------------------------------------------------------------------
+// `font-variant-numeric: tabular-nums` reaches the shaper.
+//
+// WHY A REAL TEXT SYSTEM. `TestAppContext` installs gpui's `NoopTextSystem`,
+// which advances every character by 0.6 em and ignores font features, so
+// a test through it would pass with or without the feature. This one shapes
+// with the platform's own text system (`gpui_platform::current_platform`,
+// headless: on Linux the cosmic-text system the window uses) and the design
+// system's interface face, committed as a fixture beside its licence
+// (`tests/fixtures/fonts/`, SIL OFL 1.1). The face is read from the fixture,
+// not from the host, so the numbers below are the face's: Space Grotesk
+// Regular's proportional digits run from 416 units ("1") to 641 ("0") of
+// its 1000-unit em, and its `tnum` substitutes `*.tf` digits all 620 wide.
+//
+// THE CONTROL is the same element without the property: its digits must
+// keep their different advances, which proves the fixture really is
+// proportional by default and that equal advances come from the feature.
+// ---------------------------------------------------------------------------
+
+/// The advance of each character of `text`, set in the fixture face at
+/// 100 px with the text style that `apply_styles_to_div` gives an element
+/// carrying `styles` -- the font GPUI's text layout would ask for.
+fn digit_advances(styles: &GpuiStyles, text: &str) -> Vec<f32> {
+    use gpui::{Refineable, Styled};
+    const FIXTURE: &[u8] = include_bytes!("fixtures/fonts/SpaceGrotesk-Regular.otf");
+    let platform = gpui_platform::current_platform(true);
+    let text_system = platform.text_system();
+    text_system
+        .add_fonts(vec![std::borrow::Cow::Borrowed(FIXTURE)])
+        .expect("the fixture face loads");
+    let mut el = apply_styles_to_div(div(), styles);
+    let mut style = gpui::TextStyle::default();
+    style.refine(el.text_style());
+    let font = style.font();
+    let font_id = text_system.font_id(&font).expect("the family resolves");
+    let layout = text_system.layout_line(
+        text,
+        gpui::px(100.0),
+        &[gpui::FontRun {
+            len: text.len(),
+            font_id,
+        }],
+    );
+    let mut xs: Vec<(usize, f32)> = layout
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .map(|g| (g.index, f32::from(g.position.x)))
+        .collect();
+    xs.sort_by_key(|(i, _)| *i);
+    assert_eq!(xs.len(), text.chars().count(), "one glyph per character");
+    let mut ends: Vec<f32> = xs.iter().skip(1).map(|(_, x)| *x).collect();
+    ends.push(f32::from(layout.width));
+    xs.iter().zip(ends).map(|((_, x), end)| end - x).collect()
+}
+
+#[test]
+#[serial]
+fn test_tabular_nums_sets_every_digit_one_advance() {
+    let mut styles = GpuiStyles::default();
+    styles.font_family = Some("Space Grotesk".into());
+
+    // CONTROL: proportional by default ("1" 41.6 px, "0" 64.1 px at 100 px).
+    let proportional = digit_advances(&styles, "0123456789");
+    assert!(
+        (proportional[0] - 64.1).abs() < 0.05 && (proportional[1] - 41.6).abs() < 0.05,
+        "control: the fixture face's own digits are proportional, got {proportional:?}"
+    );
+
+    styles.font_variant_numeric = Some("tabular-nums".into());
+    let tabular = digit_advances(&styles, "0123456789");
+    for (digit, advance) in "0123456789".chars().zip(&tabular) {
+        assert!(
+            (advance - 62.0).abs() < 0.05,
+            "with tabular-nums '{digit}' must be the tnum advance 62.0 px, got {advance} \
+             (all: {tabular:?})"
+        );
+    }
+
+    // `proportional-nums` asks for `pnum`, which is the face's default.
+    styles.font_variant_numeric = Some("proportional-nums".into());
+    assert_eq!(digit_advances(&styles, "0123456789"), proportional);
+}
