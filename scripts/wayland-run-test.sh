@@ -396,7 +396,10 @@ export WAYLAND_DISPLAY="$SOCKET"
 # in the runtime directory.
 if [[ "$COMPOSITOR" == "sway" ]]; then
   for _ in {1..50}; do
-    _ipc="$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*."$COMPOSITOR_PID".sock 2>/dev/null | head -1)"
+    # `|| true`: until sway creates the socket the glob does not match and
+    # `ls` fails, which under `set -eo pipefail` would end the script here,
+    # before `cleanup` is installed, leaving the compositor running.
+    _ipc="$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*."$COMPOSITOR_PID".sock 2>/dev/null | head -1 || true)"
     [[ -n "$_ipc" ]] && break
     sleep 0.1
   done
