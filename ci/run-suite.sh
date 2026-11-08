@@ -256,7 +256,18 @@ BENCHMARKS=(
 #     window, after the same sample's state dispatch) and `lib.rs`'s C-ABI
 #     round trip of it.
 #   * window-environment 17 -> 22: `onWindowActivated`'s five cases.
-EXPECTED_CASES=382
+# 2026-11-08, written LAST and from a run (trap 4c), at `c374ad4`: 399.
+#   * THE LANE WAS RED BY DRIFT AGAIN: four commits added default-build Rust
+#     cases without moving this figure. rust 217 -> 234, every other
+#     subject unchanged:
+#       `d903afa` +1  (`render_sync`: a container that spaces its children)
+#       `b2958f8` +13 (`render_sync`: +15 / -2, fused padded spans)
+#       `fbce43d` +1  (`layout_bounds`: the laid-out bounds read-back)
+#       `c374ad4` +2  (`render_sync`: pictures, italic, text-align, masks)
+#     The same commits' `gpui_app.rs` and `tests/gpui_rendering.rs` cases
+#     are `gpui-backend` / `gpui-headless` only, so they are counted by the
+#     `--with-gpui` arms, not here.
+EXPECTED_CASES=399
 
 total_cases=0
 failed_steps=()
