@@ -256,7 +256,16 @@ BENCHMARKS=(
 #     window, after the same sample's state dispatch) and `lib.rs`'s C-ABI
 #     round trip of it.
 #   * window-environment 17 -> 22: `onWindowActivated`'s five cases.
-EXPECTED_CASES=382
+# 2026-11-09, written LAST and from a run (trap 4c), at `de9d6e4` with the
+# whole-subtree snapshot (`gpui_snapshot_tree`) uncommitted: 401.
+#   * THE LANE WAS ALREADY RED BY DRIFT at `de9d6e4` unmodified: `cargo test`
+#     passed 235 Rust cases there (measured in a clean worktree), where the
+#     figure above counted 217, so the lane read 400 against 382.
+#   * 400 -> 401 is this change: `lib.rs`'s
+#     `test_snapshot_tree_preorder_with_attributes` (+1). `test_bindings`
+#     stays one checkpoint (it covers the two new bindings) and
+#     `test_renderer`'s snapshot checks sit in its tree-operations block.
+EXPECTED_CASES=401
 
 total_cases=0
 failed_steps=()
