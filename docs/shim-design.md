@@ -493,11 +493,14 @@ the headless-sway GUI lane.
 The shadow tree and the render plan say what an element is; where the window
 put it is GPUI's layout, computed after the plan is handed over. An element
 that carries the attribute `data-layout-probe` gets one more child, an
-absolutely positioned full-size `canvas` that paints nothing and records the
-element's padding box in window coordinates during prepaint (an absolute child
-takes no part in the flex layout, so the probe does not move what it
-measures). `gpui_layout_bounds(node, out)` (Nim: `renderer.layoutBounds`)
-reads the latest frame's bounds back; `gpui_layout_bounds_reset` forgets
+absolutely positioned full-size `canvas` that paints nothing and, during
+prepaint, records the element's BORDER box in window coordinates (an absolute
+child takes no part in the flex layout, so the probe does not move what it
+measures). The canvas is laid out over the padding box, its containing block;
+the element's own border widths are added back on each side, so the probe
+reports what a browser's `getBoundingClientRect` does and a bordered element
+compares with a browser's measurement of it. `gpui_layout_bounds(node, out)`
+(Nim: `renderer.layoutBounds`) reads the latest frame's bounds back; `gpui_layout_bounds_reset` forgets
 them. Without the GPUI backend nothing is laid out and every read answers 0.
 The store is `layout_bounds.rs`, feature-less like `input` and
 `frame_stats`, so the exported symbol set does not depend on the features.

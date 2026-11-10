@@ -28,6 +28,11 @@
 ##     strokes such a border itself (`gpui_app::border_stroke`);
 ##   * a row's `padding-left` moves its first child in by exactly that much,
 ##     and a `flex-grow` child fills the row to its right edge;
+##   * a LAYOUT PROBE (`data-layout-probe`, read by `gpui_layout_bounds`)
+##     reports an element's BORDER box, as a browser's
+##     `getBoundingClientRect` does: the 3px-bordered box reads its whole
+##     200×120 at the window's corner, and the box bordered on its left only
+##     its whole 120×80, not the padding box inside the border;
 ##   * the host's TICK (`gpui_set_tick`) runs on the loop's own thread, at its
 ##     interval, and stops the moment the host disarms it from inside the
 ##     callback (it ticks `TickLimit` times and never again, although the
@@ -88,6 +93,10 @@ var
     ## What the box's listeners were handed, in order.
   wheelDy: seq[float]
     ## Each wheel event's vertical delta, in pixels.
+  probedBox, probedSide: GpuiElement
+    ## The two bordered boxes the layout probe measures.
+  boxBounds, sideBounds: array[4, float64]
+  boxProbed, sideProbed = false
 
 proc readPpm(path: string): Frame =
   let raw = readFile(path)
@@ -149,6 +158,8 @@ proc buildScene(root: GpuiElement) {.cdecl.} =
   r.setStyle(quad, "background-color", QuadColor)
   r.appendChild(box, quad)
   r.appendChild(root, box)
+  r.setAttribute(box, "data-layout-probe", "box")
+  probedBox = box
 
   let side = r.createElement("div")
   r.setStyle(side, "background-color", BoxBg)
@@ -157,6 +168,8 @@ proc buildScene(root: GpuiElement) {.cdecl.} =
   r.setStyle(side, "border-left-width", $BorderPx & "px")
   r.setStyle(side, "border-color", BorderColor)
   r.appendChild(root, side)
+  r.setAttribute(side, "data-layout-probe", "side")
+  probedSide = side
 
   # A ROW with a left padding, a fixed child and a GROWING child: the
   # padding moves the first child in, and the grower fills the row to its
@@ -203,6 +216,11 @@ proc onTick() {.cdecl.} =
   inc tickCount
   if getThreadId() != launchThread:
     inc tickOffThread
+  # Laid out by the first frame; read on the loop's thread, as a host does.
+  if not boxProbed:
+    boxProbed = gpui_layout_bounds(probedBox, addr boxBounds) == 1
+  if not sideProbed:
+    sideProbed = gpui_layout_bounds(probedSide, addr sideBounds) == 1
   if tickCount == TickLimit:
     gpui_set_tick(0, nil)
 
@@ -401,6 +419,12 @@ suite "the window draws what the plan carries: borders, weight, placement, point
         check outer == (255, 0, 255)
         check half[0] == 255 and half[2] == 255 and half[1] in 80 .. 180
         check inside == (255, 255, 255)
+
+    # ---- the layout probe: the border box, as getBoundingClientRect --------
+    echo &"    probed box {boxBounds} ({boxProbed}), side box {sideBounds} ({sideProbed})"
+    check boxProbed and sideProbed
+    check boxBounds == [0.0, 0.0, float64(BoxW), float64(BoxH)]
+    check sideBounds == [0.0, float64(sideTop), float64(SideBoxW), float64(SideBoxH)]
 
     # ---- the tick: on the loop's thread, at its interval, disarmable -------
     echo &"    ticks {tickCount} (limit {TickLimit}) over {openMs} ms open; " &

@@ -1053,28 +1053,36 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
 
 /// An element that declares `data-layout-probe` gets one more child: an
 /// absolutely positioned, full-size `canvas` that paints nothing and, during
-/// prepaint, records its bounds -- the element's padding box, in window
-/// coordinates -- into `layout_bounds` (read back by `gpui_layout_bounds`;
-/// that module says why and what exactly is measured). An absolute child is
-/// outside its parent's flex layout, so the probe does not move what it
-/// measures. Every other element is returned unchanged.
+/// prepaint, records its bounds into `layout_bounds` (read back by
+/// `gpui_layout_bounds`; that module says why and what exactly is measured).
+/// An absolute child is outside its parent's flex layout, so the probe does
+/// not move what it measures. What the canvas is laid out over is the
+/// element's PADDING box (an absolute child's containing block); the
+/// element's own border widths, from its styles, are added back on each
+/// side, so what is recorded is its BORDER box, the box a browser's
+/// `getBoundingClientRect` reports. Every other element is returned
+/// unchanged.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 fn with_layout_probe(el: Div, plan: &crate::render_sync::RenderNode) -> Div {
     if !crate::layout_bounds::wants_probe(&plan.attributes) {
         return el;
     }
     let node_id = plan.node_id;
+    let [top, right, bottom, left] = border_side_widths(&plan.styles).map(|w| w.unwrap_or(0.0));
     el.child(
         canvas(
             move |bounds, _window, _cx| {
                 crate::layout_bounds::record(
                     node_id,
-                    crate::layout_bounds::LaidOut {
-                        x: f32::from(bounds.origin.x),
-                        y: f32::from(bounds.origin.y),
-                        w: f32::from(bounds.size.width),
-                        h: f32::from(bounds.size.height),
-                    },
+                    crate::layout_bounds::border_box_of(
+                        crate::layout_bounds::LaidOut {
+                            x: f32::from(bounds.origin.x),
+                            y: f32::from(bounds.origin.y),
+                            w: f32::from(bounds.size.width),
+                            h: f32::from(bounds.size.height),
+                        },
+                        [top, right, bottom, left],
+                    ),
                 );
             },
             |_, _, _, _| {},
@@ -2148,14 +2156,7 @@ pub fn apply_styles_to_div(
     // window showed neither. A width applies to every side unless a per-side
     // width names that side; a width without a colour draws in GPUI's
     // default border colour.
-    let all_sides = styles.border_width.as_deref().and_then(parse_px);
-    let side = |s: &Option<String>| s.as_deref().and_then(parse_px).or(all_sides);
-    let widths = [
-        side(&styles.border_top_width),
-        side(&styles.border_right_width),
-        side(&styles.border_bottom_width),
-        side(&styles.border_left_width),
-    ];
+    let widths = border_side_widths(styles);
     if widths.iter().any(|w| w.is_some()) {
         let st = el.style();
         if let Some(v) = widths[0] {
@@ -2365,6 +2366,20 @@ pub fn parse_mask_url(s: &str) -> Option<&str> {
     Some(path)
 }
 
+/// The border width `styles` asks for on each side -- top, right, bottom,
+/// left -- in logical pixels: a per-side width (`border-bottom-width`) where
+/// one names that side, else `border-width`, else none.
+pub fn border_side_widths(styles: &crate::render_sync::GpuiStyles) -> [Option<f32>; 4] {
+    let all_sides = styles.border_width.as_deref().and_then(parse_px);
+    let side = |s: &Option<String>| s.as_deref().and_then(parse_px).or(all_sides);
+    [
+        side(&styles.border_top_width),
+        side(&styles.border_right_width),
+        side(&styles.border_bottom_width),
+        side(&styles.border_left_width),
+    ]
+}
+
 /// A border the shim strokes itself (`with_border_stroke`), in place of
 /// GPUI's quad border.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2387,14 +2402,7 @@ pub fn border_stroke(styles: &crate::render_sync::GpuiStyles) -> Option<BorderSt
     if styles.border_style.as_deref().map(str::trim) == Some("dashed") {
         return None;
     }
-    let all_sides = styles.border_width.as_deref().and_then(parse_px);
-    let side = |s: &Option<String>| s.as_deref().and_then(parse_px).or(all_sides);
-    let widths = [
-        side(&styles.border_top_width),
-        side(&styles.border_right_width),
-        side(&styles.border_bottom_width),
-        side(&styles.border_left_width),
-    ];
+    let widths = border_side_widths(styles);
     let width = widths[0]?;
     if widths.iter().any(|w| *w != Some(width)) || !(width > 0.0) || !width.is_finite() {
         return None;

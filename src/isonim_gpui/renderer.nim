@@ -567,8 +567,9 @@ const LayoutProbeAttribute* = "data-layout-probe"
 
 proc layoutBounds*(node: GpuiElement;
                    x, y, w, h: var float): bool =
-  ## Where the window last laid `node` out (its padding box, window
-  ## coordinates, logical pixels), read off GPUI's own layout. False -- and
+  ## Where the window last laid `node` out (its border box, as a browser's
+  ## `getBoundingClientRect` reports it; window coordinates, logical
+  ## pixels), read off GPUI's own layout. False -- and
   ## the outputs untouched -- for a node that does not carry
   ## `LayoutProbeAttribute`, that no frame has laid out yet, or in a build
   ## without the GPUI backend. See the shim's `layout_bounds` module.
