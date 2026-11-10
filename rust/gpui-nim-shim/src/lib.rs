@@ -1699,6 +1699,7 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(font_weight, "font_weight");
         push_style!(font_style, "font_style");
         push_style!(font_variant_numeric, "font_variant_numeric");
+        push_style!(letter_spacing, "letter_spacing");
         push_style!(text_decoration, "text_decoration");
         push_style!(text_align, "text_align");
         push_style!(mask_image, "mask_image");

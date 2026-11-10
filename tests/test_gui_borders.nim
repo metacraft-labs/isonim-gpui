@@ -21,6 +21,11 @@
 ##     delivers `mousedown`, `mousemove` and `mouseup` to the box's listeners
 ##     with the window position (`pointerOf`), and a wheel turned two
 ##     notches arrives as a `wheel` event with its delta;
+##   * a box with a FRACTIONAL border (1.5px) is framed by a border of that
+##     width: a fully covered outer pixel and a half covered one inside it
+##     on each side, where GPUI's own quad drew one pixel (it snaps a
+##     border to whole device pixels, rounding half toward zero); the shim
+##     strokes such a border itself (`gpui_app::border_stroke`);
 ##   * a row's `padding-left` moves its first child in by exactly that much,
 ##     and a `flex-grow` child fills the row to its right edge;
 ##   * the host's TICK (`gpui_set_tick`) runs on the loop's own thread, at its
@@ -54,6 +59,9 @@ const
   QuadW = 60
   QuadH = 40
   RowW = 300
+  FracBoxPx = 40
+  FracColor = "#ff00ff"
+  FracBorder = "1.5px"
   RowPadPx = 20
   RowFixedW = 30
 
@@ -180,6 +188,16 @@ proc buildScene(root: GpuiElement) {.cdecl.} =
     r.setAttribute(label, "data-weight", weight)
     r.appendChild(label, r.createTextNode(LabelText))
     r.appendChild(root, label)
+
+  # A FRACTIONAL border on the window's white, last in the column so it
+  # moves nothing above it.
+  let frac = r.createElement("div")
+  r.setStyle(frac, "width", $FracBoxPx & "px")
+  r.setStyle(frac, "height", $FracBoxPx & "px")
+  r.setStyle(frac, "flex-shrink", "0")
+  r.setStyle(frac, "border-width", FracBorder)
+  r.setStyle(frac, "border-color", FracColor)
+  r.appendChild(root, frac)
 
 proc onTick() {.cdecl.} =
   inc tickCount
@@ -354,6 +372,35 @@ suite "the window draws what the plan carries: borders, weight, placement, point
       check f.rgbAt(RowPadPx + RowFixedW, rowY) == (0, 255, 0)
       check f.rgbAt(RowW - 1, rowY) == (0, 255, 0)          # grown to the edge
       check f.rgbAt(RowW, rowY) == (255, 255, 255)
+
+    # ---- a fractional border: 1.5px, not snapped to 1px ---------------------
+    # The box's fully covered border pixels are exactly the colour; the
+    # pixel inside each of them is half covered (its green channel about
+    # half way between the colour's 0 and the window's 255), and the next
+    # one in is the window's white. A 1px border leaves that pixel white.
+    var fx0 = int.high
+    var fy0 = int.high
+    var fx1 = -1
+    var fy1 = -1
+    for y in 0 ..< f.h:
+      for x in 0 ..< f.w:
+        if f.rgbAt(x, y) == (255, 0, 255):
+          fx0 = min(fx0, x); fx1 = max(fx1, x)
+          fy0 = min(fy0, y); fy1 = max(fy1, y)
+    echo &"    fractional-border box ({fx0},{fy0})-({fx1},{fy1})"
+    check fx1 - fx0 + 1 == FracBoxPx and fy1 - fy0 + 1 == FracBoxPx
+    if fx1 > fx0 and fy1 > fy0:
+      let my = (fy0 + fy1) div 2
+      let mx = (fx0 + fx1) div 2
+      let edges = [(f.rgbAt(fx0, my), f.rgbAt(fx0 + 1, my), f.rgbAt(fx0 + 2, my)),
+                   (f.rgbAt(fx1, my), f.rgbAt(fx1 - 1, my), f.rgbAt(fx1 - 2, my)),
+                   (f.rgbAt(mx, fy0), f.rgbAt(mx, fy0 + 1), f.rgbAt(mx, fy0 + 2)),
+                   (f.rgbAt(mx, fy1), f.rgbAt(mx, fy1 - 1), f.rgbAt(mx, fy1 - 2))]
+      echo &"    its edges (outer, half, inside): {edges}"
+      for (outer, half, inside) in edges:
+        check outer == (255, 0, 255)
+        check half[0] == 255 and half[2] == 255 and half[1] in 80 .. 180
+        check inside == (255, 255, 255)
 
     # ---- the tick: on the loop's thread, at its interval, disarmable -------
     echo &"    ticks {tickCount} (limit {TickLimit}) over {openMs} ms open; " &

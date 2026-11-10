@@ -182,6 +182,7 @@ const stylePropertyMap = {
   "font-weight": "font_weight",
   "font-style": "font_style",
   "font-variant-numeric": "font_variant_numeric",  # OpenType figure features (`tnum`)
+  "letter-spacing": "letter_spacing",  # space after each character (`SpacedText`)
   "text-align": "text_align",
   "line-height": "line_height",
 

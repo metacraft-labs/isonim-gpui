@@ -284,9 +284,51 @@ but the window ignores lets a plan-level assertion pass on a wrong frame.
 
 A property the shim cannot draw is not parsed: it falls through to the
 unknown-property arm and is ignored like any other unsupported CSS.
-`letter-spacing` is one — `gpui-pre` has no letter-spacing, and the shim
-does not space glyphs itself. Adding a property to the parser and the dump
-belongs in the same change that makes the element builder apply it.
+Adding a property to the parser and the dump belongs in the same change that
+makes the element builder apply it. `letter-spacing` was one until
+2026-11-10: `gpui-pre` has no letter-spacing, and the shim did not space
+glyphs; it is parsed again now that the shim sets spaced text itself
+(Letter Spacing, below).
+
+### Letter Spacing
+
+`letter-spacing` adds a length (`px`, or `em` of the font size; `normal` is
+none) after every character of the text the element draws itself
+(<https://www.w3.org/TR/css-text-3/#letter-spacing-property>). `gpui-pre`
+0.3.5's `TextStyle` and `TextRun` have no such field, so the shim draws such a
+text with its own element, `SpacedText` (`gpui_app.rs`): it shapes the line
+with GPUI's text system in the inherited text style, moves each glyph right by
+the spacing of the characters before it (`letter_spaced_xs`), paints the
+glyphs with `Window::paint_glyph` on the baseline GPUI's own `paint_line`
+uses, and is as wide as the spaced line, the last character's spacing
+included, as a browser lays it out. It is meant for short labels and has
+limits a consumer must know: it sets one line, never wraps and never elides
+(a line longer than its box is clipped, not cut with "…"); it draws no
+underline or strikethrough; the spacing applies to the element's own text
+nodes, not to element children (GPUI's inherited text style cannot carry
+it); and a span that sets it never fuses into an inline run, since a
+highlight cannot space glyphs. Measured 2026-11-10 against codetracer's
+CTF-P1b views: the uppercase section titles came out 3 to 7 px narrower than
+the browser's (`SESSIONS` 55 against 58 px) before, the spacing at 0.03125em
+being 0.375 px per character at 12 px.
+
+### Fractional Borders
+
+GPUI lays a border out at the width it is given but paints a quad's border
+snapped to whole device pixels, rounding half toward zero
+(`Window::paint_quad` -> `snap_border_widths` -> `round_stroke_to_device_pixel`
+in `gpui-pre` 0.3.5 `window.rs` / `util.rs`): a 1.5px border was drawn 1px
+wide on a scale-1 display, where a browser draws a fully covered pixel and a
+half covered one. For a SOLID border of one FRACTIONAL width on all four sides
+with one corner radius (`border_stroke`), the element keeps its border widths
+(its layout is unchanged) but GPUI is given no border colour, and an
+absolutely positioned child covering the border box strokes the border as an
+antialiased path of the exact width along the box inset by half the width,
+its corners the border's middle radius (`with_border_stroke`,
+`border_stroke_centre`). Whole widths, dashed borders, per-side widths that
+differ and per-corner radii stay GPUI's quad. `tests/test_gui_borders.nim`
+reads a real window's pixels: a 1.5px border's inner pixel is half covered
+(127 of 255 on white), where the quad left it white.
 
 ### Text Align
 
@@ -496,6 +538,7 @@ Required parsers for style values:
 | `parse_font_weight` | "bold", "400", "normal" | `FontWeight` enum |
 | `parse_font_style` | "italic", "oblique 10deg", "normal" | `FontStyle` (or `None`: inherit) |
 | `parse_font_variant_numeric` | "tabular-nums", "slashed-zero lining-nums", "normal" | `FontFeatures` (or `None`: inherit) |
+| `parse_letter_spacing` | "2px", "0.03125em", "normal", "0" | `LetterSpacing` (or `None`: ignored) |
 
 ### Pre-Mapped Properties (Nim Side)
 

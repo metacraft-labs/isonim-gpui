@@ -99,6 +99,11 @@ pub struct GpuiStyles {
     /// OpenType features (`tabular-nums` is `tnum`;
     /// `gpui_app::parse_font_variant_numeric`).
     pub font_variant_numeric: Option<String>,
+    /// `letter-spacing`: the space added after every character of the text
+    /// the element draws itself (a length, `px` or `em`;
+    /// `gpui_app::parse_letter_spacing`), set by `gpui_app::SpacedText`
+    /// because GPUI's text styles have no such property.
+    pub letter_spacing: Option<String>,
     /// `text-decoration`: `underline` underlines the element's text.
     pub text_decoration: Option<String>,
     /// `text-align`: where a text element's lines sit in its box
@@ -220,6 +225,7 @@ impl GpuiStyles {
             "font-variant-numeric" | "font_variant_numeric" => {
                 self.font_variant_numeric = Some(v)
             }
+            "letter-spacing" | "letter_spacing" => self.letter_spacing = Some(v),
             "text-decoration" | "text_decoration" => self.text_decoration = Some(v),
             "text-align" | "text_align" => self.text_align = Some(v),
             "mask-image" | "mask_image" | "-webkit-mask-image" => self.mask_image = Some(v),
@@ -539,8 +545,10 @@ fn fusable_child_text<'a>(context: &RenderNode, child: &'a RenderNode) -> Option
     // italic only when it happened to fuse.
     // `inline_runs_fuse_spans_that_differ_only_in_style` is its guard.
     // (`letter-spacing` had the same parsed-but-unapplied shape and was
-    // removed from the parser instead, because `gpui-pre` has no
-    // letter-spacing to apply; see `docs/shim-design.md`.)
+    // removed from the parser, because `gpui-pre` has no letter-spacing to
+    // apply; it is parsed again now that the shim draws it itself,
+    // `gpui_app::SpacedText`. It is not blanked: a `HighlightStyle` cannot
+    // space glyphs, so a span that sets it keeps its own element.)
     //
     // `font-variant-numeric` fails (1) and is deliberately NOT blanked: the
     // unfused path draws it (`apply_styles_to_div` sets the element's
@@ -1151,6 +1159,29 @@ mod tests {
                 assert_eq!(run.start, 1);
                 assert_eq!(run.text, " done today");
             }
+            other => panic!("expected the two plain spans fused, got {other:?}"),
+        }
+        assert_eq!(chunks.len(), 2);
+    }
+
+    /// A letter-spaced span keeps its own element: a `HighlightStyle` cannot
+    /// space glyphs, so fusing it would draw it unspaced
+    /// (`gpui_app::SpacedText` draws it on its own). Its neighbours still
+    /// fuse.
+    #[test]
+    fn inline_chunks_keep_a_letter_spaced_span_own() {
+        let plan = highlighted_row(
+            true,
+            &[("CURRENT", "#909090"), (" Data", "#d4d4d4"), (" model", "#d4d4d4")],
+            |span| {
+                span.styles.insert("letter-spacing".into(), "0.03125em".into());
+            },
+        );
+        assert_eq!(plan.children[0].styles.letter_spacing.as_deref(), Some("0.03125em"));
+        let chunks = inline_chunks(&plan).expect("its neighbours still fuse");
+        assert_eq!(chunks[0], InlineChunk::Own(0));
+        match &chunks[1] {
+            InlineChunk::Fused(run) => assert_eq!(run.text, " Data model"),
             other => panic!("expected the two plain spans fused, got {other:?}"),
         }
         assert_eq!(chunks.len(), 2);
@@ -2087,33 +2118,27 @@ mod tests {
         assert_eq!(GpuiStyles::from_node(&plain).text_align, None);
     }
 
-    /// `letter-spacing` IS NOT PARSED, because nothing draws it: `gpui-pre`
-    /// 0.3.5 has no letter-spacing, and no element builder in this shim
-    /// spaces glyphs by hand. A property the shim records but never applies
-    /// makes the render plan disagree with the window, so it falls through to
-    /// the unknown-property arm instead (`docs/shim-design.md`, "Only drawn
-    /// properties are parsed"; issue
+    /// `letter-spacing` IS RECORDED, in both spellings, because the shim
+    /// now draws it (`gpui_app::SpacedText`, which sets the element's own
+    /// text glyph by glyph with the spacing added after each character).
+    /// Until 2026-11-10 it fell through to the unknown-property arm, since
+    /// `gpui-pre` 0.3.5 has no letter-spacing and nothing in the shim spaced
+    /// glyphs by hand (issue
     /// `2026-10-17-letter-spacing-is-parsed-and-reported-but-never-applied.md`).
-    ///
-    /// Compared against the DEFAULT rather than a named field, so the test
-    /// also fails if the value were stored under any other field. Both
-    /// spellings the parser used to accept are checked.
     #[test]
-    fn test_styles_letter_spacing_is_not_recorded() {
+    fn test_styles_letter_spacing_is_recorded() {
         for key in ["letter-spacing", "letter_spacing"] {
             let mut node = Node::new_element("span");
-            node.styles.insert(key.into(), "2px".into());
+            node.styles.insert(key.into(), "0.03125em".into());
             assert_eq!(
-                GpuiStyles::from_node(&node),
-                GpuiStyles::default(),
-                "`{key}` must be ignored as unknown, not recorded"
+                GpuiStyles::from_node(&node).letter_spacing.as_deref(),
+                Some("0.03125em"),
+                "`{key}` must be recorded"
             );
         }
-        // Positive control: a property the shim does draw on the same node
-        // shape is recorded, so the comparison above can fail.
-        let mut drawn = Node::new_element("span");
-        drawn.styles.insert("line-height".into(), "20px".into());
-        assert_ne!(GpuiStyles::from_node(&drawn), GpuiStyles::default());
+        // Control: a node without it records nothing.
+        let plain = Node::new_element("span");
+        assert_eq!(GpuiStyles::from_node(&plain).letter_spacing, None);
     }
 
     #[test]
@@ -3296,31 +3321,27 @@ mod integration_tests {
         }
     }
 
-    /// **The plan does not report `letter-spacing`**, because the window does
-    /// not draw it (issue
+    /// **The plan reports `letter-spacing`**, because the window now draws it
+    /// (`gpui_app::SpacedText`): the plan and the pixels agree again, which
+    /// is what the issue that removed it from the plan asked for (issue
     /// `2026-10-17-letter-spacing-is-parsed-and-reported-but-never-applied.md`).
-    /// A plan that lists a property as set while the pixels ignore it lets a
-    /// plan-level assertion pass on a frame that is wrong. `line-height`, set
-    /// on the same node, is the positive control: it is drawn, so it is
-    /// reported, which shows the `styles` object is being populated at all.
     #[test]
     #[serial]
-    fn test_render_plan_does_not_report_letter_spacing() {
+    fn test_render_plan_reports_letter_spacing() {
         unsafe {
             gpui_reset_tree();
             for key in ["letter-spacing", "letter_spacing"] {
                 let node = gpui_create_element(c("span").as_ptr());
                 gpui_set_style(node, c(key).as_ptr(), c("2px").as_ptr());
-                gpui_set_style(node, c("line-height").as_ptr(), c("20px").as_ptr());
                 let json = get_plan_json(node);
-                assert_eq!(json["styles"]["line_height"], "20px");
-                assert!(
-                    json["styles"].get("letter_spacing").is_none(),
-                    "`{key}` must not appear in the plan: {}",
-                    json["styles"]
-                );
+                assert_eq!(json["styles"]["letter_spacing"], "2px", "`{key}`");
                 gpui_destroy_element(node);
             }
+            // Control: a span without it reports none.
+            let node = gpui_create_element(c("span").as_ptr());
+            let json = get_plan_json(node);
+            assert!(json["styles"].get("letter_spacing").is_none());
+            gpui_destroy_element(node);
         }
     }
 

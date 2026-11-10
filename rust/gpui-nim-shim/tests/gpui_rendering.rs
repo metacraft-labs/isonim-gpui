@@ -1537,3 +1537,112 @@ fn test_tabular_nums_sets_every_digit_one_advance() {
     styles.font_variant_numeric = Some("proportional-nums".into());
     assert_eq!(digit_advances(&styles, "0123456789"), proportional);
 }
+
+// ---------------------------------------------------------------------------
+// `letter-spacing` is drawn: the shim sets the element's own text glyph by
+// glyph (`SpacedText`), the space added after every character.
+// ---------------------------------------------------------------------------
+
+/// A span (`font-size: 10px`, `letter-spacing` as given) holding `text`, in
+/// a wrapper the size of its content.
+fn spaced_plan(text: &str, spacing: Option<&str>) -> RenderNode {
+    use gpui_nim_shim::tree::Tree;
+    let mut tree = Tree::new();
+    let mut span = Node::new_element("span");
+    span.styles.insert("font-size".into(), "10px".into());
+    span.styles.insert("white-space".into(), "nowrap".into());
+    if let Some(s) = spacing {
+        span.styles.insert("letter-spacing".into(), s.into());
+    }
+    let span_id = tree.insert(span);
+    let text_id = tree.insert(Node::new_text(text));
+    tree.append_child(span_id, text_id);
+    build_render_plan(&tree, span_id).expect("plan")
+}
+
+/// THE ELEMENT IS AS WIDE AS THE SPACED LINE, through the plan path the
+/// window takes (`render_plan_to_gpui`). `TestAppContext`'s text system
+/// advances every character 0.6 em (6px at 10px), so "ABCD" is 24px and
+/// each character adds the spacing after itself: 2px makes 32, 0.25em
+/// (2.5px) makes 34. Without the shim's spacing the label stays 24px, which
+/// is how CodeTracer's uppercase titles came out 3-7px narrower than the
+/// browser's.
+#[test]
+#[serial]
+fn test_letter_spacing_widens_the_text_by_the_spacing_of_every_character() {
+    run_gpui_test(
+        "test_letter_spacing_widens_the_text_by_the_spacing_of_every_character",
+        |cx| {
+            assert_eq!(chip_width(cx, spaced_plan("ABCD", None)), 24.0, "control: unspaced");
+            assert_eq!(chip_width(cx, spaced_plan("ABCD", Some("normal"))), 24.0);
+            assert_eq!(chip_width(cx, spaced_plan("ABCD", Some("2px"))), 32.0);
+            assert_eq!(chip_width(cx, spaced_plan("ABCD", Some("0.25em"))), 34.0);
+            // An invalid value draws nothing, as a browser ignores it.
+            assert_eq!(chip_width(cx, spaced_plan("ABCD", Some("wide"))), 24.0);
+        },
+    );
+}
+
+/// WHERE THE GLYPHS LAND, shaped by the platform's own text system with the
+/// committed Space Grotesk fixture (see `digit_advances` for why a real
+/// text system and this face). "SESSIONS" at 12px with the design system's
+/// `letter-spacing: 0.03125em` (0.375px): every glyph moves right by 0.375px
+/// per character before it, and the line is 3px (8 x 0.375) wider -- the
+/// difference measured between the browser's 58px label and GPUI's 55px
+/// before the shim drew the property.
+#[test]
+#[serial]
+fn test_letter_spaced_glyphs_move_by_the_spacing_of_the_characters_before_them() {
+    use gpui::{Refineable, Styled};
+    use gpui_nim_shim::gpui_app::{letter_spaced_xs, parse_letter_spacing};
+    const FIXTURE: &[u8] = include_bytes!("fixtures/fonts/SpaceGrotesk-Regular.otf");
+    let platform = gpui_platform::current_platform(true);
+    let text_system = platform.text_system();
+    text_system
+        .add_fonts(vec![std::borrow::Cow::Borrowed(FIXTURE)])
+        .expect("the fixture face loads");
+    let mut styles = GpuiStyles::default();
+    styles.font_family = Some("Space Grotesk".into());
+    let mut el = apply_styles_to_div(div(), &styles);
+    let mut style = gpui::TextStyle::default();
+    style.refine(el.text_style());
+    let font_id = text_system.font_id(&style.font()).expect("the family resolves");
+    let text = "SESSIONS";
+    let layout = text_system.layout_line(
+        text,
+        gpui::px(12.0),
+        &[gpui::FontRun {
+            len: text.len(),
+            font_id,
+        }],
+    );
+    let natural: Vec<f32> = layout
+        .runs
+        .iter()
+        .flat_map(|r| r.glyphs.iter())
+        .map(|g| f32::from(g.position.x))
+        .collect();
+    assert_eq!(natural.len(), text.len(), "one glyph per capital");
+
+    // CONTROL: no spacing leaves every glyph where the shaper put it.
+    let (xs0, w0) = letter_spaced_xs(&layout, text, 0.0);
+    assert_eq!(xs0, natural);
+    assert_eq!(w0, f32::from(layout.width));
+
+    let spacing = parse_letter_spacing("0.03125em").expect("parses").to_px(12.0);
+    assert_eq!(spacing, 0.375);
+    let (xs, width) = letter_spaced_xs(&layout, text, spacing);
+    for (k, (x, n)) in xs.iter().zip(&natural).enumerate() {
+        assert!(
+            (x - (n + k as f32 * 0.375)).abs() < 1e-4,
+            "glyph {k} ('{}') at {x}, expected {} + {k} x 0.375",
+            &text[k..k + 1],
+            n
+        );
+    }
+    assert!(
+        (width - (f32::from(layout.width) + 3.0)).abs() < 1e-4,
+        "the spaced line is 3px wider: {width} against {}",
+        f32::from(layout.width)
+    );
+}
