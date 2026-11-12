@@ -125,7 +125,8 @@ import ct_test_nim_unittest
 type
   GpuiTestSpec = object
     ## One entry per runnable test file. ``source`` is the repo-relative
-    ## ``.nim`` path; ``binary`` is the ``build/test-bin/<stem>`` output.
+    ## ``.nim`` path; ``binary`` is the ``build/test-bin/<stem>`` output
+    ## (``<stem>.exe`` on Windows, see ``testBinaryExt``).
     ## ``consumesIsonim`` marks the CONSUMER tests that ``import isonim/…``
     ## (they need the SC-11 ``isonim`` + ``nim-everywhere`` sibling ``src``
     ## roots on ``--path``; the engine threads those off the ``uses:``
@@ -137,32 +138,46 @@ type
     consumesIsonim: bool
     releaseBuild: bool
 
+# The test binary's file extension on the host the graph is built for.
+# ``nim c --out:build/test-bin/<stem>`` writes ``<stem>.exe`` on Windows, and
+# ``buildNimUnittest.build`` declares that ``.exe`` as the compile edge's
+# output, but it hands the ``binary`` it was given UNCHANGED to the typed
+# ``testBinary`` that ``edge.testBinary.run`` executes: the caller names the
+# runnable file. Naming ``<stem>`` alone therefore made every Windows execute
+# edge launch a file that does not exist
+# (``CreateProcessW failed (err=2): ...\build\test-bin\test_basic``). With
+# the suffix in ``binary`` itself, the compile output, the typed binary and
+# the executed path are the same file, and ``buildNimUnittest`` does not
+# append a second ``.exe``. The nimcache directory and the action ids derive
+# from ``splitFile(binary).name``, so they are identical on every host.
+const testBinaryExt = when defined(windows): ".exe" else: ""
+
 const testSpecs: seq[GpuiTestSpec] = @[
   # ---- Leaf tests (self src + the Rust shim; no isonim) --------------
   GpuiTestSpec(source: "tests/test_basic.nim",
-    binary: "build/test-bin/test_basic",
+    binary: "build/test-bin/test_basic" & testBinaryExt,
     consumesIsonim: false, releaseBuild: false),
   GpuiTestSpec(source: "tests/test_bindings.nim",
-    binary: "build/test-bin/test_bindings",
+    binary: "build/test-bin/test_bindings" & testBinaryExt,
     consumesIsonim: false, releaseBuild: false),
   GpuiTestSpec(source: "tests/test_renderer.nim",
-    binary: "build/test-bin/test_renderer",
+    binary: "build/test-bin/test_renderer" & testBinaryExt,
     consumesIsonim: false, releaseBuild: false),
   GpuiTestSpec(source: "tests/test_performance.nim",
-    binary: "build/test-bin/test_performance",
+    binary: "build/test-bin/test_performance" & testBinaryExt,
     consumesIsonim: false, releaseBuild: true),
   GpuiTestSpec(source: "tests/test_gui.nim",
-    binary: "build/test-bin/test_gui",
+    binary: "build/test-bin/test_gui" & testBinaryExt,
     consumesIsonim: false, releaseBuild: false),
   # ---- Consumer tests (isonim + nim-everywhere via SC-11 uses:) ------
   GpuiTestSpec(source: "tests/test_cross_renderer.nim",
-    binary: "build/test-bin/test_cross_renderer",
+    binary: "build/test-bin/test_cross_renderer" & testBinaryExt,
     consumesIsonim: true, releaseBuild: false),
   GpuiTestSpec(source: "tests/test_render_integration.nim",
-    binary: "build/test-bin/test_render_integration",
+    binary: "build/test-bin/test_render_integration" & testBinaryExt,
     consumesIsonim: true, releaseBuild: false),
   GpuiTestSpec(source: "tests/test_structural_comparison.nim",
-    binary: "build/test-bin/test_structural_comparison",
+    binary: "build/test-bin/test_structural_comparison" & testBinaryExt,
     consumesIsonim: true, releaseBuild: false),
 ]
 
