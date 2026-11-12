@@ -11,8 +11,28 @@
 //!   * Two consecutive submits both return non-blocking tokens (the
 //!     bridge can pipeline frame N+1 while N-1 finishes).
 //!   * Unknown / cancelled tokens behave correctly.
+//!
+//! # Why `harness = false`
+//!
+//! On macOS the async path's first `gpui_render_submit_async` obtains the
+//! platform's text system ON THE CALLING THREAD, and gpui builds that
+//! platform (`MacPlatform::new`) only on the main thread
+//! (`gpui-pre-macos-0.3.5/src/platform.rs:210`); see
+//! `async_text_system_for_this_call` in `src/gpui_headless.rs`. libtest
+//! runs every `#[test]` on a worker thread, so as `#[test]`s the two
+//! macOS cases (`async_render_produces_non_empty_buffer`,
+//! `async_submit_is_non_blocking`) could never meet that precondition.
+//! This file is its own `main` (declared `harness = false` in
+//! `Cargo.toml`) and runs every case on the main thread through
+//! `main_thread_harness::run` (`tests/main_thread_harness/mod.rs`).
+//!
+//! The WHOLE file moved, not only those two cases: all seven share the
+//! helpers below and the one process-wide render worker they drive, and
+//! the five that run everywhere are indifferent to the thread they are
+//! called from. Every assertion is unchanged, on every platform, and the
+//! cases still run one at a time, as `#[serial]` ran them.
 
-#![cfg(feature = "gpui-headless")]
+mod main_thread_harness;
 
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -28,7 +48,6 @@ use gpui_nim_shim::{
     gpui_append_child, gpui_create_element, gpui_create_text_node, gpui_destroy_element,
     gpui_reset_tree, gpui_set_style, GpuiElement, ROOT_NODE_ID,
 };
-use serial_test::serial;
 
 fn c(s: &str) -> CString {
     CString::new(s).unwrap()
@@ -114,8 +133,6 @@ fn render_one(width: u32, height: u32) -> (i32, Vec<u8>) {
     }
 }
 
-#[test]
-#[serial]
 fn async_render_produces_non_empty_buffer() {
     unsafe {
         let root = seed_root();
@@ -168,8 +185,6 @@ fn async_render_produces_non_empty_buffer() {
 /// The acceptance criterion: two consecutive submits must each return
 /// immediately. Each call must take well under the synchronous
 /// ~41 ms render-time, proving the bridge thread is not blocked.
-#[test]
-#[serial]
 fn async_submit_is_non_blocking() {
     unsafe {
         let root = seed_root();
@@ -245,8 +260,6 @@ fn async_submit_is_non_blocking() {
     }
 }
 
-#[test]
-#[serial]
 fn async_try_take_unknown_token() {
     let mut p: *mut u8 = std::ptr::null_mut();
     let mut l: usize = 0;
@@ -272,8 +285,6 @@ fn async_try_take_unknown_token() {
 /// require the headless renderer to actually complete a frame
 /// (so the test passes on non-macOS hosts that bail with
 /// RendererUnavailable inside the worker).
-#[test]
-#[serial]
 fn stale_token_after_bump_returns_stale_sentinel() {
     // Submit a render, then bump the generation BEFORE polling.
     // The slot is most likely still Pending; the try_take must
@@ -353,8 +364,6 @@ fn stale_token_after_bump_returns_stale_sentinel() {
 /// (lost all 40 attempts twice in 400 runs under 8-way load, so the
 /// case was a flake in its own right). Holding the worker gate removes
 /// the race instead of widening the window.
-#[test]
-#[serial]
 fn abandoned_token_leaves_no_orphan_slot() {
     quiesce();
     let before = slot_count_for_tests();
@@ -419,8 +428,6 @@ fn abandoned_token_leaves_no_orphan_slot() {
 /// shape and had the same orphan. Its doc comment claimed "no leak on
 /// any branch" while the `Pending` branch was the leak. Same
 /// construction, for the same reason.
-#[test]
-#[serial]
 fn cancel_while_pending_leaves_no_orphan_slot() {
     quiesce();
     let before = slot_count_for_tests();
@@ -470,8 +477,6 @@ fn cancel_while_pending_leaves_no_orphan_slot() {
 /// ERV-M3: ``gpui_bump_generation`` is monotonic and the value it
 /// returns is observable from a subsequent submit. This is the
 /// happens-before edge the staleness check depends on.
-#[test]
-#[serial]
 fn bump_generation_is_monotonic() {
     let g0 = gpui_bump_generation();
     let g1 = gpui_bump_generation();
@@ -480,4 +485,19 @@ fn bump_generation_is_monotonic() {
     assert!(g2 > g1, "bump must increase: {} -> {}", g1, g2);
     assert_eq!(g1, g0 + 1);
     assert_eq!(g2, g1 + 1);
+}
+
+/// The cases, in the order they run, all on the main thread.
+const CASES: &[main_thread_harness::Case] = &[
+    ("async_render_produces_non_empty_buffer", async_render_produces_non_empty_buffer),
+    ("async_submit_is_non_blocking", async_submit_is_non_blocking),
+    ("async_try_take_unknown_token", async_try_take_unknown_token),
+    ("stale_token_after_bump_returns_stale_sentinel", stale_token_after_bump_returns_stale_sentinel),
+    ("abandoned_token_leaves_no_orphan_slot", abandoned_token_leaves_no_orphan_slot),
+    ("cancel_while_pending_leaves_no_orphan_slot", cancel_while_pending_leaves_no_orphan_slot),
+    ("bump_generation_is_monotonic", bump_generation_is_monotonic),
+];
+
+fn main() {
+    main_thread_harness::run(CASES);
 }

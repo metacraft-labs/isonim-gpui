@@ -663,6 +663,40 @@ control to the caller of `gpui_launch`. Cleanup:
 - Callback registry is reset
 - All GpuiElement handles become dangling (Nim should not use them after shutdown)
 
+### Off-screen Rendering and the Main Thread
+
+The `gpui-headless` feature renders the shadow tree to RGBA pixels without a
+window, in two forms: `gpui_render_to_pixels` renders synchronously on the
+calling thread, and `gpui_render_submit_async` queues the render for a
+dedicated worker thread and returns a token that `gpui_render_try_take`
+redeems.
+
+Both need the platform's text system, and gpui hands that out only through a
+platform (`gpui_platform::current_platform`). On macOS that builds
+`MacPlatform`, whose constructor panics on any thread but the process's main
+thread (`gpui-pre-macos-0.3.5/src/platform.rs:210`). The text system it
+returns is `Send + Sync`, so the rule is:
+
+- **`gpui_render_to_pixels`** must be called on the main thread on macOS. Off
+  it, the panic is caught and the call returns `6` (`Panic`).
+- **`gpui_render_submit_async`** obtains the text system on the calling
+  thread, never on the worker, and hands it to the worker with the request.
+  The **first** submit in the process must therefore be made on the main
+  thread on macOS. The text system is kept for the process lifetime, so later
+  submits may come from any thread. A submit off the main thread before then
+  queues normally, and its token is answered `-2` (`RendererUnavailable`) by
+  `gpui_render_try_take`, not a caught panic. The font-smoothing policy is
+  applied to the text system when it is obtained, before the worker can
+  rasterise a glyph with it.
+
+Neither form needs a run loop: the render runs on the calling thread or on
+the worker. Off macOS the pinned gpui has no headless renderer, so both forms
+answer `RendererUnavailable` (`2`, or `-2` from `gpui_render_try_take`)
+whichever thread calls them.
+
+The macOS cases of `tests/test_async_render.rs` submit from the main thread
+for this reason; see that file's header.
+
 ---
 
 ## 7. Implementation Phases

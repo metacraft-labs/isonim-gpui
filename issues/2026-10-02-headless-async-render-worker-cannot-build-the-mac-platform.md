@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | blocked (m1:fix-headless-async-render-worker-cannot-buil): owner decision required; see below |
+| Status | in progress: the manager's decision of 2026-11-12 (below) is implemented, unverified on macOS; closes when a macOS CI lane passes `cargo test --features gpui-headless` with it |
 | Recorded | 2026-10-02 |
 | Observed in | isonim-gpui @ `4b3ed3e` (`agents`), aarch64-darwin (macOS 15), shim built `--features gpui-headless` |
 | Area | `rust/gpui-nim-shim/src/gpui_headless.rs` `spawn_worker` / `worker_main` / `render_via_cached`; the lane step `rust: cargo test --features gpui-headless` in `ci/run-suite.sh --with-gpui` |
@@ -186,3 +186,51 @@ was attempted pending the owner decision.
 - `codetracer-specs/issues/2026-09-29-gpui-window-capture-lanes-are-wayland-only.md`
   — the headless path is that issue's proposed macOS pixel route; this defect
   bounds it to the synchronous entry point.
+
+## Manager's decision (2026-11-12)
+
+Neither suggested direction is taken. Option 1 would add a requirement that
+the embedding process run a main run loop; option 2 would rewrite the two
+`#[cfg(target_os = "macos")]` assertions, a recorded weakening. A third
+shape needs neither.
+
+**The shape.** The worker needs `current_platform(true)` only for
+`platform.text_system()`, an `Arc<dyn PlatformTextSystem>`, and
+`PlatformTextSystem` is `Send + Sync`. Only `MacPlatform::new` needs the main
+thread, and `MacTextSystem` is `pub(crate)` in `gpui-pre-macos`, so it cannot
+be built directly. So:
+
+- `gpui_render_submit_async` obtains the text system **on the calling
+  thread** (`async_text_system_for_this_call` in `gpui_headless.rs`), applies
+  the font-smoothing policy to it there, keeps it for the process lifetime,
+  and sends it to the worker with each request. The worker never calls
+  `current_platform`.
+- The async path thereby gets the threading precondition the synchronous
+  `gpui_render_to_pixels` already had on macOS: the **first** submit in the
+  process must come from the main thread. Later submits may come from any
+  thread. Both preconditions are now written in the shim's doc comments and
+  in `docs/shim-design.md` §6 "Off-screen Rendering and the Main Thread".
+- A first submit off the main thread does not build a platform and does not
+  panic: its token is answered `-2` (`RendererUnavailable`, an existing code,
+  whose doc comment now says so) instead of `-6`. No code was added.
+- Off macOS nothing changes: the pinned gpui has no headless renderer there,
+  so the worker answers `-2` before it needs a text system, and none is
+  obtained.
+- `tests/test_async_render.rs` became a `harness = false` target that runs all
+  seven cases on the main thread (libtest's worker threads can never satisfy
+  the precondition), with every assertion unchanged on every platform.
+
+**Why it weakens nothing.** No assertion was edited or removed: the macOS
+cases still require `rc == 0`, a `width * height * 4` buffer with more than
+one colour, and sub-5 ms submits; the Linux cases still require `-2`. The C
+ABI is unchanged: the same functions, signatures and codes. No run loop is
+required, because the render still happens on the worker. The precondition
+added to the async path is the one its synchronous sibling already had, now
+stated rather than discovered.
+
+**Closes when** a macOS CI lane runs `ci/run-suite.sh --with-gpui` with the
+`gpui-headless` step green. On 2026-11-12 the change was built and run on
+x86_64-linux only, where the macOS arms do not compile; whether the worker's
+remaining path (`HeadlessAppContext::with_platform`, the Metal headless
+renderer) is free of further main-thread requirements is read from the gpui
+sources, not observed.
