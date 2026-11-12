@@ -394,7 +394,7 @@ Grotesk's proportional "1" is 416 units of its 1000-unit em and its "0" 641;
 its `tnum` digits are all 620. Before 2026-11-08 the property was not parsed,
 so CodeTracer's Agent Harbor recording buttons were 0.5-2 px off the
 browser's and the active initiative tab cut its title a character early.
-`test_tabular_nums_sets_every_digit_one_advance` (`tests/gpui_rendering.rs`)
+`test_tabular_nums_sets_every_digit_one_advance` (`tests/gpui_text_shaping.rs`)
 shapes the digits with the platform's real text system and the committed
 Space Grotesk fixture (`tests/fixtures/fonts/`, SIL OFL 1.1): every digit
 must be 62 px at 100 px with the property, and the control without it keeps
