@@ -29,7 +29,10 @@ pub fn run(cases: &[Case]) {
     let mut failed: Vec<&str> = Vec::new();
     for (name, case) in cases {
         let outcome = std::panic::catch_unwind(*case);
-        println!("test {name} ... {}", if outcome.is_ok() { "ok" } else { "FAILED" });
+        println!(
+            "test {name} ... {}",
+            if outcome.is_ok() { "ok" } else { "FAILED" }
+        );
         if outcome.is_err() {
             failed.push(name);
         }

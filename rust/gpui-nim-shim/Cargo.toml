@@ -165,6 +165,15 @@ name = "test_async_render"
 harness = false
 required-features = ["gpui-headless"]
 
+# The synchronous headless render, `gpui_render_to_pixels`, which on macOS
+# builds the platform on the calling thread and so must be called on the
+# main thread (see `gpui_headless.rs`). Its own `main` for the same reason
+# as `test_async_render`; the file header says more.
+[[test]]
+name = "test_headless_render"
+harness = false
+required-features = ["gpui-headless"]
+
 [dev-dependencies]
 serial_test = "3"
 serde_json = "1"

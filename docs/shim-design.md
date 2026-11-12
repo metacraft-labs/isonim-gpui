@@ -694,8 +694,9 @@ the worker. Off macOS the pinned gpui has no headless renderer, so both forms
 answer `RendererUnavailable` (`2`, or `-2` from `gpui_render_try_take`)
 whichever thread calls them.
 
-The macOS cases of `tests/test_async_render.rs` submit from the main thread
-for this reason; see that file's header.
+For this reason `tests/test_headless_render.rs` calls `gpui_render_to_pixels`
+from the main thread, and the macOS cases of `tests/test_async_render.rs`
+submit from it; see those files' headers.
 
 ---
 
