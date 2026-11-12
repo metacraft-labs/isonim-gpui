@@ -124,6 +124,12 @@ static:
   assert compiles(gpui_get_attribute(e, "name".cstring, nil, 0.uint64))
   assert compiles(gpui_nth_child(e, 0.uint64))
   assert compiles(gpui_get_tag(e, nil, 0.uint64))
+  # The whole subtree in one call, and an id from it back to a handle.
+  assert compiles(gpui_snapshot_tree(e, nil, 0.uint64))
+  assert compiles(block:
+    var x: uint64 = gpui_snapshot_tree(e, nil, 0.uint64))
+  assert compiles(block:
+    var x: E = gpui_element_of_node_id(0.uint64))
   assert compiles(gpui_get_element_kind(e))
 
   # --- Window management ---

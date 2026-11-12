@@ -267,7 +267,24 @@ BENCHMARKS=(
 #     The same commits' `gpui_app.rs` and `tests/gpui_rendering.rs` cases
 #     are `gpui-backend` / `gpui-headless` only, so they are counted by the
 #     `--with-gpui` arms, not here.
-EXPECTED_CASES=399
+# 2026-11-09, written LAST and from a run (trap 4c), at `de9d6e4` with the
+# whole-subtree snapshot (`gpui_snapshot_tree`) uncommitted: 401.
+#   * THE LANE WAS ALREADY RED BY DRIFT at `de9d6e4` unmodified: `cargo test`
+#     passed 235 Rust cases there (measured in a clean worktree), where the
+#     figure above counted 217, so the lane read 400 against 382.
+#   * 400 -> 401 is this change: `lib.rs`'s
+#     `test_snapshot_tree_preorder_with_attributes` (+1). `test_bindings`
+#     stays one checkpoint (it covers the two new bindings) and
+#     `test_renderer`'s snapshot checks sit in its tree-operations block.
+# 2026-11-12, written LAST and from a run (trap 4c), at `62298a8` merged
+# with `agents` at `9833561`: 403.
+#   * The two entries above were written in parallel on two branches from
+#     the same 382 base, so neither counts the other's commits. The merge
+#     runs rust 238: the 234 of the `c374ad4` entry plus one default-build
+#     Rust case from each of `de9d6e4` (`render_sync`), `28f1113` (`lib.rs`,
+#     the +1 named above), `dd50286` (`lib.rs`) and `9833561`
+#     (`layout_bounds`). Every Nim subject is unchanged (165 cases).
+EXPECTED_CASES=403
 
 total_cases=0
 failed_steps=()

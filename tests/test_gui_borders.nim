@@ -21,8 +21,18 @@
 ##     delivers `mousedown`, `mousemove` and `mouseup` to the box's listeners
 ##     with the window position (`pointerOf`), and a wheel turned two
 ##     notches arrives as a `wheel` event with its delta;
+##   * a box with a FRACTIONAL border (1.5px) is framed by a border of that
+##     width: a fully covered outer pixel and a half covered one inside it
+##     on each side, where GPUI's own quad drew one pixel (it snaps a
+##     border to whole device pixels, rounding half toward zero); the shim
+##     strokes such a border itself (`gpui_app::border_stroke`);
 ##   * a row's `padding-left` moves its first child in by exactly that much,
 ##     and a `flex-grow` child fills the row to its right edge;
+##   * a LAYOUT PROBE (`data-layout-probe`, read by `gpui_layout_bounds`)
+##     reports an element's BORDER box, as a browser's
+##     `getBoundingClientRect` does: the 3px-bordered box reads its whole
+##     200×120 at the window's corner, and the box bordered on its left only
+##     its whole 120×80, not the padding box inside the border;
 ##   * the host's TICK (`gpui_set_tick`) runs on the loop's own thread, at its
 ##     interval, and stops the moment the host disarms it from inside the
 ##     callback (it ticks `TickLimit` times and never again, although the
@@ -54,6 +64,9 @@ const
   QuadW = 60
   QuadH = 40
   RowW = 300
+  FracBoxPx = 40
+  FracColor = "#ff00ff"
+  FracBorder = "1.5px"
   RowPadPx = 20
   RowFixedW = 30
 
@@ -80,6 +93,10 @@ var
     ## What the box's listeners were handed, in order.
   wheelDy: seq[float]
     ## Each wheel event's vertical delta, in pixels.
+  probedBox, probedSide: GpuiElement
+    ## The two bordered boxes the layout probe measures.
+  boxBounds, sideBounds: array[4, float64]
+  boxProbed, sideProbed = false
 
 proc readPpm(path: string): Frame =
   let raw = readFile(path)
@@ -141,6 +158,8 @@ proc buildScene(root: GpuiElement) {.cdecl.} =
   r.setStyle(quad, "background-color", QuadColor)
   r.appendChild(box, quad)
   r.appendChild(root, box)
+  r.setAttribute(box, "data-layout-probe", "box")
+  probedBox = box
 
   let side = r.createElement("div")
   r.setStyle(side, "background-color", BoxBg)
@@ -149,6 +168,8 @@ proc buildScene(root: GpuiElement) {.cdecl.} =
   r.setStyle(side, "border-left-width", $BorderPx & "px")
   r.setStyle(side, "border-color", BorderColor)
   r.appendChild(root, side)
+  r.setAttribute(side, "data-layout-probe", "side")
+  probedSide = side
 
   # A ROW with a left padding, a fixed child and a GROWING child: the
   # padding moves the first child in, and the grower fills the row to its
@@ -181,10 +202,25 @@ proc buildScene(root: GpuiElement) {.cdecl.} =
     r.appendChild(label, r.createTextNode(LabelText))
     r.appendChild(root, label)
 
+  # A FRACTIONAL border on the window's white, last in the column so it
+  # moves nothing above it.
+  let frac = r.createElement("div")
+  r.setStyle(frac, "width", $FracBoxPx & "px")
+  r.setStyle(frac, "height", $FracBoxPx & "px")
+  r.setStyle(frac, "flex-shrink", "0")
+  r.setStyle(frac, "border-width", FracBorder)
+  r.setStyle(frac, "border-color", FracColor)
+  r.appendChild(root, frac)
+
 proc onTick() {.cdecl.} =
   inc tickCount
   if getThreadId() != launchThread:
     inc tickOffThread
+  # Laid out by the first frame; read on the loop's thread, as a host does.
+  if not boxProbed:
+    boxProbed = gpui_layout_bounds(probedBox, addr boxBounds) == 1
+  if not sideProbed:
+    sideProbed = gpui_layout_bounds(probedSide, addr sideBounds) == 1
   if tickCount == TickLimit:
     gpui_set_tick(0, nil)
 
@@ -354,6 +390,41 @@ suite "the window draws what the plan carries: borders, weight, placement, point
       check f.rgbAt(RowPadPx + RowFixedW, rowY) == (0, 255, 0)
       check f.rgbAt(RowW - 1, rowY) == (0, 255, 0)          # grown to the edge
       check f.rgbAt(RowW, rowY) == (255, 255, 255)
+
+    # ---- a fractional border: 1.5px, not snapped to 1px ---------------------
+    # The box's fully covered border pixels are exactly the colour; the
+    # pixel inside each of them is half covered (its green channel about
+    # half way between the colour's 0 and the window's 255), and the next
+    # one in is the window's white. A 1px border leaves that pixel white.
+    var fx0 = int.high
+    var fy0 = int.high
+    var fx1 = -1
+    var fy1 = -1
+    for y in 0 ..< f.h:
+      for x in 0 ..< f.w:
+        if f.rgbAt(x, y) == (255, 0, 255):
+          fx0 = min(fx0, x); fx1 = max(fx1, x)
+          fy0 = min(fy0, y); fy1 = max(fy1, y)
+    echo &"    fractional-border box ({fx0},{fy0})-({fx1},{fy1})"
+    check fx1 - fx0 + 1 == FracBoxPx and fy1 - fy0 + 1 == FracBoxPx
+    if fx1 > fx0 and fy1 > fy0:
+      let my = (fy0 + fy1) div 2
+      let mx = (fx0 + fx1) div 2
+      let edges = [(f.rgbAt(fx0, my), f.rgbAt(fx0 + 1, my), f.rgbAt(fx0 + 2, my)),
+                   (f.rgbAt(fx1, my), f.rgbAt(fx1 - 1, my), f.rgbAt(fx1 - 2, my)),
+                   (f.rgbAt(mx, fy0), f.rgbAt(mx, fy0 + 1), f.rgbAt(mx, fy0 + 2)),
+                   (f.rgbAt(mx, fy1), f.rgbAt(mx, fy1 - 1), f.rgbAt(mx, fy1 - 2))]
+      echo &"    its edges (outer, half, inside): {edges}"
+      for (outer, half, inside) in edges:
+        check outer == (255, 0, 255)
+        check half[0] == 255 and half[2] == 255 and half[1] in 80 .. 180
+        check inside == (255, 255, 255)
+
+    # ---- the layout probe: the border box, as getBoundingClientRect --------
+    echo &"    probed box {boxBounds} ({boxProbed}), side box {sideBounds} ({sideProbed})"
+    check boxProbed and sideProbed
+    check boxBounds == [0.0, 0.0, float64(BoxW), float64(BoxH)]
+    check sideBounds == [0.0, float64(sideTop), float64(SideBoxW), float64(SideBoxH)]
 
     # ---- the tick: on the loop's thread, at its interval, disarmable -------
     echo &"    ticks {tickCount} (limit {TickLimit}) over {openMs} ms open; " &

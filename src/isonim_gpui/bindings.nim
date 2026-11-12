@@ -248,7 +248,7 @@ proc gpui_frame_stats_reset*() {.importc: "gpui_frame_stats_reset".}
 #
 # Where the window laid an element out, read off GPUI's own layout. Only an
 # element carrying the attribute `data-layout-probe` is recorded; see the
-# shim's `layout_bounds` module for what exactly is measured (the padding box,
+# shim's `layout_bounds` module for what exactly is measured (the border box,
 # window coordinates, logical pixels).
 
 proc gpui_layout_bounds*(node: GpuiElement; outXywh: ptr array[4, float64]): uint8
@@ -373,6 +373,18 @@ proc gpui_get_text_content*(node: GpuiElement; buf: pointer; bufLen: uint64): ui
 
 proc gpui_get_attribute*(node: GpuiElement; name: cstring; buf: pointer; bufLen: uint64): uint64
   {.importc: "gpui_get_attribute".}
+
+proc gpui_snapshot_tree*(root: GpuiElement; buf: pointer; bufLen: uint64): uint64
+  {.importc: "gpui_snapshot_tree".}
+  ## The subtree under `root` in pre-order: per node its id (u64), its
+  ## parent's index (u32, `high(uint32)` for `root`), its attribute count
+  ## (u32), all little-endian, then each attribute as `name\0value\0` (not
+  ## the shim's own `__`-prefixed ones); the size the whole encoding needs.
+  ## `renderer.snapshotTree` wraps it.
+
+proc gpui_element_of_node_id*(id: uint64): GpuiElement
+  {.importc: "gpui_element_of_node_id".}
+  ## A handle for the node `id` names, nil when it is not in the tree.
 
 proc gpui_nth_child*(node: GpuiElement; index: uint64): GpuiElement
   {.importc: "gpui_nth_child".}

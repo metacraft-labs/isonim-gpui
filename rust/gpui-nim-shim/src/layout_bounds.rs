@@ -13,13 +13,19 @@
 //! `Div` is then given one more child, an absolutely positioned, full-size
 //! `canvas` that paints nothing and records its bounds during prepaint
 //! (`gpui_app::with_layout_probe`). An absolute child takes no part in its
-//! parent's flex layout, so the probe does not move what it measures. What it
-//! records is the parent's padding box -- the containing block of an absolute
-//! child (CSS 2.1 §10.1, which Taffy follows:
-//! <https://www.w3.org/TR/CSS21/visudet.html#containing-block-details>) -- in
-//! window coordinates, logical pixels. That is the border box less the
-//! element's own border, so a bordered element reads its border width smaller
-//! on each side than a browser's `getBoundingClientRect`.
+//! parent's flex layout, so the probe does not move what it measures. The
+//! canvas is laid out over the parent's PADDING box -- the containing block
+//! of an absolute child (CSS 2.1 §10.1, which Taffy follows:
+//! <https://www.w3.org/TR/CSS21/visudet.html#containing-block-details>) --
+//! and the element's own border widths are added back on each side
+//! (`border_box_of`), so what is recorded is its BORDER box, in window
+//! coordinates, logical pixels: the box a browser's `getBoundingClientRect`
+//! reports (CSSOM View §6,
+//! <https://www.w3.org/TR/cssom-view-1/#dom-element-getboundingclientrect>).
+//! Until 2026-11-10 the padding box itself was recorded, and every bordered
+//! element read its border width smaller on each side than the browser's:
+//! a list of rows with a 1px hairline under each read every row 1px short
+//! although the rows stood exactly as far apart as the browser's.
 //!
 //! Only elements that opt in are recorded: a probe on every node would add a
 //! child to every node of every application.
@@ -55,6 +61,18 @@ static BOUNDS: Mutex<Option<HashMap<u64, LaidOut>>> = Mutex::new(None);
 /// Whether a plan node with these attributes asked for its bounds.
 pub fn wants_probe(attributes: &std::collections::BTreeMap<String, String>) -> bool {
     attributes.contains_key(LAYOUT_PROBE_ATTRIBUTE)
+}
+
+/// The border box of an element whose padding box is `padding` and whose
+/// border is `widths` wide on each side (top, right, bottom, left).
+pub fn border_box_of(padding: LaidOut, widths: [f32; 4]) -> LaidOut {
+    let [top, right, bottom, left] = widths;
+    LaidOut {
+        x: padding.x - left,
+        y: padding.y - top,
+        w: padding.w + left + right,
+        h: padding.h + top + bottom,
+    }
 }
 
 /// The window laid `node_id` out at these bounds (its latest frame wins).
@@ -118,6 +136,23 @@ mod tests {
 
     // The store is process-global; these run in one test so they cannot
     // interleave with each other.
+    #[test]
+    fn a_border_box_adds_each_side_s_border_back() {
+        let padding = LaidOut { x: 10.0, y: 20.0, w: 100.0, h: 50.0 };
+        // No border: the padding box is the border box.
+        assert_eq!(border_box_of(padding, [0.0; 4]), padding);
+        // A 1px hairline under a row: one pixel taller, nowhere else moved.
+        assert_eq!(
+            border_box_of(padding, [0.0, 0.0, 1.0, 0.0]),
+            LaidOut { x: 10.0, y: 20.0, w: 100.0, h: 51.0 }
+        );
+        // Every side different.
+        assert_eq!(
+            border_box_of(padding, [1.0, 2.0, 3.0, 4.0]),
+            LaidOut { x: 6.0, y: 19.0, w: 106.0, h: 54.0 }
+        );
+    }
+
     #[test]
     fn records_reads_and_forgets() {
         reset();

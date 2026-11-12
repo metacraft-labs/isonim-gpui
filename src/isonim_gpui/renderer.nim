@@ -181,6 +181,8 @@ const stylePropertyMap = {
   "font-family": "font_family",
   "font-weight": "font_weight",
   "font-style": "font_style",
+  "font-variant-numeric": "font_variant_numeric",  # OpenType figure features (`tnum`)
+  "letter-spacing": "letter_spacing",  # space after each character (`SpacedText`)
   "text-align": "text_align",
   "line-height": "line_height",
 
@@ -565,8 +567,9 @@ const LayoutProbeAttribute* = "data-layout-probe"
 
 proc layoutBounds*(node: GpuiElement;
                    x, y, w, h: var float): bool =
-  ## Where the window last laid `node` out (its padding box, window
-  ## coordinates, logical pixels), read off GPUI's own layout. False -- and
+  ## Where the window last laid `node` out (its border box, as a browser's
+  ## `getBoundingClientRect` reports it; window coordinates, logical
+  ## pixels), read off GPUI's own layout. False -- and
   ## the outputs untouched -- for a node that does not carry
   ## `LayoutProbeAttribute`, that no frame has laid out yet, or in a build
   ## without the GPUI backend. See the shim's `layout_bounds` module.
@@ -611,6 +614,79 @@ proc getAttribute*(node: GpuiElement; name: string): string =
   discard gpui_get_attribute(node, name.cstring, addr buf[0], uint64(buf.len))
   buf.setLen(int(needed))
   buf
+
+type
+  SnapshotNode* = object
+    ## One node of `snapshotTree`.
+    id*: uint64
+      ## Its `nodeId`; `elementOf` turns it into a handle.
+    parent*: int
+      ## Its parent's index in the snapshot, -1 for the snapshot's root.
+    attributes*: seq[(string, string)]
+      ## Every attribute the program set on it, in name order (not the
+      ## shim's own `__`-prefixed storage, such as `__text_content`).
+
+func attr*(n: SnapshotNode; name: string): string =
+  ## The value of `name` on `n`, "" when it carries none — what
+  ## `getAttribute` answers, from the snapshot.
+  for (k, v) in n.attributes:
+    if k == name:
+      return v
+  ""
+
+var snapshotBuffer {.threadvar.}: string
+  ## `snapshotTree`'s buffer, kept at the size the last snapshot needed.
+
+proc snapshotTree*(root: GpuiElement): seq[SnapshotNode] =
+  ## The subtree under `root` — `root` first, then each child's subtree in
+  ## child order (pre-order, the order `nthChild` walks) — with every node's
+  ## attributes, read in ONE call into the shim. Empty for a nil root.
+  ##
+  ## For a walk that classifies every element of a window after each redraw
+  ## by which of many attributes it carries: walking with `childCount` /
+  ## `nthChild` and asking `getAttribute` once per name is a lock and a
+  ## lookup in the shim per name per element, and cost about 50 ms a redraw
+  ## over a thousand elements. A node of the snapshot reflects the tree at
+  ## the call; `elementOf` gives a handle for the ones the walk changes.
+  # Into the buffer the last snapshot needed, so a window read after every
+  # redraw is serialized once, not once to size it and again to fill it.
+  template buf: untyped = snapshotBuffer
+  var needed = gpui_snapshot_tree(root, (if buf.len > 0: addr buf[0] else: nil),
+                                  uint64(buf.len))
+  while needed > uint64(buf.len):
+    # Larger than the buffer (or the tree grew before the second call).
+    buf.setLen(int(needed))
+    needed = gpui_snapshot_tree(root, addr buf[0], needed)
+  if needed == 0'u64:
+    return
+  let used = int(needed)
+  proc le(at, width: int): uint64 =
+    for k in countdown(width - 1, 0):
+      result = (result shl 8) or uint64(ord(buf[at + k]))
+  proc zstr(at: var int): string =
+    let e = buf.find('\0', at, used - 1)
+    if e < 0:
+      raise newException(ValueError, "gpui_snapshot_tree: an unterminated string")
+    result = buf[at ..< e]
+    at = e + 1
+  var i = 0
+  while i < used:
+    if i + 16 > used:
+      raise newException(ValueError, "gpui_snapshot_tree: a truncated node")
+    var n = SnapshotNode(id: le(i, 8))
+    let parent = le(i + 8, 4)
+    n.parent = if parent == uint64(high(uint32)): -1 else: int(parent)
+    let count = int(le(i + 12, 4))
+    i += 16
+    for _ in 0 ..< count:
+      let name = zstr(i)
+      n.attributes.add (name, zstr(i))
+    result.add n
+
+proc elementOf*(id: uint64): GpuiElement =
+  ## A handle for the node `id` names (a `SnapshotNode.id`, a `nodeId`), nil
+  ## when no such node is in the tree any more.
+  gpui_element_of_node_id(id)
 
 proc nthChild*(node: GpuiElement; index: int): GpuiElement =
   gpui_nth_child(node, uint64(index))

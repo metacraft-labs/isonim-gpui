@@ -862,6 +862,88 @@ pub extern "C" fn gpui_get_attribute(
     needed
 }
 
+/// The whole subtree under `root`, in ONE call: every node in pre-order
+/// (a node, then each of its children's subtrees in child order), each as
+///
+///   * its node id, a u64, little-endian (`gpui_node_id`'s value);
+///   * the index of its parent in this sequence, a u32, little-endian, and
+///     `u32::MAX` for `root` itself;
+///   * how many attributes it carries, a u32, little-endian;
+///   * each attribute as `name\0value\0`, in name order -- the ones the
+///     program set: `__`-prefixed keys are the shim's own storage
+///     (`__text_content`), left out as render-sync leaves them out.
+///
+/// Written into `buf` (at most `buf_len` bytes); returns the number of bytes
+/// the whole encoding needs, or 0 when `root` is null or not in the tree.
+///
+/// A caller that classifies every element of a window after each redraw --
+/// which kind of control it is, which rows take clicks -- would otherwise
+/// walk it with `gpui_child_count` / `gpui_nth_child` and ask
+/// `gpui_get_attribute` once per attribute NAME it knows, each a lock of the
+/// tree and nearly every answer "absent": about 50 ms a redraw over a
+/// thousand elements. Attribute names and values come from C strings, so
+/// neither can contain the NUL that ends them. `gpui_element_of_node_id`
+/// turns an id from here into a handle, for the few elements the caller
+/// then changes.
+#[no_mangle]
+pub extern "C" fn gpui_snapshot_tree(root: *mut GpuiElement, buf: *mut u8, buf_len: u64) -> u64 {
+    let root_id = unsafe { handle_to_node_id(root) };
+    if root_id.is_null() {
+        return 0;
+    }
+    let tree = lock_tree();
+    if tree.get(root_id).is_none() {
+        return 0;
+    }
+    let mut out = Vec::new();
+    // (node, its parent's index) -- children pushed in reverse so they are
+    // popped, and so encoded, in child order.
+    let mut stack: Vec<(NodeId, u32)> = vec![(root_id, u32::MAX)];
+    let mut index: u32 = 0;
+    while let Some((id, parent)) = stack.pop() {
+        let Some(node) = tree.get(id) else { continue };
+        out.extend_from_slice(&id.0.to_le_bytes());
+        out.extend_from_slice(&parent.to_le_bytes());
+        let mut pairs: Vec<(&String, &String)> = node
+            .attributes
+            .iter()
+            .filter(|(k, _)| !k.starts_with("__"))
+            .collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        out.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+        for (name, value) in pairs {
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+            out.extend_from_slice(value.as_bytes());
+            out.push(0);
+        }
+        for child in node.children.iter().rev() {
+            stack.push((*child, index));
+        }
+        index += 1;
+    }
+    let needed = out.len() as u64;
+    if buf.is_null() || buf_len == 0 {
+        return needed;
+    }
+    let to_copy = std::cmp::min(out.len(), buf_len as usize);
+    unsafe {
+        std::ptr::copy_nonoverlapping(out.as_ptr(), buf, to_copy);
+    }
+    needed
+}
+
+/// A handle for the node `id` names (an id `gpui_snapshot_tree` or
+/// `gpui_node_id` answered), or null when no such node is in the tree.
+#[no_mangle]
+pub extern "C" fn gpui_element_of_node_id(id: u64) -> *mut GpuiElement {
+    let tree = lock_tree();
+    match tree.get(NodeId(id)) {
+        Some(_) => node_id_to_handle(NodeId(id)),
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Get the Nth child of a node (0-indexed).
 /// Returns null if out of bounds or node not found.
 #[no_mangle]
@@ -1616,6 +1698,8 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(font_family, "font_family");
         push_style!(font_weight, "font_weight");
         push_style!(font_style, "font_style");
+        push_style!(font_variant_numeric, "font_variant_numeric");
+        push_style!(letter_spacing, "letter_spacing");
         push_style!(text_decoration, "text_decoration");
         push_style!(text_align, "text_align");
         push_style!(mask_image, "mask_image");
@@ -1925,6 +2009,96 @@ mod tests {
         assert_eq!(len, 0);
 
         gpui_destroy_element(node);
+    }
+
+    /// Decode `gpui_snapshot_tree`'s bytes as (id, parent, attributes).
+    fn decode_snapshot(bytes: &[u8]) -> Vec<(u64, u32, Vec<(String, String)>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        let zstr = |i: &mut usize| {
+            let end = bytes[*i..].iter().position(|b| *b == 0).unwrap() + *i;
+            let s = String::from_utf8(bytes[*i..end].to_vec()).unwrap();
+            *i = end + 1;
+            s
+        };
+        while i < bytes.len() {
+            let id = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+            let parent = u32::from_le_bytes(bytes[i + 8..i + 12].try_into().unwrap());
+            let count = u32::from_le_bytes(bytes[i + 12..i + 16].try_into().unwrap());
+            i += 16;
+            let mut attrs = Vec::new();
+            for _ in 0..count {
+                let name = zstr(&mut i);
+                let value = zstr(&mut i);
+                attrs.push((name, value));
+            }
+            out.push((id, parent, attrs));
+        }
+        out
+    }
+
+    #[test]
+    #[serial]
+    fn test_snapshot_tree_preorder_with_attributes() {
+        gpui_reset_tree();
+        let (div, span) = (c("div"), c("span"));
+        let root = gpui_create_element(div.as_ptr());
+        let a = gpui_create_element(span.as_ptr());
+        let a1 = gpui_create_element(span.as_ptr());
+        let b = gpui_create_element(span.as_ptr());
+        let text = c("hi");
+        let t = gpui_create_text_node(text.as_ptr());
+        gpui_append_child(root, a);
+        gpui_append_child(a, a1);
+        gpui_append_child(root, b);
+        gpui_append_child(b, t);
+        let (zn, one, an, two, en, blank) =
+            (c("z-name"), c("1"), c("a-name"), c("two"), c("empty"), c(""));
+        gpui_set_attribute(a, zn.as_ptr(), one.as_ptr());
+        gpui_set_attribute(a, an.as_ptr(), two.as_ptr());
+        gpui_set_attribute(b, en.as_ptr(), blank.as_ptr());
+        // The shim's own storage (`__text_content`) is not an attribute here.
+        let words = c("words");
+        gpui_set_text_content(a1, words.as_ptr());
+
+        let needed = gpui_snapshot_tree(root, std::ptr::null_mut(), 0);
+        let mut buf = vec![0xffu8; needed as usize];
+        assert_eq!(gpui_snapshot_tree(root, buf.as_mut_ptr(), needed), needed);
+        let nodes = decode_snapshot(&buf);
+        let ids: Vec<u64> = nodes.iter().map(|n| n.0).collect();
+        // Pre-order, children in child order: root, a, a1, b, the text node.
+        assert_eq!(ids, vec![gpui_node_id(root), gpui_node_id(a), gpui_node_id(a1),
+                             gpui_node_id(b), gpui_node_id(t)]);
+        let parents: Vec<u32> = nodes.iter().map(|n| n.1).collect();
+        assert_eq!(parents, vec![u32::MAX, 0, 1, 0, 3]);
+        // Attributes in name order, an empty value kept; none on the rest.
+        assert_eq!(nodes[1].2, vec![("a-name".to_string(), "two".to_string()),
+                                    ("z-name".to_string(), "1".to_string())]);
+        assert_eq!(nodes[3].2, vec![("empty".to_string(), String::new())]);
+        assert!(nodes[0].2.is_empty() && nodes[2].2.is_empty() && nodes[4].2.is_empty());
+
+        // A short buffer is filled as far as it goes, and still told the size.
+        let mut short = vec![0xffu8; 4];
+        assert_eq!(gpui_snapshot_tree(root, short.as_mut_ptr(), 4), needed);
+        assert_eq!(&short[..], &buf[..4]);
+
+        // A subtree is snapshotted from its own root.
+        let sub_needed = gpui_snapshot_tree(a, std::ptr::null_mut(), 0);
+        let mut sub = vec![0u8; sub_needed as usize];
+        gpui_snapshot_tree(a, sub.as_mut_ptr(), sub_needed);
+        let sub_nodes = decode_snapshot(&sub);
+        assert_eq!(sub_nodes.len(), 2);
+        assert_eq!(sub_nodes[0].1, u32::MAX);
+        assert_eq!(sub_nodes[1].1, 0);
+
+        // An id becomes a handle to the same node; an unknown id, null.
+        let h = gpui_element_of_node_id(gpui_node_id(b));
+        assert!(!h.is_null());
+        assert_eq!(gpui_node_id(h), gpui_node_id(b));
+        assert!(gpui_element_of_node_id(u64::MAX).is_null());
+        assert_eq!(gpui_snapshot_tree(std::ptr::null_mut(), std::ptr::null_mut(), 0), 0);
+
+        gpui_destroy_tree(root);
     }
 
     #[test]

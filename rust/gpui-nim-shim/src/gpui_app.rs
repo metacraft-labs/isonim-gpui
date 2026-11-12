@@ -1014,15 +1014,24 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
             }
         }
         None => {
+            // `letter-spacing` applies to the text this element draws itself
+            // (its text nodes and its own text), which `SpacedText` sets
+            // glyph by glyph; an element child sets its own, as it is not
+            // passed down (GPUI's inherited text style has no such field).
+            let spacing = plan.styles.letter_spacing.as_deref().and_then(parse_letter_spacing);
             // Add children
             for child in &plan.children {
-                el = el.child(render_plan_to_gpui(child));
+                el = if spacing.is_some() && child.kind == crate::tree::GpuiElementKind::TextNode {
+                    el.child(text_with_spacing(child.text.clone().unwrap_or_default(), spacing))
+                } else {
+                    el.child(render_plan_to_gpui(child))
+                };
             }
 
             // If the node has direct text content, add it as a child
             if let Some(ref text) = plan.text {
                 if !text.is_empty() {
-                    el = el.child(text.clone());
+                    el = el.child(text_with_spacing(text.clone(), spacing));
                 }
             }
         }
@@ -1044,28 +1053,36 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
 
 /// An element that declares `data-layout-probe` gets one more child: an
 /// absolutely positioned, full-size `canvas` that paints nothing and, during
-/// prepaint, records its bounds -- the element's padding box, in window
-/// coordinates -- into `layout_bounds` (read back by `gpui_layout_bounds`;
-/// that module says why and what exactly is measured). An absolute child is
-/// outside its parent's flex layout, so the probe does not move what it
-/// measures. Every other element is returned unchanged.
+/// prepaint, records its bounds into `layout_bounds` (read back by
+/// `gpui_layout_bounds`; that module says why and what exactly is measured).
+/// An absolute child is outside its parent's flex layout, so the probe does
+/// not move what it measures. What the canvas is laid out over is the
+/// element's PADDING box (an absolute child's containing block); the
+/// element's own border widths, from its styles, are added back on each
+/// side, so what is recorded is its BORDER box, the box a browser's
+/// `getBoundingClientRect` reports. Every other element is returned
+/// unchanged.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 fn with_layout_probe(el: Div, plan: &crate::render_sync::RenderNode) -> Div {
     if !crate::layout_bounds::wants_probe(&plan.attributes) {
         return el;
     }
     let node_id = plan.node_id;
+    let [top, right, bottom, left] = border_side_widths(&plan.styles).map(|w| w.unwrap_or(0.0));
     el.child(
         canvas(
             move |bounds, _window, _cx| {
                 crate::layout_bounds::record(
                     node_id,
-                    crate::layout_bounds::LaidOut {
-                        x: f32::from(bounds.origin.x),
-                        y: f32::from(bounds.origin.y),
-                        w: f32::from(bounds.size.width),
-                        h: f32::from(bounds.size.height),
-                    },
+                    crate::layout_bounds::border_box_of(
+                        crate::layout_bounds::LaidOut {
+                            x: f32::from(bounds.origin.x),
+                            y: f32::from(bounds.origin.y),
+                            w: f32::from(bounds.size.width),
+                            h: f32::from(bounds.size.height),
+                        },
+                        [top, right, bottom, left],
+                    ),
                 );
             },
             |_, _, _, _| {},
@@ -1393,6 +1410,170 @@ impl IntoElement for InsetRunText {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+/// A text set with `letter-spacing`: GPUI's text styles have no letter
+/// spacing (`gpui-pre` 0.3.5's `TextStyle` and `TextRun` carry none), so the
+/// shim shapes the line with GPUI's own text system, in the inherited text
+/// style, and paints its glyphs one by one, each moved right by the spacing
+/// of the characters before it (`letter_spaced_xs`). The element is as wide
+/// as the spaced line, so what follows it moves as it does in a browser.
+///
+/// It sets ONE line and never elides: a letter-spaced text is a short label
+/// (an uppercase section title), and a browser's labels of that kind are
+/// `white-space: nowrap` too. A line longer than its box is clipped by the
+/// box, not cut with "…". Underline and strikethrough are not drawn on it.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct SpacedText {
+    text: gpui::SharedString,
+    spacing: LetterSpacing,
+}
+
+/// What `SpacedText::request_layout` measured, kept for `paint`.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct SpacedTextLayout {
+    line: gpui::ShapedLine,
+    xs: Vec<f32>,
+    width: gpui::Pixels,
+    line_height: gpui::Pixels,
+    color: Hsla,
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl SpacedText {
+    pub fn new(text: impl Into<gpui::SharedString>, spacing: LetterSpacing) -> Self {
+        Self {
+            text: text.into(),
+            spacing,
+        }
+    }
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl gpui::Element for SpacedText {
+    type RequestLayoutState = SpacedTextLayout;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        // As `TextLayout::layout` computes it, so the label is as tall as an
+        // unspaced text element in the same style.
+        let line_height = window.pixel_snap(
+            text_style
+                .line_height
+                .to_pixels(font_size.into(), window.rem_size()),
+        );
+        let line = window.text_system().shape_line(
+            self.text.clone(),
+            font_size,
+            &[text_style.to_run(self.text.len())],
+            None,
+        );
+        let (xs, width) = letter_spaced_xs(&line, &self.text, self.spacing.to_px(f32::from(font_size)));
+        let measured = size(px(width.max(0.0)), line_height);
+        let layout_id = window
+            .request_measured_layout(Default::default(), move |_known, _available, _w, _cx| {
+                measured
+            });
+        (
+            layout_id,
+            SpacedTextLayout {
+                line,
+                xs,
+                width: px(width.max(0.0)),
+                line_height,
+                color: text_style.color,
+            },
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<gpui::Pixels>,
+        _layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        // Aligned as a whole within the bounds, as a `StyledText` line is,
+        // and on the baseline `paint_line` (gpui's line.rs) puts it on: half
+        // the leading above the ascent.
+        let slack = bounds.size.width - layout.width;
+        let shift = match window.text_style().text_align {
+            gpui::TextAlign::Left => px(0.0),
+            gpui::TextAlign::Center => slack / 2.0,
+            gpui::TextAlign::Right => slack,
+        };
+        let line = &layout.line;
+        let padding_top = (layout.line_height - line.ascent - line.descent) / 2.0;
+        let baseline = bounds.origin.y + padding_top + line.ascent;
+        let mut k = 0usize;
+        for run in &line.runs {
+            for glyph in &run.glyphs {
+                let x = layout.xs.get(k).copied().unwrap_or(0.0);
+                k += 1;
+                let origin = gpui::point(
+                    bounds.origin.x + shift + px(x),
+                    baseline + glyph.position.y,
+                );
+                // A glyph the atlas cannot take is lost for this frame, as a
+                // `StyledText` drops the error; the rest still paint.
+                let _ = if glyph.is_emoji {
+                    window.paint_emoji(origin, run.font_id, glyph.id, line.font_size)
+                } else {
+                    window.paint_glyph(origin, run.font_id, glyph.id, line.font_size, layout.color)
+                };
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl IntoElement for SpacedText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// A text node's drawing under an element that may set `letter-spacing`:
+/// `SpacedText` when the spacing is a valid, non-zero length, else GPUI's
+/// own text element, exactly as before the property was drawn.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn text_with_spacing(text: String, spacing: Option<LetterSpacing>) -> AnyElement {
+    match spacing {
+        Some(s) if s.to_px(1.0) != 0.0 => SpacedText::new(text, s).into_any_element(),
+        _ => text.into_any_element(),
     }
 }
 
@@ -1975,14 +2156,7 @@ pub fn apply_styles_to_div(
     // window showed neither. A width applies to every side unless a per-side
     // width names that side; a width without a colour draws in GPUI's
     // default border colour.
-    let all_sides = styles.border_width.as_deref().and_then(parse_px);
-    let side = |s: &Option<String>| s.as_deref().and_then(parse_px).or(all_sides);
-    let widths = [
-        side(&styles.border_top_width),
-        side(&styles.border_right_width),
-        side(&styles.border_bottom_width),
-        side(&styles.border_left_width),
-    ];
+    let widths = border_side_widths(styles);
     if widths.iter().any(|w| w.is_some()) {
         let st = el.style();
         if let Some(v) = widths[0] {
@@ -1998,14 +2172,28 @@ pub fn apply_styles_to_div(
             st.border_widths.left = Some(AbsoluteLength::Pixels(px(v)));
         }
     }
+    // A FRACTIONAL BORDER IS STROKED BY THE SHIM (`border_stroke`): GPUI
+    // keeps the width for layout but paints a quad's border snapped to whole
+    // device pixels, rounding half toward zero (`Window::paint_quad` ->
+    // `snap_border_widths` -> `round_stroke_to_device_pixel`, gpui-pre
+    // 0.3.5 window.rs and util.rs), so a 1.5px ring was drawn 1px wide. The
+    // element keeps its border widths (its box is laid out as before) but no
+    // border colour, so GPUI paints no border, and `with_border_stroke`
+    // paints it as an antialiased path of the exact width instead.
+    let stroke = border_stroke(styles);
     if let Some(color) = styles.border_color.as_deref().and_then(parse_color) {
-        el = el.border_color(color);
+        if stroke.is_none() {
+            el = el.border_color(color);
+        }
     }
     // `border-style: dashed` (a notice outlined rather than filled); any
     // other value keeps GPUI's solid border, as a browser does for the
     // styles it is not asked to vary here.
     if styles.border_style.as_deref().map(str::trim) == Some("dashed") {
         el = el.border_dashed();
+    }
+    if let Some(stroke) = stroke {
+        el = with_border_stroke(el, stroke);
     }
     // `font-family`: the face this element's text is set in.
     if let Some(ref family) = styles.font_family {
@@ -2034,6 +2222,18 @@ pub fn apply_styles_to_div(
     // Grotesk) is drawn upright -- see docs/shim-design.md, "Font Style".
     if let Some(style) = styles.font_style.as_deref().and_then(parse_font_style) {
         el.text_style().font_style = Some(style);
+    }
+    // `font-variant-numeric`: the figures the element's digits take, as the
+    // OpenType features the text system shapes with (`tabular-nums` is
+    // `tnum`, every digit one advance wide; `parse_font_variant_numeric`).
+    // GPUI hands them to its shaper per loaded font (on Linux, cosmic-text's
+    // `font_features`), so a face without the feature draws as before.
+    if let Some(features) = styles
+        .font_variant_numeric
+        .as_deref()
+        .and_then(parse_font_variant_numeric)
+    {
+        el = el.font_features(features);
     }
     // `text-align`: where the element's text lines sit in its box -- a
     // wrapped notice centred line by line, a column's figures at its right
@@ -2103,10 +2303,51 @@ pub fn parse_font_style(s: &str) -> Option<gpui::FontStyle> {
     }
 }
 
-/// A CSS `text-align` as GPUI's (https://www.w3.org/TR/css-text-3/#text-align-property):
-/// `left` / `start`, `center`, `right` / `end` (left-to-right text). `None`
-/// for anything else (`justify` among them, which GPUI cannot draw), which
-/// keeps the inherited alignment.
+/// A CSS `font-variant-numeric` as the OpenType features it stands for
+/// (https://www.w3.org/TR/css-fonts-4/#font-variant-numeric-prop, whose
+/// table names the feature of each keyword): `lining-nums` `lnum`,
+/// `oldstyle-nums` `onum`, `proportional-nums` `pnum`, `tabular-nums`
+/// `tnum`, `diagonal-fractions` `frac`, `stacked-fractions` `afrc`,
+/// `ordinal` `ordn`, `slashed-zero` `zero`, each switched on. `normal`
+/// switches none of them on, which drops features an ancestor asked for.
+/// `None` for an invalid value -- an unknown word, a word twice, or two
+/// words of one group (`lining-nums oldstyle-nums`) -- which keeps the
+/// inherited features, as a browser ignores an invalid declaration.
+///
+/// GPUI's `FontFeatures` replace the inherited set rather than adding to
+/// it; no other property of this shim sets features, so the two agree.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_font_variant_numeric(s: &str) -> Option<gpui::FontFeatures> {
+    let s = s.trim();
+    if s == "normal" {
+        return Some(gpui::FontFeatures(std::sync::Arc::new(Vec::new())));
+    }
+    // (keyword, its group, its feature); one keyword per group at most.
+    const KEYWORDS: [(&str, u8, &str); 8] = [
+        ("lining-nums", 0, "lnum"),
+        ("oldstyle-nums", 0, "onum"),
+        ("proportional-nums", 1, "pnum"),
+        ("tabular-nums", 1, "tnum"),
+        ("diagonal-fractions", 2, "frac"),
+        ("stacked-fractions", 2, "afrc"),
+        ("ordinal", 3, "ordn"),
+        ("slashed-zero", 4, "zero"),
+    ];
+    let mut seen = [false; 5];
+    let mut features = Vec::new();
+    for word in s.split_whitespace() {
+        let &(_, group, tag) = KEYWORDS.iter().find(|(k, _, _)| *k == word)?;
+        if std::mem::replace(&mut seen[group as usize], true) {
+            return None;
+        }
+        features.push((tag.to_string(), 1));
+    }
+    if features.is_empty() {
+        return None;
+    }
+    Some(gpui::FontFeatures(std::sync::Arc::new(features)))
+}
+
 /// The file a CSS `mask-image` names (https://www.w3.org/TR/css-masking-1/#the-mask-image):
 /// `url("path")`, `url('path')` or `url(path)`. `None` for anything else --
 /// `none`, a gradient, several layers -- which leaves the background
@@ -2125,16 +2366,159 @@ pub fn parse_mask_url(s: &str) -> Option<&str> {
     Some(path)
 }
 
+/// The border width `styles` asks for on each side -- top, right, bottom,
+/// left -- in logical pixels: a per-side width (`border-bottom-width`) where
+/// one names that side, else `border-width`, else none.
+pub fn border_side_widths(styles: &crate::render_sync::GpuiStyles) -> [Option<f32>; 4] {
+    let all_sides = styles.border_width.as_deref().and_then(parse_px);
+    let side = |s: &Option<String>| s.as_deref().and_then(parse_px).or(all_sides);
+    [
+        side(&styles.border_top_width),
+        side(&styles.border_right_width),
+        side(&styles.border_bottom_width),
+        side(&styles.border_left_width),
+    ]
+}
+
+/// A border the shim strokes itself (`with_border_stroke`), in place of
+/// GPUI's quad border.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BorderStroke {
+    /// The width, in logical pixels, on every side.
+    pub width: f32,
+    /// The radius of every corner of the border box.
+    pub radius: f32,
+    pub color: Hsla,
+}
+
+/// The border `styles` asks for, when GPUI's quad would draw it at another
+/// width: a SOLID border of one FRACTIONAL width on all four sides
+/// (`1.5px`), in a colour that parses, with one radius for every corner.
+/// GPUI snaps a quad border to whole device pixels, rounding half toward
+/// zero, so such a border is drawn a fraction of a pixel narrower than
+/// asked (1.5px as 1px). A whole width, a dashed border, per-side widths
+/// that differ or a per-corner radius are left to GPUI's quad as before.
+pub fn border_stroke(styles: &crate::render_sync::GpuiStyles) -> Option<BorderStroke> {
+    if styles.border_style.as_deref().map(str::trim) == Some("dashed") {
+        return None;
+    }
+    let widths = border_side_widths(styles);
+    let width = widths[0]?;
+    if widths.iter().any(|w| *w != Some(width)) || !(width > 0.0) || !width.is_finite() {
+        return None;
+    }
+    if (width - width.round()).abs() < 1e-3 {
+        return None;
+    }
+    if [&styles.rounded_tl, &styles.rounded_tr, &styles.rounded_br, &styles.rounded_bl]
+        .iter()
+        .any(|r| r.is_some())
+    {
+        return None;
+    }
+    let color = styles.border_color.as_deref().and_then(parse_color)?;
+    let radius = styles
+        .rounded
+        .as_deref()
+        .and_then(parse_px)
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .unwrap_or(0.0);
+    Some(BorderStroke { width, radius, color })
+}
+
+/// The centre line a border of `width` is stroked along, for a border box
+/// of `w` x `h` whose corners have `radius`: the box inset by half the
+/// width, its corners `radius - width / 2` (the radius of the border's
+/// middle, which is what keeps a stroke of `width` exactly between the
+/// border box's edge and its padding edge), at most half the inset box's
+/// shorter side. Returned as `(inset, radius)`.
+pub fn border_stroke_centre(w: f32, h: f32, width: f32, radius: f32) -> (f32, f32) {
+    let inset = width / 2.0;
+    let limit = ((w.min(h)) / 2.0 - inset).max(0.0);
+    (inset, (radius - inset).clamp(0.0, limit))
+}
+
+/// The element with its border painted by an antialiased path of the exact
+/// width (see `border_stroke`). The path is drawn by an absolutely
+/// positioned child covering the BORDER box (insets of minus the width:
+/// taffy resolves a child's insets against its parent's padding box), first
+/// among the children, so the border lies over the background and under
+/// whatever the element holds, as a browser paints it.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn with_border_stroke(el: Div, stroke: BorderStroke) -> Div {
+    let w = stroke.width;
+    el.child(
+        canvas(
+            |_bounds, _window, _cx| (),
+            move |bounds, (), window, _cx| {
+                let (inset, r) = border_stroke_centre(
+                    f32::from(bounds.size.width),
+                    f32::from(bounds.size.height),
+                    stroke.width,
+                    stroke.radius,
+                );
+                let l = f32::from(bounds.left()) + inset;
+                let t = f32::from(bounds.top()) + inset;
+                let rt = f32::from(bounds.right()) - inset;
+                let b = f32::from(bounds.bottom()) - inset;
+                if rt <= l || b <= t {
+                    return;
+                }
+                let p = |x: f32, y: f32| gpui::point(px(x), px(y));
+                let radii = gpui::point(px(r), px(r));
+                let mut path = gpui::PathBuilder::stroke(px(stroke.width));
+                path.move_to(p(l + r, t));
+                path.line_to(p(rt - r, t));
+                if r > 0.0 {
+                    path.arc_to(radii, px(0.0), false, true, p(rt, t + r));
+                }
+                path.line_to(p(rt, b - r));
+                if r > 0.0 {
+                    path.arc_to(radii, px(0.0), false, true, p(rt - r, b));
+                }
+                path.line_to(p(l + r, b));
+                if r > 0.0 {
+                    path.arc_to(radii, px(0.0), false, true, p(l, b - r));
+                }
+                path.line_to(p(l, t + r));
+                if r > 0.0 {
+                    path.arc_to(radii, px(0.0), false, true, p(l + r, t));
+                }
+                path.close();
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, stroke.color);
+                }
+            },
+        )
+        .absolute()
+        .top(px(-w))
+        .left(px(-w))
+        .right(px(-w))
+        .bottom(px(-w)),
+    )
+}
+
 /// The element's background painted THROUGH a mask: an SVG file's alpha,
 /// filling the box, in `color` -- CSS `background-color` under `mask-image`
 /// (https://www.w3.org/TR/css-masking-1/#the-mask-image), which is how a
-/// web front-end draws a one-colour icon in a theme's ink. GPUI's `svg()`
-/// renders the alpha mask at the box's DEVICE size and tints it, so the
-/// icon's edges are those of the shape at that size. An `img` of the same
-/// file is rasterised at twice its intrinsic size, un-premultiplied and
-/// minified on a 1x window with straight-alpha filtering, which darkens every
-/// antialiased edge (measured 2026-11-08: a 1px stroke of `#b0b0b0` at 0.7
-/// drew 64 over a 51 ground where the browser draws 94); see
+/// web front-end draws a one-colour icon in a theme's ink.
+///
+/// The mask is rasterised HERE, at the box's device size, into a picture of
+/// `color` whose alpha is the mask's coverage (`mask_picture`), and painted
+/// as a picture (`Window::paint_image`, a polychrome sprite) one texel per
+/// device pixel. GPUI's own `svg()` is not used, because it paints a
+/// MONOCHROME sprite, and GPUI's monochrome-sprite shader is its glyph
+/// shader: it applies the text system's light-on-dark contrast enhancement
+/// and gamma-1.8 alpha correction (`gpui-pre-wgpu` `shaders.wgsl`
+/// `fs_mono_sprite`, `apply_contrast_and_gamma_correction`) to every
+/// coverage value, which a browser does not do to a mask. Measured
+/// 2026-11-08 on CodeTracer's "+" (a 1px cross, `#b0b0b0` at 0.7 on
+/// `#333333`): the browser draws its half-covered arm pixels 94 and the
+/// three-quarter-covered centre 117, linear coverage; `svg()` drew 105 and
+/// 121, which is exactly that shader's correction of 0.5 and 0.75 (0.617
+/// and 0.800). An `img` of a recoloured SVG is no better: it is rasterised
+/// at twice its size, un-premultiplied and minified with straight-alpha
+/// filtering, which darkens every antialiased edge instead. See
 /// docs/shim-design.md, "Mask Image".
 ///
 /// The mask is an absolutely positioned child under the element's own
@@ -2142,21 +2526,153 @@ pub fn parse_mask_url(s: &str) -> Option<&str> {
 /// border are drawn as usual (a browser would mask them too; no consumer puts
 /// either on a masked element). It fills the box, which is
 /// `mask-size: contain; mask-position: center` when the mask's aspect is the
-/// box's. A file that is not an SVG GPUI can parse draws nothing (and is
-/// logged by GPUI).
+/// box's. A file that cannot be read or parsed as an SVG draws nothing.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 fn with_mask_image(el: Div, path: &str, color: Hsla) -> Div {
+    let path = path.to_string();
     el.child(
-        gpui::svg()
-            .external_path(path.to_string())
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .text_color(color),
+        canvas(
+            |_bounds, _window, _cx| (),
+            move |bounds, (), window, _cx| {
+                let device_w = (f32::from(bounds.size.width) * window.scale_factor()).round();
+                let device_h = (f32::from(bounds.size.height) * window.scale_factor()).round();
+                if device_w < 1.0 || device_h < 1.0 {
+                    return;
+                }
+                let key = MaskKey {
+                    path: path.clone(),
+                    width: device_w as u32,
+                    height: device_h as u32,
+                    bgra: mask_ink(color),
+                };
+                if let Some(picture) = cached_mask_picture(key) {
+                    let _ = window.paint_image(
+                        bounds,
+                        bounds,
+                        gpui::Corners::default(),
+                        picture,
+                        0,
+                        false,
+                    );
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
     )
 }
 
+/// What a mask picture is drawn from: the file, its size in device pixels
+/// and the ink, as straight-alpha BGRA bytes (the order `RenderImage` keeps).
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MaskKey {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    pub bgra: [u8; 4],
+}
+
+/// `color` as straight-alpha BGRA bytes.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn mask_ink(color: Hsla) -> [u8; 4] {
+    let c = color.to_rgb();
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [byte(c.b), byte(c.g), byte(c.r), byte(c.a)]
+}
+
+/// The pixels of a mask picture: the SVG `bytes` rasterised at exactly
+/// `width` x `height` device pixels (resvg's analytic coverage, the way a
+/// browser rasterises a mask at its device size), every pixel the ink `bgra`
+/// with alpha = the ink's alpha times the mask's alpha at that pixel.
+/// Straight (not premultiplied) BGRA, `width * height * 4` bytes; `None` for
+/// bytes that are not an SVG.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn mask_picture(bytes: &[u8], width: u32, height: u32, bgra: [u8; 4]) -> Option<Vec<u8>> {
+    MASK_RASTERISER.with(|svg| {
+        let parsed = svg.parse_svg(bytes).ok()?;
+        let size = gpui::size(
+            gpui::DevicePixels(width as i32),
+            gpui::DevicePixels(height as i32),
+        );
+        let raster = svg.render_parsed(&parsed, gpui::SvgSize::ExactSize(size)).ok()?;
+        let pixels = raster.as_bytes(0)?;
+        if raster.size(0) != size {
+            return None;
+        }
+        let mut out = Vec::with_capacity(pixels.len());
+        for px in pixels.chunks_exact(4) {
+            let alpha = (px[3] as u32 * bgra[3] as u32 + 127) / 255;
+            out.extend_from_slice(&[bgra[0], bgra[1], bgra[2], alpha as u8]);
+        }
+        Some(out)
+    })
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+thread_local! {
+    /// The SVG rasteriser masks are drawn with: GPUI's own (resvg), with no
+    /// asset source, since a mask is read from its file.
+    static MASK_RASTERISER: gpui::SvgRenderer =
+        gpui::SvgRenderer::new(std::sync::Arc::new(()));
+    /// The mask pictures drawn so far, newest last. Each `RenderImage` has its
+    /// own id, under which the window keeps it in its atlas, so a picture is
+    /// made once per key, not once per frame; the ones evicted go to
+    /// `EVICTED_IMAGES` for the window to release.
+    static MASK_CACHE: std::cell::RefCell<Vec<(MaskKey, Option<std::sync::Arc<gpui::RenderImage>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many mask pictures are kept: every icon a window shows, in each ink
+/// and size it shows it in.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const MASK_CACHE_SIZE: usize = 64;
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn cached_mask_picture(key: MaskKey) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    MASK_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
+            let entry = cache.remove(i);
+            let picture = entry.1.clone();
+            cache.push(entry);
+            return picture;
+        }
+        // A file that cannot be drawn is remembered too, so it is reported
+        // once rather than on every frame.
+        let picture = match std::fs::read(&key.path) {
+            Err(err) => {
+                eprintln!("gpui-nim-shim: mask-image: cannot read {}: {err}", key.path);
+                None
+            }
+            Ok(bytes) => match mask_picture(&bytes, key.width, key.height, key.bgra)
+                .and_then(|pixels| image::RgbaImage::from_raw(key.width, key.height, pixels))
+            {
+                None => {
+                    eprintln!("gpui-nim-shim: mask-image: {} is not an SVG it can draw", key.path);
+                    None
+                }
+                Some(buffer) => Some(std::sync::Arc::new(gpui::RenderImage::new(vec![
+                    image::Frame::new(buffer),
+                ]))),
+            },
+        };
+        cache.push((key, picture.clone()));
+        while cache.len() > MASK_CACHE_SIZE {
+            if let (_, Some(old)) = cache.remove(0) {
+                EVICTED_IMAGES.with(|e| e.borrow_mut().push(old));
+            }
+        }
+        picture
+    })
+}
+
+/// A CSS `text-align` as GPUI's (https://www.w3.org/TR/css-text-3/#text-align-property):
+/// `left` / `start`, `center`, `right` / `end` (left-to-right text). `None`
+/// for anything else (`justify` among them, which GPUI cannot draw), which
+/// keeps the inherited alignment.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn parse_text_align(s: &str) -> Option<gpui::TextAlign> {
     match s.trim() {
@@ -2186,6 +2702,74 @@ pub fn parse_line_height(s: &str) -> Option<gpui::DefiniteLength> {
     }
     let v = s.parse::<f32>().ok().filter(|v| *v > 0.0)?;
     Some(gpui::relative(v))
+}
+
+/// A CSS `letter-spacing` (https://www.w3.org/TR/css-text-3/#letter-spacing-property):
+/// a length added after every character, in pixels or in ems of the
+/// element's font size. `normal` is no extra space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LetterSpacing {
+    /// `Npx`.
+    Px(f32),
+    /// `Nem`, resolved against the font size the text is set in.
+    Em(f32),
+}
+
+impl LetterSpacing {
+    /// The spacing in pixels for text set at `font_size_px`.
+    pub fn to_px(self, font_size_px: f32) -> f32 {
+        match self {
+            LetterSpacing::Px(v) => v,
+            LetterSpacing::Em(v) => v * font_size_px,
+        }
+    }
+}
+
+/// Parse a CSS `letter-spacing`: `2px`, `0.03125em`, a bare `0`, or
+/// `normal` (zero). A negative length tightens the text, as in CSS.
+/// Anything else is `None`, which leaves the text as it is (a browser
+/// ignores an invalid declaration).
+pub fn parse_letter_spacing(s: &str) -> Option<LetterSpacing> {
+    let s = s.trim();
+    if s == "normal" {
+        return Some(LetterSpacing::Px(0.0));
+    }
+    let finite = |n: &str| n.trim().parse::<f32>().ok().filter(|v| v.is_finite());
+    if let Some(n) = s.strip_suffix("px") {
+        return finite(n).map(LetterSpacing::Px);
+    }
+    if let Some(n) = s.strip_suffix("em").filter(|n| !n.ends_with('r')) {
+        return finite(n).map(LetterSpacing::Em);
+    }
+    finite(s).filter(|v| *v == 0.0).map(LetterSpacing::Px)
+}
+
+/// Where each glyph of a line set with `spacing_px` after every character
+/// lands, and the line's width: a glyph moves right by the spacing of every
+/// character before it in the text (`ShapedGlyph::index` is its byte
+/// offset), and the line is wider by the spacing of every character,
+/// the last one included, as a browser sets `letter-spacing`
+/// (https://www.w3.org/TR/css-text-3/#letter-spacing-property: the space
+/// goes after each typographic character unit). Characters here are Unicode
+/// scalar values: the labels the shim spaces are Latin capitals, where the
+/// two agree. Returned in glyph order, run by run.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn letter_spaced_xs(
+    layout: &gpui::LineLayout,
+    text: &str,
+    spacing_px: f32,
+) -> (Vec<f32>, f32) {
+    let mut xs = Vec::new();
+    for run in &layout.runs {
+        for glyph in &run.glyphs {
+            let before = text
+                .get(..glyph.index.min(text.len()))
+                .map_or(0, |t| t.chars().count());
+            xs.push(f32::from(glyph.position.x) + before as f32 * spacing_px);
+        }
+    }
+    let width = f32::from(layout.width) + text.chars().count() as f32 * spacing_px;
+    (xs, width)
 }
 
 /// Parse a color from a CSS-like string.
@@ -2695,8 +3279,9 @@ mod tests {
     // (re-exported via use statements) that include a `test` proc macro
     // which shadows `#[test]` and causes infinite macro recursion.
     use super::{
-        active_window_id, apply_styles_to_div, file_image, launch_gpui_app, parse_font_style,
-        parse_line_height, parse_mask_url, parse_text_align, run_highlight,
+        active_window_id, apply_styles_to_div, file_image, launch_gpui_app, mask_picture,
+        parse_font_style, parse_font_variant_numeric, parse_line_height, parse_mask_url,
+        parse_text_align, run_highlight,
     };
     use gpui::Styled as _;
 
@@ -2758,6 +3343,140 @@ mod tests {
         assert_eq!(el.text_style().font_style, None);
     }
 
+    /// Each `font-variant-numeric` keyword names its OpenType feature, and
+    /// an invalid value is refused so the inherited features stay.
+    #[test]
+    fn test_font_variant_numeric_keywords_name_their_features() {
+        let tags = |s: &str| {
+            parse_font_variant_numeric(s).map(|f| {
+                f.tag_value_list()
+                    .iter()
+                    .map(|(t, v)| format!("{t}={v}"))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(tags("tabular-nums"), Some(vec!["tnum=1".to_string()]));
+        assert_eq!(tags(" proportional-nums "), Some(vec!["pnum=1".to_string()]));
+        assert_eq!(
+            tags("slashed-zero tabular-nums oldstyle-nums"),
+            Some(vec!["zero=1".into(), "tnum=1".into(), "onum=1".into()])
+        );
+        assert_eq!(tags("normal"), Some(vec![]), "normal switches every one off");
+        // Invalid, so the inherited features stay: two of one group, a word
+        // twice, an unknown word, `normal` with another, nothing at all.
+        assert_eq!(tags("tabular-nums proportional-nums"), None);
+        assert_eq!(tags("ordinal ordinal"), None);
+        assert_eq!(tags("tabular-numbers"), None);
+        assert_eq!(tags("normal tabular-nums"), None);
+        assert_eq!(tags(""), None);
+    }
+
+    /// `font-variant-numeric` is APPLIED to the drawn element's text style,
+    /// and an invalid value leaves it unstated.
+    #[test]
+    fn test_font_variant_numeric_is_applied_to_the_drawn_element() {
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.font_variant_numeric = Some("tabular-nums".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(
+            el.text_style().font_features.as_ref().map(|f| f.tag_value_list().to_vec()),
+            Some(vec![("tnum".to_string(), 1)])
+        );
+        styles.font_variant_numeric = Some("tabular".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert!(el.text_style().font_features.is_none(), "an invalid value draws nothing");
+    }
+
+    /// `letter-spacing` lengths: px, em (not rem), a bare 0, `normal`.
+    #[test]
+    fn test_parse_letter_spacing() {
+        use super::{parse_letter_spacing, LetterSpacing};
+        assert_eq!(parse_letter_spacing("2px"), Some(LetterSpacing::Px(2.0)));
+        assert_eq!(parse_letter_spacing(" 0.03125em "), Some(LetterSpacing::Em(0.03125)));
+        assert_eq!(parse_letter_spacing("-0.5px"), Some(LetterSpacing::Px(-0.5)));
+        assert_eq!(parse_letter_spacing("normal"), Some(LetterSpacing::Px(0.0)));
+        assert_eq!(parse_letter_spacing("0"), Some(LetterSpacing::Px(0.0)));
+        for bad in ["1rem", "2", "wide", "", "NaNpx", "1e40px"] {
+            assert_eq!(parse_letter_spacing(bad), None, "{bad:?}");
+        }
+        assert_eq!(LetterSpacing::Em(0.03125).to_px(12.0), 0.375);
+        assert_eq!(LetterSpacing::Px(2.0).to_px(12.0), 2.0);
+    }
+
+    /// Which borders the shim strokes itself: a solid border of one
+    /// FRACTIONAL width on every side, in a colour, with one radius. Every
+    /// other border stays GPUI's quad.
+    #[test]
+    fn test_border_stroke_takes_only_uniform_fractional_solid_borders() {
+        use super::{border_stroke, parse_color};
+        let ring = || {
+            let mut s = crate::render_sync::GpuiStyles::default();
+            s.border_width = Some("1.5px".into());
+            s.border_color = Some("#dddddd".into());
+            s.rounded = Some("4px".into());
+            s
+        };
+        let got = border_stroke(&ring()).expect("a 1.5px ring is stroked by the shim");
+        assert_eq!((got.width, got.radius), (1.5, 4.0));
+        assert_eq!(Some(got.color), parse_color("#dddddd"));
+        // Whole widths are GPUI's: it draws them at their width.
+        let mut whole = ring();
+        whole.border_width = Some("1px".into());
+        assert_eq!(border_stroke(&whole), None);
+        let mut dashed = ring();
+        dashed.border_style = Some("dashed".into());
+        assert_eq!(border_stroke(&dashed), None);
+        let mut one_side = ring();
+        one_side.border_width = None;
+        one_side.border_left_width = Some("1.5px".into());
+        assert_eq!(border_stroke(&one_side), None);
+        let mut corner = ring();
+        corner.rounded_tl = Some("2px".into());
+        assert_eq!(border_stroke(&corner), None);
+        let mut colourless = ring();
+        colourless.border_color = None;
+        assert_eq!(border_stroke(&colourless), None);
+    }
+
+    /// The stroke's centre line: half the width in from the border box, its
+    /// radius the border's middle radius, never past half the inset box.
+    #[test]
+    fn test_border_stroke_centre_line() {
+        use super::border_stroke_centre;
+        // CodeTracer's idle ring: an 8px circle, a 1.5px border.
+        assert_eq!(border_stroke_centre(8.0, 8.0, 1.5, 4.0), (0.75, 3.25));
+        // A square box: corners square.
+        assert_eq!(border_stroke_centre(40.0, 20.0, 1.5, 0.0), (0.75, 0.0));
+        // A radius larger than the box allows is held to it.
+        assert_eq!(border_stroke_centre(10.0, 6.0, 1.5, 20.0), (0.75, 2.25));
+    }
+
+    /// A FRACTIONAL BORDER IS NOT LEFT TO GPUI'S QUAD: the element keeps
+    /// its border widths, so its box is laid out as before, but no border
+    /// colour, so GPUI paints no border (it would snap 1.5px to 1px,
+    /// `Window::paint_quad`); the shim strokes it instead. A whole width is
+    /// still GPUI's, colour and all.
+    #[test]
+    fn test_a_fractional_border_keeps_its_width_and_leaves_gpui_no_colour() {
+        use gpui::Styled;
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.border_width = Some("1.5px".into());
+        styles.border_color = Some("#dddddd".into());
+        styles.rounded = Some("4px".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        let st = el.style();
+        assert_eq!(
+            st.border_widths.left,
+            Some(gpui::AbsoluteLength::Pixels(gpui::px(1.5))),
+            "the layout keeps the 1.5px border"
+        );
+        assert!(st.border_color.is_none(), "GPUI must not paint it: {:?}", st.border_color);
+        // Control: 2px is drawn by GPUI as before.
+        styles.border_width = Some("2px".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert!(el.style().border_color.is_some(), "a whole width keeps GPUI's border");
+    }
+
     /// `text-align` is APPLIED to the drawn element's text style, and an
     /// alignment GPUI cannot draw leaves it unstated.
     #[test]
@@ -2815,6 +3534,44 @@ mod tests {
         assert_eq!(run_highlight(&run).font_style, Some(gpui::FontStyle::Italic));
         let upright = crate::render_sync::InlineTextRun { font_style: None, ..run };
         assert_eq!(run_highlight(&upright).font_style, None);
+    }
+
+    /// A mask picture is the ink at the mask's LINEAR coverage, rasterised
+    /// at the device size it is painted at -- what a browser composites.
+    /// The "+" is CodeTracer's `session_tab_add.svg`: two 1px bars on the
+    /// half-pixel, so at 12x12 each arm covers half of two pixel columns
+    /// (alpha 128 of 255) and the four centre pixels three quarters (191).
+    /// GPUI's `svg()` turned the same 0.5 and 0.75 into 0.617 and 0.800 with
+    /// its glyph contrast and gamma correction (see `with_mask_image`).
+    #[test]
+    fn test_mask_picture_is_the_ink_at_linear_coverage() {
+        const PLUS: &[u8] = br##"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M6.5 5.5H12V6.5H6.5V12H5.5V6.5H0V5.5H5.5V0H6.5V5.5Z" fill="#DDDDDD"/>
+</svg>"##;
+        let ink = [0xb0, 0xb1, 0xb2, 0xff]; // B, G, R, A
+        let px = mask_picture(PLUS, 12, 12, ink).expect("an SVG");
+        assert_eq!(px.len(), 12 * 12 * 4);
+        let at = |x: usize, y: usize| &px[(y * 12 + x) * 4..(y * 12 + x) * 4 + 4];
+        // Every pixel carries the ink; only its alpha varies.
+        assert!(px.chunks_exact(4).all(|p| p[..3] == ink[..3]));
+        // Within one unit: the rasteriser rounds its coverage (resvg draws
+        // one arm's half at 127, the other's at 128). The glyph correction
+        // GPUI's `svg()` applied would read 157 and 204.
+        let near = |got: u8, want: u8| (got as i32 - want as i32).abs() <= 1;
+        assert_eq!(at(0, 0)[3], 0, "outside the cross");
+        assert!(near(at(5, 0)[3], 128), "an arm's half-covered column: {}", at(5, 0)[3]);
+        assert!(near(at(6, 11)[3], 128), "{}", at(6, 11)[3]);
+        assert!(near(at(0, 5)[3], 128), "the other arm: {}", at(0, 5)[3]);
+        assert!(near(at(5, 5)[3], 191), "the centre, three quarters: {}", at(5, 5)[3]);
+        assert!(near(at(6, 6)[3], 191), "{}", at(6, 6)[3]);
+        // At twice the size the bars cover whole device pixels.
+        let px2 = mask_picture(PLUS, 24, 24, ink).expect("an SVG");
+        assert_eq!(px2[(0 * 24 + 11) * 4 + 3], 255);
+        assert_eq!(px2[(0 * 24 + 10) * 4 + 3], 0);
+        // The ink's own alpha scales the coverage.
+        let half = mask_picture(PLUS, 12, 12, [0, 0, 0, 128]).expect("an SVG");
+        assert!(near(half[(5 * 12 + 5) * 4 + 3], 96)); // 191 * 128 / 255
+        assert_eq!(mask_picture(b"not an svg", 12, 12, ink), None);
     }
 
     #[test]
