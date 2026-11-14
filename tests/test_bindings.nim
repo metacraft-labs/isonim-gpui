@@ -124,6 +124,12 @@ static:
   assert compiles(gpui_get_attribute(e, "name".cstring, nil, 0.uint64))
   assert compiles(gpui_nth_child(e, 0.uint64))
   assert compiles(gpui_get_tag(e, nil, 0.uint64))
+  # The whole subtree in one call, and an id from it back to a handle.
+  assert compiles(gpui_snapshot_tree(e, nil, 0.uint64))
+  assert compiles(block:
+    var x: uint64 = gpui_snapshot_tree(e, nil, 0.uint64))
+  assert compiles(block:
+    var x: E = gpui_element_of_node_id(0.uint64))
   assert compiles(gpui_get_element_kind(e))
 
   # --- Window management ---
@@ -141,6 +147,7 @@ static:
   assert compiles(gpui_quit())
   assert compiles(gpui_quit_after_ms(1000.uint32))
   assert compiles(gpui_quit_requested())
+  assert compiles(gpui_set_tick(5000'u32, nil))
 
   var rcb: ResizeCallback
   var fcb: FocusCallback
@@ -152,6 +159,41 @@ static:
   assert compiles(gpui_notify_focus(1.uint32, 1.uint8))
   assert compiles(gpui_reset_windows())
 
+  # --- GWIN: window chrome state, identity, launch options ---
+  #
+  # Behaviour: `tests/test_window_environment.nim` and `window.rs`'s tests.
+  var sd: WindowStateDispatcher
+  assert compiles(gpui_window_decorations(1.uint32))
+  assert compiles(gpui_window_tiling(1.uint32))
+  assert compiles(gpui_window_controls(1.uint32))
+  assert compiles(gpui_window_is_maximized(1.uint32))
+  assert compiles(gpui_window_is_active(1.uint32))
+  assert compiles(gpui_window_button_layout(1.uint32))
+  assert compiles(gpui_set_window_state_dispatcher(sd))
+  assert compiles(gpui_on_window_state_id(1.uint32))
+  var ad: WindowActivatedDispatcher
+  assert compiles(gpui_set_window_activated_dispatcher(ad))
+  assert compiles(gpui_on_window_activated_id(1.uint32))
+  assert compiles(gpui_notify_window_activation(1.uint32, 0.uint8))
+  assert compiles(gpui_notify_window_state(1.uint32, 1.uint8, 0.uint8,
+                                           15.uint8, 0.uint8, 1.uint8,
+                                           ":close".cstring))
+  assert compiles(gpui_launch_window_id())
+  assert compiles(gpui_add_font_file("font.ttf".cstring))
+  assert compiles(gpui_set_app_id("codetracer".cstring))
+  assert compiles(gpui_set_min_window_size(1050.0.cdouble, 600.0.cdouble))
+  assert compiles(gpui_set_initial_window_state(1.uint8))
+  assert compiles(gpui_set_window_title(1.uint32, "title".cstring))
+  assert compiles(gpui_window_minimize())
+  assert compiles(gpui_window_toggle_maximize())
+  assert compiles(gpui_window_toggle_fullscreen())
+  assert compiles(gpui_window_request_close())
+
+  # --- PLAT-50: the system clipboard (`clipboard.rs`) ---
+  var clip: array[16, char]
+  assert compiles(gpui_write_clipboard("text".cstring))
+  assert compiles(gpui_clipboard_text(addr clip[0], 16.uint64))
+
   # --- PLAT-42: frame and key-latency statistics ---
   #
   # The per-frame render time and the key-to-frame latency the windowed
@@ -161,6 +203,14 @@ static:
   assert compiles(gpui_key_latency_count())
   assert compiles(gpui_key_latency_ns(0.uint64))
   assert compiles(gpui_frame_stats_reset())
+
+  # --- Laid-out bounds, image pixels and the window-level cursor ---
+  var xywh: array[4, float64]
+  assert compiles(gpui_layout_bounds(nil, addr xywh))
+  assert compiles(gpui_layout_bounds_reset())
+  assert compiles(gpui_set_image_rgba(nil, nil, 0.csize_t, 0'u32, 0'u32))
+  assert compiles(gpui_set_window_cursor(cstring""))
+  assert compiles(gpui_window_cursor())
 
   # --- Element event dispatcher (the element-callback registry) ---
   var disp: proc(callbackId: int32; payload: ptr GpuiEventPayload) {.cdecl.}
@@ -226,6 +276,10 @@ static:
   # --- Render plan inspection ---
   assert compiles(gpui_render_plan_json(e))
   assert compiles(gpui_free_string(nil))
+  # Declared by 06acc9f without a check here, which left this file red
+  # (the completeness scan above names it); covered alongside the free.
+  assert compiles(block:
+    var x: pointer = gpui_font_report())
   assert compiles(gpui_render_plan_element_count(e))
   assert compiles(gpui_verify_render_plan(e))
   assert compiles(block:
@@ -301,6 +355,8 @@ static:
     var x: uint8 = gpui_take_repaint_request())
   assert compiles(block:
     var x: uint8 = gpui_quit_requested())
+  assert compiles(block:
+    var x: uint8 = gpui_has_window_backend())
 
   # Verify functions that return uint32
   assert compiles(block:

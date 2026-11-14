@@ -90,6 +90,13 @@ UNITTEST_SUITES=(
 	# discriminating the moment the seam regresses, and this one is the
 	# only place `PLAT21-VG1`/`VG2`/`VG3` are asserted inside this repo.
 	tests/test_input_focus.nim
+	# GWIN-M1 (T3): window chrome state, the window-environment helper and
+	# the launch options through the real shim.
+	tests/test_window_environment.nim
+	# Whether a window can open at all: the shim's `gpui_has_window_backend`
+	# (this lane links the featureless shim, which must answer 0) and
+	# `display_session`'s mirror of GPUI's Linux platform choice.
+	tests/test_window_backend.nim
 )
 ASSERT_SCRIPTS=(
 	tests/test_basic.nim
@@ -173,7 +180,111 @@ BENCHMARKS=(
 #   * gpui-reactive 0 -> 5: the prediction above, fulfilled. The workspace's
 #     `../isonim` was fast-forwarded to its `dev`, which carries
 #     `NativeRootAccessor`, and the suite compiles and runs its five cases.
-EXPECTED_CASES=287
+# 2026-09-30, written LAST and from a run (trap 4c):
+#   157 rust unit  +  10 window-registry  +  15 cross-renderer
+# +  14 gui        +  31 render-integration  +  6 structural
+# +   5 gpui-reactive
+# +  27 input-focus
+# +   1 basic      +   1 bindings           + 23 renderer checkpoints
+# = 290
+#
+#   * rust 155 -> 157: `render_sync`'s per-side border/padding and
+#     absolute-placement keys (the window now draws them), and `window`'s
+#     host tick (`gpui_set_tick`: armed, disarmed, reset with the windows).
+#   * input-focus 26 -> 27: a pointer event decodes its window position,
+#     and a wheel its delta.
+#   The windowed border/weight/pointer/tick suite (`tests/test_gui_borders.nim`)
+#   needs a compositor and a virtual pointer and is NOT in this total; its
+#   home is `just test-gui-borders`.
+# GWIN-M1, 2026-10-13, written LAST and from a run (trap 4c):
+#   167 rust unit  +  10 window-registry  +  15 cross-renderer
+# +  14 gui        +  31 render-integration  +  6 structural
+# +   5 gpui-reactive
+# +  28 input-focus
+# +  17 window-environment
+# +   1 basic      +   1 bindings           + 23 renderer checkpoints
+# = 318
+#
+#   * rust 157 -> 167. Seven are GWIN-M1's `window` tests (chrome state
+#     and its dispatch, the default state, the button-layout syntax, GPUI's
+#     fallback layout not passed off as the desktop's, the decorations
+#     override, the launch options, the run-time title). The
+#     other three landed since 2026-09-30 without moving this figure:
+#     `clipboard`'s `write_keeps_the_text_and_one_pending_copy` (76b2a2c),
+#     `render_sync`'s `test_styles_text_decoration` (a76a77d) and
+#     `window`'s `test_every_arming_moves_the_generation` (11b2faa).
+#   * input-focus 27 -> 28: a76a77d's modifier-change event kind.
+#   * window-environment is new: GWIN-M1's T3 suite.
+#   * bindings stays one checkpoint, but it was RED before this change:
+#     76b2a2c declared `gpui_write_clipboard` / `gpui_clipboard_text` and
+#     `test_bindings` never exercised them. Both are now covered there.
+# GWIN-M2, 2026-10-16, written LAST and from a run (trap 4c): 324.
+#   * rust 167 -> 173: `frame`'s five geometry tests (no frame under
+#     server-side decorations, a band on every untiled side, none when
+#     maximized, none on a tiled side, every edge and corner found where it
+#     is with corners winning) and `window`'s content-origin round trip.
+#   The frame's own window suite (`tests/test_gui_window_frame.nim`) needs a
+#   compositor and GuiAssert and is NOT in this total; its home is
+#   `just test-gui-window-frame`.
+# GWIN-M3, 2026-10-16, written LAST and from a run (trap 4c): 329.
+#   * rust 173 -> 178: `regions`' four (the attribute's values, pointer
+#     listeners as implicitly no-drag, a claim lasting one press, one press
+#     arming one move) and `window`'s queue of window operations.
+# GWIN-M4, 2026-10-16, written LAST and from a run (trap 4c): 332.
+#   * rust 178 -> 181: `regions`' fallback-title-bar button policy — a
+#     configured layout followed, unsupported operations dropped, the
+#     platform convention when none is configured (the cases
+#     `test_window_environment.nim` runs against the Nim helper).
+# 2026-10-20, written LAST and from a run (trap 4c), at `058d5e1` with the
+# window-backend change uncommitted: 372.
+#   * THE LANE WAS ALREADY RED BEFORE THIS CHANGE, by drift: at `058d5e1`
+#     unmodified, `cargo test` passed 211 Rust cases (measured, with only
+#     this change's `lib.rs` stashed), where the GWIN-M4 figure was 181 and
+#     the 336 above was never annotated. So 336 -> 362 is the Rust cases that
+#     landed since without moving this figure.
+#   * 362 -> 372 is this change: `lib.rs`'s
+#     `test_has_window_backend_matches_the_build` (+1) and the new
+#     `tests/test_window_backend.nim` (+9: the shim's answer and
+#     `display_session`'s mirror of GPUI's platform choice).
+#   * `test_bindings` stays one checkpoint, but it was RED at `058d5e1`:
+#     06acc9f declared `gpui_font_report` without exercising it there. It is
+#     covered now, beside `gpui_has_window_backend`.
+# 2026-10-21, written LAST and from a run (trap 4c), at `d4325e9` with the
+# window-activation change uncommitted: 382.
+#   * rust 212 -> 217: `window`'s four activation-edge cases (the edge and
+#     only the edge, a deactivation no frame sampled, only to an opted-in
+#     window, after the same sample's state dispatch) and `lib.rs`'s C-ABI
+#     round trip of it.
+#   * window-environment 17 -> 22: `onWindowActivated`'s five cases.
+# 2026-11-08, written LAST and from a run (trap 4c), at `c374ad4`: 399.
+#   * THE LANE WAS RED BY DRIFT AGAIN: four commits added default-build Rust
+#     cases without moving this figure. rust 217 -> 234, every other
+#     subject unchanged:
+#       `d903afa` +1  (`render_sync`: a container that spaces its children)
+#       `b2958f8` +13 (`render_sync`: +15 / -2, fused padded spans)
+#       `fbce43d` +1  (`layout_bounds`: the laid-out bounds read-back)
+#       `c374ad4` +2  (`render_sync`: pictures, italic, text-align, masks)
+#     The same commits' `gpui_app.rs` and `tests/gpui_rendering.rs` cases
+#     are `gpui-backend` / `gpui-headless` only, so they are counted by the
+#     `--with-gpui` arms, not here.
+# 2026-11-09, written LAST and from a run (trap 4c), at `de9d6e4` with the
+# whole-subtree snapshot (`gpui_snapshot_tree`) uncommitted: 401.
+#   * THE LANE WAS ALREADY RED BY DRIFT at `de9d6e4` unmodified: `cargo test`
+#     passed 235 Rust cases there (measured in a clean worktree), where the
+#     figure above counted 217, so the lane read 400 against 382.
+#   * 400 -> 401 is this change: `lib.rs`'s
+#     `test_snapshot_tree_preorder_with_attributes` (+1). `test_bindings`
+#     stays one checkpoint (it covers the two new bindings) and
+#     `test_renderer`'s snapshot checks sit in its tree-operations block.
+# 2026-11-12, written LAST and from a run (trap 4c), at `62298a8` merged
+# with `agents` at `9833561`: 403.
+#   * The two entries above were written in parallel on two branches from
+#     the same 382 base, so neither counts the other's commits. The merge
+#     runs rust 238: the 234 of the `c374ad4` entry plus one default-build
+#     Rust case from each of `de9d6e4` (`render_sync`), `28f1113` (`lib.rs`,
+#     the +1 named above), `dd50286` (`lib.rs`) and `9833561`
+#     (`layout_bounds`). Every Nim subject is unchanged (165 cases).
+EXPECTED_CASES=403
 
 total_cases=0
 failed_steps=()
@@ -204,14 +315,35 @@ run_gate "gate: Rust exports == Nim bindings" ./tools/check_bindings.sh
 # default build that exported 56, while every GPUI launcher died at load
 # with "could not import: gpui_bump_generation". Traps §18.
 run_gate "gate: Nim bindings == built shim exports" ./tools/check_exported_symbols.sh
+run_gate "gate: explicit shim path controls the loader" bash ci/test-shim-path.sh
+run_gate "gate: the shim input digest sees every input state" bash ci/test-shim-input-digest.sh
 run_gate "gate: trap-13 assertion-helper sweep" python3 tools/trap13-assertion-helper-sweep.py tests src
 
 # --- 1. The Rust shim --------------------------------------------------
+# A failing cargo step must show its CAUSE, not just its summary. The
+# filtered views below (`tail -5`, the `^test result|^running|^error` grep)
+# keep a passing log short, but on a failure they reduce a link error to
+# "error: linking with `cc` failed: exit status: 1" and drop rustc's
+# `note:` block -- the linker command line and the undefined symbols or
+# missing `-l` libraries it reports. That is how the linux-arm64
+# `--with-gpui` lane failed on CI with no diagnosable output. Print the
+# tail of the captured output (the whole of it when shorter) whenever the
+# step exits non-zero. Pass/fail and case counting are untouched: this
+# only adds output.
+CARGO_FAILURE_TAIL_LINES=200
+show_cargo_failure() { # step-name, rc, captured-output
+	[ "$2" -eq 0 ] && return 0
+	echo "--- $1 FAILED (rc=$2); last $CARGO_FAILURE_TAIL_LINES lines of its output:"
+	printf '%s\n' "$3" | tail -n "$CARGO_FAILURE_TAIL_LINES"
+	echo "--- end of $1 output"
+}
+
 echo ""
 echo "--- rust: cargo build"
 cargo_out="$(cd rust && cargo build 2>&1)"
 cargo_rc=$?
 printf '%s\n' "$cargo_out" | tail -5
+show_cargo_failure "rust: cargo build" "$cargo_rc" "$cargo_out"
 [ "$cargo_rc" -eq 0 ] || failed_steps+=("rust: cargo build (rc=$cargo_rc)")
 REPORT+=("$(printf '%-46s rc=%-3s cases=%s' "rust: cargo build" "$cargo_rc" "n/a")")
 
@@ -220,6 +352,7 @@ echo "--- rust: cargo test"
 cargo_out="$(cd rust && cargo test 2>&1)"
 cargo_rc=$?
 printf '%s\n' "$cargo_out" | grep -E '^test result|^running|^error' || true
+show_cargo_failure "rust: cargo test" "$cargo_rc" "$cargo_out"
 [ "$cargo_rc" -eq 0 ] || failed_steps+=("rust: cargo test (rc=$cargo_rc)")
 rust_cases="$(printf '%s\n' "$cargo_out" |
 	sed -n 's/^test result: ok\. \([0-9]\{1,\}\) passed.*/\1/p' |
@@ -243,6 +376,7 @@ if [ "$WITH_GPUI" -eq 1 ]; then
 		cargo_out="$(cd rust && cargo test --features "$feat" 2>&1)"
 		cargo_rc=$?
 		printf '%s\n' "$cargo_out" | grep -E '^test result|^running|^error' || true
+		show_cargo_failure "rust: cargo test --features $feat" "$cargo_rc" "$cargo_out"
 		[ "$cargo_rc" -eq 0 ] || failed_steps+=("rust: cargo test --features $feat (rc=$cargo_rc)")
 		feat_cases="$(printf '%s\n' "$cargo_out" |
 			sed -n 's/^test result: ok\. \([0-9]\{1,\}\) passed.*/\1/p' |

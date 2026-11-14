@@ -245,6 +245,116 @@ fi
 
 COMPOSITOR_LOG="$XDG_RUNTIME_DIR/$COMPOSITOR.log"
 
+# --- The session bus (headless) ---------------------------------------
+#
+# Headless: a PRIVATE session bus, started here from the dev shell's own
+# dbus with a configuration written here (see "THE BUS ACTIVATES NOTHING"
+# below). Without it the run depends
+# on the host in a way nothing in this repository declares:
+#
+#   * nixpkgs' `sway` is a wrapper that, when DBUS_SESSION_BUS_ADDRESS is
+#     empty, re-execs sway under `dbus-run-session`. That starts
+#     `dbus-daemon --session`, whose compiled-in default configuration is
+#     `/etc/dbus-1/session.conf` -- a HOST file. The CI guests have no such
+#     file, so there sway never started and the `gui-tests` job failed
+#     before any test ran (isonim-gpui CI run 36644786213, 2026-09-30):
+#         dbus[54940]: Failed to start message bus: Failed to open
+#         "/etc/dbus-1/session.conf": No such file or directory
+#   * where a session bus DOES exist (a desktop workstation), sway and the
+#     GPUI window under test joined the USER'S bus, so a local run and a CI
+#     run were not the same experiment.
+#
+# With the address exported, the sway wrapper takes its "bus already
+# present" branch and execs sway itself, so COMPOSITOR_PID stays sway's
+# PID and the cleanup below stops the compositor and this bus separately.
+#
+# THE BUS ACTIVATES NOTHING. Its configuration is written here rather than
+# taken from the dev shell's `session.conf`, because that file is not
+# self-contained: it declares `<standard_session_servicedirs/>`, i.e. every
+# `dbus-1/services` directory on `XDG_DATA_DIRS` -- which inherits the
+# host's `/run/current-system/sw/share` -- and it includes
+# `/etc/dbus-1/session.conf`, a host file again. So whatever D-Bus services
+# the host has installed became activatable on this "private" bus. On a
+# host with xdg-desktop-portal installed -- the CI runner of the run cited
+# below is one, while a host without it never showed the defect -- GPUI's
+# startup query of the Settings portal (`gpui_linux`'s xdg_desktop_portal)
+# activated `xdg-desktop-portal`, which activated `xdg-document-portal`,
+# which mounted a FUSE filesystem at `$XDG_RUNTIME_DIR/doc`. Stopping the
+# bus ends the portal, its mount goes stale, and the `rm -rf` below fails
+# on it (isonim-gpui CI run 43307312907, 2026-11-12):
+#     rm: cannot remove '/tmp/isonim-gpui-wl-127zFd/doc/by-app':
+#         Transport endpoint is not connected
+# leaving the runtime directory behind and failing the lane after every
+# test had passed. It also made the run host-dependent in the way the
+# private bus exists to prevent: GPUI's appearance settings came from
+# whatever portal the host provided, or from none.
+#
+# Nothing this harness runs needs an activatable service, so the bus has
+# no service directories at all: a client asking for one gets
+# `ServiceUnknown` (GPUI then uses its built-in defaults), the same answer
+# on every host. The policy is the permissive one of the stock session bus
+# (`dbus-daemon(1)`, CONFIGURATION FILE; the dev shell's `session.conf`).
+#
+# Nested (`--window`): keep the host's bus, for the reason the runtime
+# directory above is kept.
+DBUS_DAEMON_PID=""
+stop_session_bus() {
+  if [[ -n "${DBUS_DAEMON_PID:-}" ]]; then
+    kill "$DBUS_DAEMON_PID" 2>/dev/null || true
+    DBUS_DAEMON_PID=""
+  fi
+}
+if [[ "$USE_HEADLESS" == "1" ]]; then
+  if ! _dbus_daemon="$(command -v dbus-daemon)"; then
+    echo "Error: dbus-daemon not found. Ensure dbus is in your nix dev shell." >&2
+    rm -rf "$XDG_RUNTIME_DIR"
+    exit 1
+  fi
+  # No <servicedir>, no <standard_session_servicedirs/> and no <include>:
+  # see "THE BUS ACTIVATES NOTHING" above. The heredoc expands only
+  # `$XDG_RUNTIME_DIR`, which `mktemp` above made of characters that need
+  # no XML escaping.
+  _dbus_conf="$XDG_RUNTIME_DIR/dbus-session.conf"
+  cat >"$_dbus_conf" <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <keep_umask/>
+  <listen>unix:path=$XDG_RUNTIME_DIR/bus</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+EOF
+  # `--fork` returns once the bus is listening; the address is printed
+  # first and the PID second (dbus-daemon(1), --print-address/--print-pid).
+  if ! _dbus_out="$(dbus-daemon --config-file="$_dbus_conf" \
+    --nopidfile --fork --print-address=1 --print-pid=1)"; then
+    echo "Error: could not start a private session bus with $_dbus_conf" >&2
+    rm -rf "$XDG_RUNTIME_DIR"
+    exit 1
+  fi
+  DBUS_SESSION_BUS_ADDRESS="$(sed -n 1p <<<"$_dbus_out")"
+  DBUS_DAEMON_PID="$(sed -n 2p <<<"$_dbus_out")"
+  if [[ -z "$DBUS_SESSION_BUS_ADDRESS" ]] || ! [[ "$DBUS_DAEMON_PID" =~ ^[0-9]+$ ]]; then
+    echo "Error: unexpected dbus-daemon output: $_dbus_out" >&2
+    [[ "$DBUS_DAEMON_PID" =~ ^[0-9]+$ ]] && kill "$DBUS_DAEMON_PID" 2>/dev/null
+    rm -rf "$XDG_RUNTIME_DIR"
+    exit 1
+  fi
+  export DBUS_SESSION_BUS_ADDRESS
+  echo "Private session bus: $DBUS_SESSION_BUS_ADDRESS (PID $DBUS_DAEMON_PID)"
+  # `--fork` detaches the daemon from this script, so nothing else stops
+  # it if the script exits before `cleanup` is installed below -- and
+  # under `set -e` any failing command between here and there is such an
+  # exit. `trap cleanup EXIT` replaces this; `cleanup` stops the bus too.
+  trap stop_session_bus EXIT
+fi
+
 # Comma-joined list of the wayland sockets already present, so
 # `wait_for_socket` can tell a pre-existing one from the compositor's.
 # Empty in headless mode, where the runtime dir is private and new.
@@ -312,12 +422,32 @@ if ! SOCKET="$(wait_for_socket "$SEEN")"; then
   echo "--- $COMPOSITOR log ---" >&2
   cat "$COMPOSITOR_LOG" >&2 || true
   kill "$COMPOSITOR_PID" 2>/dev/null || true
+  stop_session_bus
   [[ "${CLEANUP_XDG:-0}" == "1" ]] && rm -rf "$XDG_RUNTIME_DIR"
   exit 1
 fi
 echo "$COMPOSITOR created socket: $SOCKET"
 
 export WAYLAND_DISPLAY="$SOCKET"
+
+# Sway's IPC socket, so a test can drive the compositor's own seat —
+# `swaymsg seat seat0 cursor set/press/release` is a real `wl_pointer` event,
+# routed to the surface under it exactly as a mouse's would be
+# (`tests/test_gui_borders.nim`). Sway names it `sway-ipc.<uid>.<pid>.sock`
+# in the runtime directory.
+if [[ "$COMPOSITOR" == "sway" ]]; then
+  for _ in {1..50}; do
+    # `|| true`: until sway creates the socket the glob does not match and
+    # `ls` fails, which under `set -eo pipefail` would end the script here,
+    # before `cleanup` is installed, leaving the compositor running.
+    _ipc="$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*."$COMPOSITOR_PID".sock 2>/dev/null | head -1 || true)"
+    [[ -n "$_ipc" ]] && break
+    sleep 0.1
+  done
+  if [[ -n "${_ipc:-}" ]]; then
+    export SWAYSOCK="$_ipc"
+  fi
+fi
 
 cleanup() {
   local exit_code=$?
@@ -352,6 +482,9 @@ cleanup() {
     fi
     wait "$COMPOSITOR_PID" 2>/dev/null || true
   fi
+
+  # After the compositor, which is a client of it.
+  stop_session_bus
 
   if [[ "${CLEANUP_XDG:-0}" == "1" ]]; then
     rm -rf "$XDG_RUNTIME_DIR"

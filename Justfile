@@ -12,6 +12,13 @@ rust-check-gpui:
 rust-build:
     cd rust && cargo build
 
+# Build the project: the default (feature-less) Rust shim, the one artefact
+# this repository ships — the Nim side is a source library. This is what
+# `repro build`'s `default` collection builds, and the standard recipe
+# `.github/workflows/ci-reprobuild.yml` cross-checks it against; without it
+# that step failed with "Justfile does not contain recipe `build`".
+build: rust-build
+
 # Build the Rust shim in release mode
 rust-build-release:
     cd rust && cargo build --release
@@ -27,6 +34,16 @@ nim-check-renderer:
 # Run Rust tests
 rust-test:
     cd rust && cargo test
+
+# macOS: `GPUIWindow` keeps a frame larger than the display instead of being
+# fitted to its visible frame (`rust/gpui-nim-shim/src/mac_window_frame.rs`).
+# Needs a live GUI session with a screen: it opens real AppKit windows, and it
+# FAILS rather than skips without one, because then it cannot show the clamp
+# it guards against. `ci/run-suite.sh --with-gpui` runs it as part of
+# `cargo test --features gpui-backend`; this recipe runs it alone. Off macOS
+# the binary reports that it has nothing to test.
+rust-test-window-frame:
+    cd rust && cargo test -p gpui-nim-shim --features gpui-backend --test test_mac_window_frame
 
 # Run Nim tests (requires Rust shim to be built: just rust-build)
 test:
@@ -106,7 +123,22 @@ test-reactive-root:
 test-reconciler:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --path:../isonim/src -d:isonimHmr --nimcache:nimcache/test_gpui_reconciler tests/test_gpui_reconciler_identity.nim
 
-test-all: check-exported-symbols rust-test test test-cross test-integration test-structural test-reactive-root test-reconciler
+# The window frame, title bars and window operations on REAL compositors:
+# GuiAssert's headless sway and headless GNOME Shell targets drive
+# `tests/gui/window_frame_app.nim` (built here against the windowed shim)
+# and check it against what each compositor reports. Linux; needs
+# ../GuiAssert. `GUIENV_TARGETS=gnome just test-gui-window-frame` for one.
+test-gui-window-frame:
+    bash scripts/run-window-frame-suite.sh
+
+# Whether a window can open at all: `gpui_has_window_backend` from the shim
+# this binary loads (the default build must answer 0) and `display_session`,
+# the mirror of GPUI's Linux platform choice. Requires the Rust shim
+# (`just rust-build`) for the reason `test-reactive-root` gives.
+test-window-backend:
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_window_backend tests/test_window_backend.nim
+
+test-all: check-exported-symbols rust-test test test-cross test-integration test-structural test-reactive-root test-reconciler test-window-backend
 
 # Run the GUI tests, including the windowed pixel case, under headless
 # sway. THIS IS THE GUI LANE. (RS-M14b)
@@ -121,7 +153,7 @@ test-all: check-exported-symbols rust-test test test-cross test-integration test
 # §18, *pin the image, or the manifest measures whichever build ran last*.
 # PLAT-38 fixed this for `test-gui-keyboard` and recorded the same hazard
 # here; closing it is PLAT-37's, and this is it.
-test-gui *ARGS:
+test-gui *ARGS: test-virtual-pointer
     #!/usr/bin/env bash
     set -uo pipefail
     (cd rust && cargo build --features gpui-backend) || exit $?
@@ -130,6 +162,10 @@ test-gui *ARGS:
     # Restored WHATEVER the outcome, for the reason above.
     (cd rust && cargo build) || true
     exit $rc
+
+# The input device's button protocol is part of every real-window lane.
+test-virtual-pointer:
+    bash scripts/test-virtual-pointer.sh
 
 test-gui-wayland *ARGS:
     just test-gui {{ARGS}}
@@ -190,30 +226,118 @@ plat42-gpui-kit-probe:
 #   headless     `--features gpui-headless`. `gpui_render_to_pixels` over
 #                `HeadlessAppContext` + `Window::render_to_image`. No
 #                compositor, and NOT a substitute for the windowed path.
+# THE THREE PLATFORM FACTS, SEPARATED FROM THE ONE CAPABILITY FACT. Until
+# 2026-10-02 this recipe hard-coded `.so`, `ldd` and `nm -D`, none of which
+# is valid on macOS, so it failed there at `cp` with a missing file —
+# reporting a MISSING ARTEFACT for what is only a different spelling. That is
+# the producer half of `codetracer-specs/issues/2026-09-29-gpui-window-
+# capture-lanes-are-wayland-only.md`, whose first suggested step is exactly
+# this: separate *"needs a compositor"* (a real capability gap on macOS) from
+# *"needs Linux"* (a one-line answer). The capability gap is untouched here
+# and still belongs to that issue; what is fixed is that the three shims and
+# their symbol tables can now be PRODUCED on macOS, which is what the
+# compositor-free `gpui-headless` pixel path needs in order to be measured at
+# all.
+#
+#   extension   `.so` / `.dylib`
+#   link closure `ldd` / `otool -L`
+#   symbol table `nm -D --defined-only` / `nm -gU`  (Mach-O has no `-D`, and
+#               `-gU` is "global, defined only"; the leading `_` that the
+#               Mach-O ABI prepends is stripped so the two platforms' symbol
+#               files are comparable line for line)
 plat37-shims:
     #!/usr/bin/env bash
     set -euo pipefail
     out="rust/target/plat37"
     mkdir -p "$out"
+    case "$(uname -s)" in
+      Darwin) dylib_ext="dylib" ;;
+      *)      dylib_ext="so" ;;
+    esac
+    link_closure() {
+      if [ "${dylib_ext}" = "dylib" ]; then
+        otool -L "$1"
+      else
+        env -u LD_LIBRARY_PATH ldd "$1"
+      fi
+    }
+    exported_gpui_symbols() {
+      if [ "${dylib_ext}" = "dylib" ]; then
+        nm -gU "$1" | awk '{print $NF}' | sed 's/^_//'
+      else
+        nm -D --defined-only "$1" | awk '{print $NF}'
+      fi
+    }
+    # THE STAMP DIGEST IS TAKEN BEFORE THE FIRST BUILD, so a source edited while
+    # cargo runs reads as stale afterwards rather than being vouched for by a
+    # shim that may not contain it. A consumer that stages one of these shims
+    # recomputes the same digest and refuses a mismatch; see the header of
+    # `tools/shim_input_digest.sh`.
+    input_digest="$(bash tools/shim_input_digest.sh "$PWD")"
     for spec in "featureless:" "windowed:--features gpui-backend" "headless:--features gpui-headless"; do
       config="${spec%%:*}"
       flags="${spec#*:}"
       echo "=== ${config} ${flags:-(default)} ==="
+      # Removed first, so a build that fails leaves no stamp vouching for the
+      # previous shim against this tree.
+      rm -f "$out/${config}.build-stamp"
+      # THE UPLIFTED ARTEFACT IS DELETED BEFORE EVERY BUILD, because cargo
+      # decides freshness from its fingerprints and the dep-info mtimes, never
+      # from the bytes of the output. `target/debug/libgpui_nim_shim.so` is a
+      # HARDLINK to `target/debug/deps/libgpui_nim_shim.so`, so any `cp` onto
+      # the uplifted path (codetracer's `plat37-capture` swapped arms that way
+      # until 2026-10-18) rewrites cargo's own cached output; the next
+      # `cargo build` then reports the unit fresh and re-uplifts the foreign
+      # bytes. Measured 2026-10-18: the staged FEATURELESS shim was
+      # byte-identical to the headless one (341,153,248 bytes, a gpui
+      # closure), while a genuine featureless link is 8,083,520 bytes with
+      # libgcc + libc only. A MISSING output does make cargo relink (measured:
+      # "Compiling gpui-nim-shim" after the two `rm`s), so this is the
+      # cheapest way to make every staged file the build its name says.
+      rm -f "rust/target/debug/libgpui_nim_shim.${dylib_ext}" \
+        "rust/target/debug/deps/libgpui_nim_shim.${dylib_ext}"
       # shellcheck disable=SC2086  # the flag string must word-split
-      (cd rust && cargo build ${flags})
-      cp rust/target/debug/libgpui_nim_shim.so "$out/libgpui_nim_shim.${config}.so"
-      ldd "$out/libgpui_nim_shim.${config}.so" > "$out/${config}.ldd.txt" 2>&1 || true
-      nm -D --defined-only "$out/libgpui_nim_shim.${config}.so" \
-        | awk '{print $NF}' | grep '^gpui_' | sort -u > "$out/${config}.symbols.txt"
-      echo "  $(wc -c <"$out/libgpui_nim_shim.${config}.so") bytes, \
-    $(wc -l <"$out/${config}.ldd.txt") ldd entries, \
+      (cd rust && cargo build -p gpui-nim-shim ${flags})
+      staged="$out/libgpui_nim_shim.${config}.${dylib_ext}"
+      cp "rust/target/debug/libgpui_nim_shim.${dylib_ext}" "${staged}"
+      link_closure "${staged}" > "$out/${config}.links.txt" 2>&1 || true
+      exported_gpui_symbols "${staged}" | grep '^gpui_' | sort -u \
+        > "$out/${config}.symbols.txt"
+      bash tools/write_shim_stamp.sh "$out/${config}.build-stamp" "$PWD/${staged}" \
+        "${input_digest}" "${config}"
+      echo "  $(wc -c <"${staged}") bytes, \
+    $(wc -l <"$out/${config}.links.txt") link entries, \
     $(wc -l <"$out/${config}.symbols.txt") gpui_ symbols"
     done
     # The default profile is left in `target/debug`, because that is the one
     # every OTHER consumer of this repo expects to find there. A recipe that
     # left a 544 MB windowed cdylib at the shared path would change what the
     # 237-case lane and both sibling repos link, silently.
-    (cd rust && cargo build)
+    rm -f "rust/target/debug/libgpui_nim_shim.${dylib_ext}" \
+      "rust/target/debug/deps/libgpui_nim_shim.${dylib_ext}"
+    (cd rust && cargo build -p gpui-nim-shim)
+    # THE STAMPS CLAIM THE DIGEST TAKEN BEFORE THE FIRST BUILD, so they are true
+    # only if the build left the inputs alone. cargo rewrites an out-of-date
+    # `Cargo.lock`, and that is an input; left alone, a consumer would refuse
+    # these shims and name this recipe as the remedy, with nothing here to say
+    # why a successful run had not cleared it.
+    if [ "$(bash tools/shim_input_digest.sh "$PWD")" != "${input_digest}" ]; then
+      rm -f "$out"/*.build-stamp
+      echo "FAIL: the shim inputs changed during this build, so no stamp was kept." >&2
+      echo "  Review the changes (git status), then run this recipe again." >&2
+      exit 1
+    fi
+    # Three configurations that produced the same bytes are one build under
+    # three names — the stale-artefact state above — so that is refused here
+    # rather than discovered by a differential that compared a build with
+    # itself.
+    sums="$(for c in featureless windowed headless; do
+      cksum <"$out/libgpui_nim_shim.${c}.${dylib_ext}"; done | sort -u | wc -l)"
+    if [ "${sums}" -ne 3 ]; then
+      rm -f "$out"/*.build-stamp
+      echo "FAIL: the three staged shims are not three distinct builds" >&2
+      exit 1
+    fi
     echo "OK: three shims in ${out}"
 
 # Run the GUI tests with video recording.
@@ -259,6 +383,22 @@ test-gui-x11:
 # Internal: actual GUI test commands (run inside headless display)
 _run-gui-tests:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui -d:gpuiBackend --path:../isonim/src tests/test_gui.nim
+
+# The window draws the borders, the weight and the absolute placement the
+# render plan carries, and a real compositor pointer reaches an element with
+# its window position (`tests/test_gui_borders.nim`). Its own recipe for
+# `test-gui-keyboard`'s reason — one experiment per compositor — and built
+# into its OWN target directory, so the shared `target/debug` shim every
+# sibling links is never swapped for the windowed one.
+test-gui-borders *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    (cd rust && CARGO_TARGET_DIR=target/windowed cargo build --features gpui-backend) || exit $?
+    ./scripts/build-virtual-pointer.sh || exit $?
+    ./scripts/wayland-run-test.sh {{ARGS}} just _run-gui-borders
+
+_run-gui-borders:
+    LD_LIBRARY_PATH=rust/target/windowed/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui_borders -d:gpuiBackend -d:gpuiShimPath=rust/target/windowed/debug/libgpui_nim_shim.so --path:../isonim/src tests/test_gui_borders.nim
 
 # PLAT-38 — A REAL KEY, through the compositor's own `wl_seat`, into a
 # focused GPUI window, read back from the Rust-side element store.

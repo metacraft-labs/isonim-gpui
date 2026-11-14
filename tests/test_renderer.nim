@@ -10,6 +10,8 @@
 ## To verify compilation only (no Rust shim needed):
 ##   nim check --nimcache:nimcache/test_renderer tests/test_renderer.nim
 
+import std/strutils
+
 import isonim_gpui/renderer
 import isonim_gpui/bindings
 import isonim_gpui/window
@@ -311,6 +313,35 @@ block treeOperations:
   let removed = getAttribute(child1, "class")
   assert removed == "", "getAttribute after remove should return empty"
 
+  # The whole subtree in one call: pre-order, each node's parent index and
+  # its attributes in name order (an empty value kept) — the same answers
+  # `childCount` / `nthChild` / `getAttribute` give one call at a time.
+  r.setAttribute(child1, "data-z", "last")
+  r.setAttribute(child1, "data-a", "first")
+  r.setAttribute(child1, "data-empty", "")
+  let grand = r.createElement("b")
+  r.appendChild(child2, grand)
+  let snap = snapshotTree(parent)
+  assert snap.len == 4, "parent, child1, child2, its child; got " & $snap.len
+  assert snap[0].id == nodeId(parent) and snap[0].parent == -1
+  assert snap[1].id == nodeId(child1) and snap[1].parent == 0
+  assert snap[2].id == nodeId(child2) and snap[2].parent == 0
+  assert snap[3].id == nodeId(grand) and snap[3].parent == 2
+  # (`setTextContent` above keeps an element's text as `__text_content`,
+  # the shim's own storage, which is not listed.)
+  assert snap[1].attributes == @[("data-a", "first"), ("data-empty", ""),
+                                 ("data-z", "last")],
+    "attributes in name order, got: " & $snap[1].attributes
+  for (name, value) in snap[1].attributes:
+    assert getAttribute(child1, name) == value
+  assert getAttribute(child1, "__text_content") == "hello"
+  assert snap[1].attr("data-z") == "last" and snap[1].attr("absent") == ""
+  assert snap[0].attributes.len == 0 and snap[3].attributes.len == 0
+  # An id becomes a handle to that node again; a nil root has no snapshot.
+  assert sameNode(elementOf(snap[2].id), child2)
+  assert snapshotTree(nil).len == 0
+  r.removeChild(child2, grand)
+
   # nth child
   let nth = nthChild(parent, 0)
   assert nth != nil, "nthChild(0) should return non-nil"
@@ -365,6 +396,30 @@ block styleApplication:
   r.setStyle(el, "border-radius", "4px")
   r.setStyle(el, "cursor", "pointer")
 
+
+  # Every cursor name reaches the plan; one outside the set is reported there.
+  block:
+    let root = r.createElement("div")
+    for name in ["default", "pointer", "text", "col-resize", "row-resize",
+                 "grab", "grabbing", "not-allowed"]:
+      let child = r.createElement("div")
+      r.setStyle(child, "cursor", name)
+      r.appendChild(root, child)
+    let plan = r.renderPlanJson(root)
+    for name in ["grabbing", "not-allowed", "col-resize"]:
+      assert ("\"cursor\":\"" & name & "\"") in plan, name
+    assert "cursor_unknown" notin plan
+    let odd = r.createElement("div")
+    r.setStyle(odd, "cursor", "hand")
+    r.appendChild(root, odd)
+    assert "\"cursor_unknown\":\"hand\"" in r.renderPlanJson(root)
+
+  # The window-level cursor: set for a gesture, cleared at its end.
+  assert r.windowCursor() == ""
+  r.setWindowCursor("grabbing")
+  assert r.windowCursor() == "grabbing"
+  r.setWindowCursor("")
+  assert r.windowCursor() == ""
   # If we got here without crashing, style mapping works
   gpui_reset_tree()
   echo "test_renderer: style application passed"

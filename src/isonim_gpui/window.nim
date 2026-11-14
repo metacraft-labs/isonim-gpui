@@ -65,6 +65,8 @@ var
   resizeCallbacks: Table[uint32, proc(width, height: float)]
   focusCallbacks: Table[uint32, proc(focused: bool)]
   closeCallbacks: Table[uint32, proc(): bool]
+  stateCallbacks: Table[uint32, proc()]
+  activatedCallbacks: Table[uint32, proc()]
   windowDispatchersRegistered = false
 
 proc resizeDispatcher(windowId: uint32; w, h: cdouble) {.cdecl.} =
@@ -82,11 +84,21 @@ proc closeDispatcher(windowId: uint32): uint8 {.cdecl.} =
   elif cb(): 1'u8
   else: 0'u8
 
+proc stateDispatcher(windowId: uint32) {.cdecl.} =
+  let cb = stateCallbacks.getOrDefault(windowId)
+  if cb != nil: cb()
+
+proc activatedDispatcher(windowId: uint32) {.cdecl.} =
+  let cb = activatedCallbacks.getOrDefault(windowId)
+  if cb != nil: cb()
+
 proc ensureWindowDispatchers() =
   if not windowDispatchersRegistered:
     gpui_set_window_resize_dispatcher(resizeDispatcher)
     gpui_set_window_focus_dispatcher(focusDispatcher)
     gpui_set_window_close_dispatcher(closeDispatcher)
+    gpui_set_window_state_dispatcher(stateDispatcher)
+    gpui_set_window_activated_dispatcher(activatedDispatcher)
     windowDispatchersRegistered = true
 
 proc windowCallbackCount*(): int =
@@ -100,12 +112,18 @@ proc windowCallbackCount*(): int =
     if id notin ids: ids.add id
   for id in closeCallbacks.keys:
     if id notin ids: ids.add id
+  for id in stateCallbacks.keys:
+    if id notin ids: ids.add id
+  for id in activatedCallbacks.keys:
+    if id notin ids: ids.add id
   ids.len
 
 proc releaseWindowCallbacks(windowId: uint32) =
   resizeCallbacks.del(windowId)
   focusCallbacks.del(windowId)
   closeCallbacks.del(windowId)
+  stateCallbacks.del(windowId)
+  activatedCallbacks.del(windowId)
 
 # ===========================================================================
 # Window API
@@ -174,6 +192,148 @@ proc onClose*(win: GpuiWindow; callback: proc(): bool) =
   closeCallbacks[win.id] = callback
   discard gpui_on_close_id(win.id)
 
+# ===========================================================================
+# GWIN — window chrome state, identity and launch options
+# (GWIN-M1)
+# ===========================================================================
+
+type
+  WindowControl* = enum
+    ## A window operation the platform may or may not support.
+    wcMinimize, wcMaximize, wcFullscreen, wcWindowMenu
+
+  WindowEdge* = enum
+    weTop, weRight, weBottom, weLeft
+
+proc launchWindow*(): GpuiWindow =
+  ## The window `gpui_launch` is opening. Valid inside the root builder and
+  ## while the event loop runs; `id == 0` at any other time. Register
+  ## `onResize` / `onWindowState` on it from the root builder.
+  GpuiWindow(id: gpui_launch_window_id())
+
+proc clientDecorated*(win: GpuiWindow): bool =
+  ## Whether the application is expected to draw the title bar and frame
+  ## (the compositor draws nothing — GNOME/Wayland).
+  gpui_window_decorations(win.id) == 1
+
+proc tiledEdges*(win: GpuiWindow): set[WindowEdge] =
+  let bits = gpui_window_tiling(win.id)
+  for edge in WindowEdge:
+    if (bits and (1'u8 shl ord(edge))) != 0: result.incl edge
+
+proc supportedControls*(win: GpuiWindow): set[WindowControl] =
+  let bits = gpui_window_controls(win.id)
+  for c in WindowControl:
+    if (bits and (1'u8 shl ord(c))) != 0: result.incl c
+
+proc isMaximized*(win: GpuiWindow): bool =
+  gpui_window_is_maximized(win.id) != 0
+
+proc isActive*(win: GpuiWindow): bool =
+  gpui_window_is_active(win.id) != 0
+
+proc buttonLayout*(win: GpuiWindow): string =
+  ## The desktop's configured button layout in GNOME `button-layout`
+  ## syntax, `""` when the platform reports none. See
+  ## `window_environment.windowEnvironment` for the parsed, resolved form.
+  let p = gpui_window_button_layout(win.id)
+  if p != nil:
+    result = $cast[cstring](p)
+    gpui_free_string(p)
+
+proc onWindowState*(win: GpuiWindow; callback: proc()) =
+  ## Called when any of `clientDecorated`, `tiledEdges`,
+  ## `supportedControls`, `isMaximized`, `isActive` or `buttonLayout`
+  ## changed — for example to swap a maximize icon for a restore icon.
+  ensureWindowDispatchers()
+  stateCallbacks[win.id] = callback
+  discard gpui_on_window_state_id(win.id)
+
+proc onWindowActivated*(win: GpuiWindow; callback: proc()) =
+  ## Called when the window is ACTIVATED: `isActive` went from false to
+  ## true — the user came back to it from another program (alt-tab, a click
+  ## on it, the dock). The moment to re-read state another program may have
+  ## changed while the window was in the background, as a web page does on
+  ## its window `focus` event; a refresh on a clock alone leaves the window
+  ## showing stale state for up to one interval after the user returns.
+  ##
+  ## An edge, delivered once per return: deactivation, a repeat, and any
+  ## other chrome change while active (`onWindowState`'s business) do not
+  ## call it. A window starts inactive, so its first active frame counts as
+  ## an activation. So does a return to a window that drew nothing while the
+  ## user was away (another workspace, minimized): the renderer keeps the
+  ## platform's report that the window went inactive until the next frame
+  ## samples it. It runs on the event loop's thread from inside the frame
+  ## that sampled the change, after `onWindowState`'s callback for the same
+  ## frame, so whatever it changes in the tree is drawn in that frame.
+  ## Registering again replaces this window's handler; `destroy` releases it.
+  ensureWindowDispatchers()
+  activatedCallbacks[win.id] = callback
+  discard gpui_on_window_activated_id(win.id)
+
+proc setTitle*(win: GpuiWindow; title: string): bool =
+  ## Change the window's title; the platform sees it on the next frame.
+  gpui_set_window_title(win.id, title.cstring) != 0
+
+proc addFontFile*(path: string): bool =
+  ## Before `gpui_launch`: register a TrueType/OpenType font file for every
+  ## launch of this process, so a `font-family` style can name its family
+  ## (otherwise the platform's fallback face is drawn). False if the file
+  ## cannot be read.
+  gpui_add_font_file(path.cstring) != 0
+
+proc setAppId*(appId: string) =
+  ## Before `gpui_launch`: the Wayland `app_id` / X11 `WM_CLASS`. Match the
+  ## application's `.desktop` file name so the desktop associates them.
+  gpui_set_app_id(appId.cstring)
+
+proc setMinWindowSize*(width, height: float) =
+  ## Before `gpui_launch`: the smallest content size the app can lay out.
+  gpui_set_min_window_size(width.cdouble, height.cdouble)
+
+proc setInitialWindowState*(maximized: bool) =
+  ## Before `gpui_launch`: open maximized (the launch size is then the
+  ## restore size) or windowed and centred. The policy is the
+  ## application's; the renderer only carries it out.
+  gpui_set_initial_window_state(uint8(maximized))
+
+# ---------------------------------------------------------------------------
+# GWIN — window operations and window regions
+# ---------------------------------------------------------------------------
+#
+# A title bar is declared, not programmed: give elements the attribute
+# `windowRegionAttribute` with one of the `WindowRegion` values and the
+# renderer moves, maximizes, minimizes and closes the window for presses on
+# them (a drag region acts only while the application draws the decorations;
+# see `clientDecorated`). These procs are for the same operations from a menu
+# entry or a key binding. They act on the launched window on its next frame.
+
+const windowRegionAttribute* = "data-window-region"
+
+type
+  WindowRegion* = enum
+    wrDrag = "drag"            ## moves the window; double-click maximizes;
+                               ## right-click opens the window menu
+    wrNoDrag = "no-drag"       ## the application's, inside or over a drag region
+    wrMinimize = "minimize"    ## a click minimizes
+    wrMaximize = "maximize"    ## a click toggles maximize
+    wrClose = "close"          ## a click closes, asking `onClose` first
+
+proc minimize*(win: GpuiWindow) =
+  ## Minimize the window, where the platform supports it
+  ## (`wcMinimize in win.supportedControls`).
+  gpui_window_minimize()
+
+proc toggleMaximize*(win: GpuiWindow) =
+  gpui_window_toggle_maximize()
+
+proc toggleFullscreen*(win: GpuiWindow) =
+  gpui_window_toggle_fullscreen()
+
+proc requestClose*(win: GpuiWindow) =
+  ## Close the window as its close button would: `onClose` decides.
+  gpui_window_request_close()
+
 proc requestRepaint*() =
   ## Request a repaint of the active window. Call this after modifying
   ## the shadow tree to trigger a re-render on the next frame.
@@ -193,6 +353,8 @@ proc resetWindows*() =
   resizeCallbacks.clear()
   focusCallbacks.clear()
   closeCallbacks.clear()
+  stateCallbacks.clear()
+  activatedCallbacks.clear()
   # Re-register the dispatchers so they are always set after a reset,
   # mirroring `renderer.resetCallbacks`.
   windowDispatchersRegistered = false

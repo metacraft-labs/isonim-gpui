@@ -14,7 +14,7 @@
 ## .bg(), .text_color(), .w(), .h(), .flex(), etc. The Rust shim
 ## translates the string-based style properties into these calls.
 
-import std/tables
+import std/[strutils, tables]
 import isonim_gpui/bindings
 
 # Re-export GpuiElement so users only need to import renderer.
@@ -23,6 +23,50 @@ export bindings.GpuiElement
 type
   GpuiRenderer* = object
     ## Renderer backend that delegates to GPUI via FFI.
+
+const inlineTextRunsAttribute* = "data-inline-text-runs"
+  ## Declares an element an INLINE FORMATTING CONTEXT: its text-only children
+  ## are drawn as ONE piece of text carrying a colour per span, rather than as
+  ## one text element per span.
+  ##
+  ## Give it to a container whose children are spans of differently coloured
+  ## text on one line — a syntax-highlighted row of code is the motivating
+  ## case. A GPUI text element rounds its width up to a whole logical pixel,
+  ## so one element per span applies that rounding once per span and the
+  ## error accumulates along the row; fused, the row is rounded once, which
+  ## is what a browser's inline layout does.
+  ##
+  ## THE FUSION SAFETY RULE. A child fuses only when it is plain text: no
+  ## handler, no window region, and no style beyond `color`, `font-weight`
+  ## and `flex-shrink`, tested by difference from the default style so a
+  ## style the renderer learns later keeps its own element rather than
+  ## fusing silently. A style may join that set only when (1) the fused
+  ## element can state it per span and (2) the unfused path already draws
+  ## it, so that fusing changes where glyphs land and nothing else.
+  ##
+  ## One box property passes that test, under a condition: a child's own
+  ## HORIZONTAL padding (`padding-left` / `padding-right`, each a
+  ## non-negative px length) fuses when THIS ELEMENT declares
+  ## `white-space: nowrap` (or `pre`) and declares no `text-overflow`. The
+  ## renderer then draws the run with an element that leaves exactly the
+  ## padded gap between the text either side of it — snapped to the device
+  ## pixel grid as the unfused padding is — and still rounds the run once,
+  ## so the gap is kept and only the rounding goes. The one-line condition
+  ## is required because that element draws one line and never truncates:
+  ## a context that may wrap or elide keeps a padded child as its own
+  ## element, as does a padding that is not a px length, the `padding`
+  ## shorthand, vertical padding, margins and every other box style.
+  ## A text-overflow inherited from an ancestor is not seen by the rule, so
+  ## do not declare a one-line context inside an eliding one.
+  ##
+  ## A child that does not qualify keeps its own element, and only runs of
+  ## two or more adjacent plain spans are fused. A container that puts
+  ## something between its children — a `gap` or a `space-*`
+  ## `justify-content` — is not fused at all, because fusing would delete
+  ## that spacing. Nor is a container that is not drawn as a flex row
+  ## (`display: flex`, or `flex-direction: row`): a column, or a container
+  ## with no flex layout, stacks its children, and fusing would draw them
+  ## on one line. The declaration is therefore safe to leave in place.
 
 # ===========================================================================
 # Tag mapping: HTML tags -> GPUI element model
@@ -130,12 +174,15 @@ const stylePropertyMap = {
   "background-color": "bg",
   "background": "bg",
   "color": "text_color",
+  "mask-image": "mask_image",   # `background` painted through an SVG's alpha
 
   # Typography
   "font-size": "text_size",
   "font-family": "font_family",
   "font-weight": "font_weight",
   "font-style": "font_style",
+  "font-variant-numeric": "font_variant_numeric",  # OpenType figure features (`tnum`)
+  "letter-spacing": "letter_spacing",  # space after each character (`SpacedText`)
   "text-align": "text_align",
   "line-height": "line_height",
 
@@ -264,6 +311,15 @@ type
     gekOther
     gekKeyDown
     gekKeyUp
+    gekPointerDown     ## `mousedown`: the left button, at `pointerOf`
+    gekPointerMove     ## `mousemove`
+    gekPointerUp       ## `mouseup`
+    gekWheel           ## `wheel`: `pointerOf` also carries the delta
+    gekContextMenu     ## `contextmenu`: the RIGHT button, at `pointerOf`
+    gekAuxDown         ## `auxdown`: the MIDDLE button, at `pointerOf`
+    gekModifiers       ## `modifierschange`: the held modifiers changed (a
+                       ## modifier pressed or released ALONE); `modifiers` is
+                       ## the new set, `key` is empty
 
   GpuiEvent* = object
     ## **What a handler is handed. PLAT-38's whole point.**
@@ -305,6 +361,13 @@ func toEventKind*(raw: uint32): GpuiEventKind =
   case raw
   of GpuiEventKeyDown: gekKeyDown
   of GpuiEventKeyUp: gekKeyUp
+  of GpuiEventPointerDown: gekPointerDown
+  of GpuiEventPointerMove: gekPointerMove
+  of GpuiEventPointerUp: gekPointerUp
+  of GpuiEventPointerWheel: gekWheel
+  of GpuiEventPointerContext: gekContextMenu
+  of GpuiEventPointerAux: gekAuxDown
+  of GpuiEventModifiers: gekModifiers
   else: gekOther
 
 func fromEventKind*(k: GpuiEventKind): uint32 =
@@ -312,6 +375,45 @@ func fromEventKind*(k: GpuiEventKind): uint32 =
   of gekOther: GpuiEventOther
   of gekKeyDown: GpuiEventKeyDown
   of gekKeyUp: GpuiEventKeyUp
+  of gekPointerDown: GpuiEventPointerDown
+  of gekPointerMove: GpuiEventPointerMove
+  of gekPointerUp: GpuiEventPointerUp
+  of gekWheel: GpuiEventPointerWheel
+  of gekContextMenu: GpuiEventPointerContext
+  of gekAuxDown: GpuiEventPointerAux
+  of gekModifiers: GpuiEventModifiers
+
+type
+  GpuiPointer* = object
+    ## A pointer event's window position (logical pixels) and, for a wheel,
+    ## its delta in pixels. `valid` is false for an event that is not a
+    ## pointer event or whose payload could not be read.
+    valid*: bool
+    x*, y*: float
+    dx*, dy*: float
+    clickCount*: int
+      ## A left or middle press: the platform's click count, 0 when absent.
+
+func pointerOf*(ev: GpuiEvent): GpuiPointer =
+  ## Decode the position the shim spelled into a pointer event's key
+  ## (`input.rs`, `deliver_pointer`): `"x,y"`, `"x,y,count"` for a left or middle
+  ## press (the platform's click count), or `"x,y,dx,dy"` for a wheel.
+  if ev.kind notin {gekPointerDown, gekPointerMove, gekPointerUp, gekWheel,
+                    gekContextMenu, gekAuxDown}:
+    return GpuiPointer()
+  let parts = ev.key.split(',')
+  if parts.len notin {2, 3, 4}:
+    return GpuiPointer()
+  try:
+    result = GpuiPointer(valid: true, x: parseFloat(parts[0]),
+                         y: parseFloat(parts[1]))
+    if parts.len == 3:
+      result.clickCount = parseInt(parts[2])
+    if parts.len == 4:
+      result.dx = parseFloat(parts[2])
+      result.dy = parseFloat(parts[3])
+  except ValueError:
+    return GpuiPointer()
 
 proc readPayload*(p: ptr GpuiEventPayload): GpuiEvent =
   ## Decode what the shim handed us. A nil pointer is the honest encoding of
@@ -398,6 +500,17 @@ proc removeAttribute*(r: GpuiRenderer; node: GpuiElement; name: string) =
 proc setTextContent*(r: GpuiRenderer; node: GpuiElement; text: string) =
   gpui_set_text_content(node, text.cstring)
 
+proc setImageRgba*(r: GpuiRenderer; node: GpuiElement; pixels: string;
+                   width, height: int): bool =
+  ## Draw `pixels` — `width * height` RGBA8888 pixels — in `node`, an `img`
+  ## element, stretched to its box. False (and the placeholder) when the
+  ## bytes are not `width * height * 4` long.
+  if width <= 0 or height <= 0 or pixels.len != width * height * 4:
+    discard gpui_set_image_rgba(node, nil, 0, 0, 0)
+    return false
+  gpui_set_image_rgba(node, unsafeAddr pixels[0], csize_t(pixels.len),
+                      uint32(width), uint32(height)) == 1
+
 proc setStyle*(r: GpuiRenderer; node: GpuiElement; prop, value: string) =
   let gpuiProp = mapStyleProperty(prop)
   let gpuiValue = mapStyleValue(prop, value)
@@ -449,12 +562,47 @@ proc sameNode*(a, b: GpuiElement): bool =
 proc childCount*(node: GpuiElement): int =
   int(gpui_child_count(node))
 
+const LayoutProbeAttribute* = "data-layout-probe"
+  ## The attribute an element opts into `layoutBounds` with.
+
+proc layoutBounds*(node: GpuiElement;
+                   x, y, w, h: var float): bool =
+  ## Where the window last laid `node` out (its border box, as a browser's
+  ## `getBoundingClientRect` reports it; window coordinates, logical
+  ## pixels), read off GPUI's own layout. False -- and
+  ## the outputs untouched -- for a node that does not carry
+  ## `LayoutProbeAttribute`, that no frame has laid out yet, or in a build
+  ## without the GPUI backend. See the shim's `layout_bounds` module.
+  if node == nil: return false
+  var xywh: array[4, float64]
+  if gpui_layout_bounds(node, addr xywh) == 0'u8: return false
+  x = xywh[0]
+  y = xywh[1]
+  w = xywh[2]
+  h = xywh[3]
+  true
+
 proc textContent*(node: GpuiElement): string =
   let needed = gpui_get_text_content(node, nil, 0)
   if needed == 0:
     return ""
   var buf = newString(int(needed) + 1)
   discard gpui_get_text_content(node, addr buf[0], uint64(buf.len))
+  buf.setLen(int(needed))
+  buf
+
+proc writeClipboard*(text: string) =
+  ## Copy `text` to the system clipboard (GPUI's platform clipboard takes it
+  ## on the window's next frame).
+  gpui_write_clipboard(text.cstring)
+
+proc clipboardText*(): string =
+  ## The text most recently copied with `writeClipboard`.
+  let needed = gpui_clipboard_text(nil, 0)
+  if needed == 0:
+    return ""
+  var buf = newString(int(needed) + 1)
+  discard gpui_clipboard_text(addr buf[0], uint64(buf.len))
   buf.setLen(int(needed))
   buf
 
@@ -466,6 +614,79 @@ proc getAttribute*(node: GpuiElement; name: string): string =
   discard gpui_get_attribute(node, name.cstring, addr buf[0], uint64(buf.len))
   buf.setLen(int(needed))
   buf
+
+type
+  SnapshotNode* = object
+    ## One node of `snapshotTree`.
+    id*: uint64
+      ## Its `nodeId`; `elementOf` turns it into a handle.
+    parent*: int
+      ## Its parent's index in the snapshot, -1 for the snapshot's root.
+    attributes*: seq[(string, string)]
+      ## Every attribute the program set on it, in name order (not the
+      ## shim's own `__`-prefixed storage, such as `__text_content`).
+
+func attr*(n: SnapshotNode; name: string): string =
+  ## The value of `name` on `n`, "" when it carries none — what
+  ## `getAttribute` answers, from the snapshot.
+  for (k, v) in n.attributes:
+    if k == name:
+      return v
+  ""
+
+var snapshotBuffer {.threadvar.}: string
+  ## `snapshotTree`'s buffer, kept at the size the last snapshot needed.
+
+proc snapshotTree*(root: GpuiElement): seq[SnapshotNode] =
+  ## The subtree under `root` — `root` first, then each child's subtree in
+  ## child order (pre-order, the order `nthChild` walks) — with every node's
+  ## attributes, read in ONE call into the shim. Empty for a nil root.
+  ##
+  ## For a walk that classifies every element of a window after each redraw
+  ## by which of many attributes it carries: walking with `childCount` /
+  ## `nthChild` and asking `getAttribute` once per name is a lock and a
+  ## lookup in the shim per name per element, and cost about 50 ms a redraw
+  ## over a thousand elements. A node of the snapshot reflects the tree at
+  ## the call; `elementOf` gives a handle for the ones the walk changes.
+  # Into the buffer the last snapshot needed, so a window read after every
+  # redraw is serialized once, not once to size it and again to fill it.
+  template buf: untyped = snapshotBuffer
+  var needed = gpui_snapshot_tree(root, (if buf.len > 0: addr buf[0] else: nil),
+                                  uint64(buf.len))
+  while needed > uint64(buf.len):
+    # Larger than the buffer (or the tree grew before the second call).
+    buf.setLen(int(needed))
+    needed = gpui_snapshot_tree(root, addr buf[0], needed)
+  if needed == 0'u64:
+    return
+  let used = int(needed)
+  proc le(at, width: int): uint64 =
+    for k in countdown(width - 1, 0):
+      result = (result shl 8) or uint64(ord(buf[at + k]))
+  proc zstr(at: var int): string =
+    let e = buf.find('\0', at, used - 1)
+    if e < 0:
+      raise newException(ValueError, "gpui_snapshot_tree: an unterminated string")
+    result = buf[at ..< e]
+    at = e + 1
+  var i = 0
+  while i < used:
+    if i + 16 > used:
+      raise newException(ValueError, "gpui_snapshot_tree: a truncated node")
+    var n = SnapshotNode(id: le(i, 8))
+    let parent = le(i + 8, 4)
+    n.parent = if parent == uint64(high(uint32)): -1 else: int(parent)
+    let count = int(le(i + 12, 4))
+    i += 16
+    for _ in 0 ..< count:
+      let name = zstr(i)
+      n.attributes.add (name, zstr(i))
+    result.add n
+
+proc elementOf*(id: uint64): GpuiElement =
+  ## A handle for the node `id` names (a `SnapshotNode.id`, a `nodeId`), nil
+  ## when no such node is in the tree any more.
+  gpui_element_of_node_id(id)
 
 proc nthChild*(node: GpuiElement; index: int): GpuiElement =
   gpui_nth_child(node, uint64(index))
@@ -620,6 +841,19 @@ proc getTag*(node: GpuiElement): string =
 # ===========================================================================
 # Render plan inspection (G3-G — integration testing)
 # ===========================================================================
+
+proc setWindowCursor*(r: GpuiRenderer; name: string) =
+  ## A window-level cursor for a gesture in flight: it wins over every
+  ## element's `cursor` until cleared with `""`.
+  gpui_set_window_cursor(name.cstring)
+
+proc windowCursor*(r: GpuiRenderer): string =
+  ## The window-level cursor now set, `""` for none.
+  let raw = gpui_window_cursor()
+  if raw == nil:
+    return ""
+  result = $cast[cstring](raw)
+  gpui_free_string(raw)
 
 proc renderPlanJson*(r: GpuiRenderer; root: GpuiElement): string =
   ## Build a render plan from the shadow tree rooted at `root` and return

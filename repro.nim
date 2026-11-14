@@ -101,8 +101,9 @@
 ##     ``uses: "isonim"`` + ``uses: "nim-everywhere"``.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
-## canonical recipes: the nix dev shell puts ``nim`` + ``gcc`` + ``cargo``
-## + ``rustc`` on ``PATH``. Without it ``repro build`` refuses to run with
+## canonical recipes: the nix dev shell puts ``nim`` + the C compiler
+## (``clang`` on macOS, ``gcc`` elsewhere) + ``cargo`` + ``rustc`` + ``just``
+## on ``PATH``. Without it ``repro build`` refuses to run with
 ## "typed tool provisioning is required for uses declarations".
 
 import std/os
@@ -124,7 +125,8 @@ import ct_test_nim_unittest
 type
   GpuiTestSpec = object
     ## One entry per runnable test file. ``source`` is the repo-relative
-    ## ``.nim`` path; ``binary`` is the ``build/test-bin/<stem>`` output.
+    ## ``.nim`` path; ``binary`` is the ``build/test-bin/<stem>`` output
+    ## (``<stem>.exe`` on Windows, see ``testBinaryExt``).
     ## ``consumesIsonim`` marks the CONSUMER tests that ``import isonim/…``
     ## (they need the SC-11 ``isonim`` + ``nim-everywhere`` sibling ``src``
     ## roots on ``--path``; the engine threads those off the ``uses:``
@@ -136,32 +138,46 @@ type
     consumesIsonim: bool
     releaseBuild: bool
 
+# The test binary's file extension on the host the graph is built for.
+# ``nim c --out:build/test-bin/<stem>`` writes ``<stem>.exe`` on Windows, and
+# ``buildNimUnittest.build`` declares that ``.exe`` as the compile edge's
+# output, but it hands the ``binary`` it was given UNCHANGED to the typed
+# ``testBinary`` that ``edge.testBinary.run`` executes: the caller names the
+# runnable file. Naming ``<stem>`` alone therefore made every Windows execute
+# edge launch a file that does not exist
+# (``CreateProcessW failed (err=2): ...\build\test-bin\test_basic``). With
+# the suffix in ``binary`` itself, the compile output, the typed binary and
+# the executed path are the same file, and ``buildNimUnittest`` does not
+# append a second ``.exe``. The nimcache directory and the action ids derive
+# from ``splitFile(binary).name``, so they are identical on every host.
+const testBinaryExt = when defined(windows): ".exe" else: ""
+
 const testSpecs: seq[GpuiTestSpec] = @[
   # ---- Leaf tests (self src + the Rust shim; no isonim) --------------
   GpuiTestSpec(source: "tests/test_basic.nim",
-    binary: "build/test-bin/test_basic",
+    binary: "build/test-bin/test_basic" & testBinaryExt,
     consumesIsonim: false, releaseBuild: false),
   GpuiTestSpec(source: "tests/test_bindings.nim",
-    binary: "build/test-bin/test_bindings",
+    binary: "build/test-bin/test_bindings" & testBinaryExt,
     consumesIsonim: false, releaseBuild: false),
   GpuiTestSpec(source: "tests/test_renderer.nim",
-    binary: "build/test-bin/test_renderer",
+    binary: "build/test-bin/test_renderer" & testBinaryExt,
     consumesIsonim: false, releaseBuild: false),
   GpuiTestSpec(source: "tests/test_performance.nim",
-    binary: "build/test-bin/test_performance",
+    binary: "build/test-bin/test_performance" & testBinaryExt,
     consumesIsonim: false, releaseBuild: true),
   GpuiTestSpec(source: "tests/test_gui.nim",
-    binary: "build/test-bin/test_gui",
+    binary: "build/test-bin/test_gui" & testBinaryExt,
     consumesIsonim: false, releaseBuild: false),
   # ---- Consumer tests (isonim + nim-everywhere via SC-11 uses:) ------
   GpuiTestSpec(source: "tests/test_cross_renderer.nim",
-    binary: "build/test-bin/test_cross_renderer",
+    binary: "build/test-bin/test_cross_renderer" & testBinaryExt,
     consumesIsonim: true, releaseBuild: false),
   GpuiTestSpec(source: "tests/test_render_integration.nim",
-    binary: "build/test-bin/test_render_integration",
+    binary: "build/test-bin/test_render_integration" & testBinaryExt,
     consumesIsonim: true, releaseBuild: false),
   GpuiTestSpec(source: "tests/test_structural_comparison.nim",
-    binary: "build/test-bin/test_structural_comparison",
+    binary: "build/test-bin/test_structural_comparison" & testBinaryExt,
     consumesIsonim: true, releaseBuild: false),
 ]
 
@@ -175,13 +191,32 @@ package isonim_gpui:
   uses:
     # Toolchain floor — the PATH-resolvable binaries the build needs.
     # ``nim`` compiles every test binary (the ``buildNimUnittest.build``
-    # edges below, matching the nimble file's ``requires "nim >= 2.0.0"``);
-    # ``gcc`` is the C back-end ``nim c`` shells out to and links through;
+    # edges below, matching the nimble file's ``requires "nim >= 2.0.0"``).
+    # Native Nim selects Clang on Darwin and GCC elsewhere as the C
+    # back-end it shells out to and links through; declare that actual
+    # backend so its identity and executable directory reach each compile
+    # action under action-scoped tool selection.
+    #
     # ``cargo`` (+ its bundled ``rustc``) builds the ``gpui-nim-shim``
-    # cdylib. Sufficient for the path-mode resolver under ``nix develop``.
+    # cdylib. The floor is 1.95 because a plain ``cargo build`` in
+    # ``rust/`` builds every workspace member, and ``gpui-kit-probe``
+    # depends on ``gpui-pre`` 0.3.5 unconditionally (the shim also takes it
+    # as a dev-dependency). ``gpui-pre`` calls ``std::hint::cold_path``
+    # outside any feature gate (``src/profiler.rs``) and declares no
+    # ``rust-version``; that function is stable only from Rust 1.95, so an
+    # older cargo fails with "use of unstable library feature
+    # `cold_path`".
+    #
+    # ``just`` is declared because the ``Justfile`` recipes (``just
+    # rust-build`` and the rest) are run inside this package's environment,
+    # including by consumers through ``repro exec <this repo> -- just ...``.
     "nim >=2.0"
-    "gcc >=12"
-    "cargo >=1.85"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
+    "cargo >=1.95"
+    "just >=1"
 
     # Sibling Nim-library producers (SC-11 develop-mode from-source
     # consumption). The cross-renderer / integration / structural tests
@@ -206,15 +241,18 @@ package isonim_gpui:
     # ---- Native cargo build of the gpui-nim-shim cdylib --------------
     #
     # DEFAULT (feature-less) cargo profile → the stub shadow-tree +
-    # extern-"C" API, no ``gpui``/``gpui_platform`` git deps, no GPU. The
-    # cargo workspace root is ``rust/Cargo.toml`` (the repo root has no
-    # ``Cargo.toml``); pin the manifest so cargo resolves it from the
-    # recipe CWD (the repo root). ``rust/Cargo.lock`` IS tracked, so
-    # ``locked = true`` fails fast rather than silently regenerating the
-    # lock. The cdylib lands at ``rust/target/debug/<dylib>`` (cargo's
-    # target dir is next to the manifest); declared as ``extraOutputs`` so
-    # the engine tracks it as the build edge's effect and every downstream
-    # test compile can depend on it.
+    # extern-"C" API; the shim cdylib links no ``gpui``/``gpui_platform``
+    # and needs no GPU. The build still COMPILES ``gpui-pre``, because it
+    # covers every workspace member and ``gpui-kit-probe`` depends on it
+    # (hence the ``cargo >=1.95`` floor above). The cargo workspace root
+    # is ``rust/Cargo.toml`` (the repo root has no ``Cargo.toml``); pin
+    # the manifest so cargo resolves it from the recipe CWD (the repo
+    # root). ``rust/Cargo.lock`` IS tracked, so ``locked = true`` fails
+    # fast rather than silently regenerating the lock. The cdylib lands at
+    # ``rust/target/debug/<dylib>`` (cargo's target dir is next to the
+    # manifest); declared as ``extraOutputs`` so the engine tracks it as
+    # the build edge's effect and every downstream test compile can depend
+    # on it.
     const dylibName =
       when defined(windows): "gpui_nim_shim.dll"
       elif defined(macosx): "libgpui_nim_shim.dylib"

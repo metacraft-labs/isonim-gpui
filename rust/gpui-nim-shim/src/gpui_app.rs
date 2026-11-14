@@ -19,9 +19,11 @@ use crate::window;
 // recursion in the compiler.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 use gpui::{
-    div, px, rgb, rgba, size, AnyElement, App, AppContext as _, Application, AsyncApp, Bounds,
-    Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, QuitMode,
-    Render, Rgba, Styled, WeakEntity, Window, WindowBounds, WindowOptions,
+    canvas, div, img, px, rgb, rgba, size, AbsoluteLength, AnyElement, App, AppContext as _, Application,
+    AsyncApp, Bounds, Context, CursorStyle, Decorations, Div, FontWeight, HighlightStyle, Hsla,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, QuitMode, Render, Rgba, Styled,
+    StyledText, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowDecorations,
+    WindowOptions,
 };
 
 // RS-M14 Phase 2 (git pin): `Application::new()` from crates.io `gpui = "0.2"`
@@ -66,6 +68,46 @@ pub struct NimRootView {
     /// places including two test files; a constructor that grew a parameter
     /// would put this milestone's diff across all of them for no gain.
     focus_handle: Option<gpui::FocusHandle>,
+
+    /// GWIN: observers that re-render when the window's chrome state
+    /// changes without a resize (the desktop's button layout, activation).
+    /// Kept alive here; dropping a `Subscription` unregisters it.
+    chrome_observers: Vec<Subscription>,
+
+    /// GWIN: set once GPUI has told the window the desktop's button
+    /// layout changed. See `desktop_button_layout`.
+    layout_reported: std::rc::Rc<std::cell::Cell<bool>>,
+
+    /// GWIN: the window's frame for the frame being built (see `frame.rs`).
+    frame: crate::frame::FrameGeometry,
+
+    /// GWIN: whether the launch's client-side decoration request has been
+    /// repeated now that the window is mapped. Sway grants a client-side
+    /// request only for a window that is floating when it asks (measured,
+    /// sway 1.11), and GPUI asks once, at creation, before any window rule
+    /// has floated it.
+    decorations_rerequested: bool,
+
+    /// GWIN: the launch size is the CONTENT's. GPUI opens a window whose
+    /// whole size, band included, is the size it is given, so a window that
+    /// is to draw its own decorations is created larger by the band (see
+    /// `launch_gpui_app`), before the compositor has seen any size. When the
+    /// compositor then grants server-side decorations instead, the first
+    /// frame shrinks it back — still before the first commit. This holds the
+    /// launch size; `None` once that first frame has run, or when nothing
+    /// was added. It is pending until the decoration mode is known (see
+    /// `sync_window_registry`).
+    ///
+    /// Correcting the size any later does not work: measured on headless
+    /// GNOME Shell 49, a resize after the window was mapped changed GPUI's
+    /// surface (660x420) while Mutter kept the geometry it had mapped
+    /// (620x380), and the content overran the frame.
+    pub launch_inflated: Option<(f32, f32)>,
+
+    /// GWIN: the fallback title bar's height this frame — `regions::
+    /// FALLBACK_BAR_HEIGHT` while the application draws the decorations, is
+    /// not fullscreen and declares no drag region of its own; 0 otherwise.
+    title_bar: f32,
 }
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
@@ -74,7 +116,363 @@ impl NimRootView {
         NimRootView {
             poll_started: false,
             focus_handle: None,
+            chrome_observers: Vec::new(),
+            layout_reported: std::rc::Rc::new(std::cell::Cell::new(false)),
+            frame: crate::frame::FrameGeometry::new(false, 0, false, 0.0, 0.0),
+            decorations_rerequested: false,
+            launch_inflated: None,
+            title_bar: 0.0,
         }
+    }
+
+    /// GWIN — keep the window registry in step with the live
+    /// platform window, before the frame is built so that whatever the
+    /// application does in its callbacks is in THIS frame:
+    ///
+    ///   * a title set with `gpui_set_window_title` reaches the platform;
+    ///   * the chrome state is sampled, and `gpui_on_window_state` fires if
+    ///     it changed;
+    ///   * a changed content size fires `gpui_on_resize`, so the
+    ///     application lays itself out for the size it is about to be
+    ///     drawn at. Until GWIN the shim never reported a resize at all.
+    ///
+    /// Only the launched window has a registry entry; the headless renderer
+    /// (`ACTIVE_WINDOW_ID == 0`) skips all of it.
+    fn sync_window_registry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let win_id = active_window_id();
+        if win_id == 0 {
+            return;
+        }
+        if self.chrome_observers.is_empty() {
+            // GPUI does not refresh the window when the button layout
+            // changes (`Window::button_layout_changed` only runs observers),
+            // and activation changes need a frame to be sampled in.
+            let reported = self.layout_reported.clone();
+            self.chrome_observers
+                .push(window.observe_button_layout_changed(move |window, _cx| {
+                    reported.set(true);
+                    window.refresh();
+                }));
+            // The observer also RECORDS the activation it was told about,
+            // because the frame it asks for may not come: a window that is
+            // not shown (another workspace, minimized) draws nothing, and the
+            // per-frame sample would miss the deactivation entirely
+            // (`window::note_activation`).
+            self.chrome_observers
+                .push(cx.observe_window_activation(window, move |_view, window, cx| {
+                    window::note_activation(win_id, window.is_window_active());
+                    cx.notify();
+                }));
+            // A close the COMPOSITOR asks for (its own close button, a
+            // keyboard shortcut) goes through the same predicate as the
+            // application's close button and `gpui_window_request_close`:
+            // the application's close callback decides.
+            window.on_window_should_close(cx, move |_window, _cx| window::close_window(win_id));
+        }
+        for op in window::take_window_ops() {
+            perform_window_op(op, window, win_id);
+        }
+        if let Some(title) = window::take_pending_title() {
+            window.set_window_title(&title);
+        }
+        let chrome = sample_chrome_state(window, cx, self.layout_reported.get());
+        // Pending until the decoration mode is known: GPUI's first frames
+        // show its provisional client mode, and a compositor's answer comes a
+        // frame or more later (measured on sway: one frame).
+        if let Some((lw, lh)) = self.launch_inflated {
+            if chrome.decorations == window::DECORATIONS_SERVER {
+                // The band added at creation is not needed after all.
+                self.launch_inflated = None;
+                window.resize(size(px(lw), px(lh)));
+            } else if chrome.active {
+                // Mapped, focused and still client-decorated: the mode is
+                // settled and the band is in use.
+                self.launch_inflated = None;
+            }
+        }
+        if !self.decorations_rerequested
+            && window::requested_decorations() == Some(window::DECORATIONS_CLIENT)
+            && chrome.decorations == window::DECORATIONS_SERVER
+        {
+            self.decorations_rerequested = true;
+            window.request_decorations(WindowDecorations::Client);
+        }
+
+        // The frame for this frame: a band on every untiled side when the
+        // application draws the decorations. GPUI is told the band so the
+        // compositor's window geometry is the content, and pointer
+        // positions are translated by the content's origin.
+        let viewport = window.viewport_size();
+        self.frame = crate::frame::FrameGeometry::new(
+            chrome.decorations == window::DECORATIONS_CLIENT,
+            chrome.tiling,
+            chrome.maximized,
+            f32::from(viewport.width),
+            f32::from(viewport.height),
+        );
+        // The band GPUI reserves is constant under client-side decorations:
+        // GPUI itself leaves it out on tiled edges (a maximized window is
+        // tiled on all four), and it computes a restored window's geometry
+        // from the inset in force at that moment. An inset dropped to 0 while
+        // maximized made each maximize-restore cycle grow the window by the
+        // band (measured on GNOME: 640x400 restored as 660x420).
+        window.set_client_inset(px(
+            if chrome.decorations == window::DECORATIONS_CLIENT {
+                crate::frame::FRAME_INSET
+            } else {
+                0.0
+            },
+        ));
+        window::set_client_decorated(chrome.decorations == window::DECORATIONS_CLIENT);
+        let client = chrome.decorations == window::DECORATIONS_CLIENT;
+        // The application hears about the new state FIRST: it may answer a
+        // grant of client-side decorations by declaring its own title bar,
+        // and the fallback bar is decided from the tree as it stands after
+        // that. Decided before, an application that does so got one frame of
+        // the fallback bar and two spurious resizes at every grant (measured
+        // with CodeTracer on sway: 1280x800 -> 1260x748 -> 1280x800).
+        window::update_chrome_state(win_id, chrome);
+        let has_drag_region = {
+            let tree = crate::lock_tree();
+            let root = *crate::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
+            crate::regions::tree_declares_drag_region(&tree, root)
+        };
+        self.title_bar = if client && !window.is_fullscreen() && !has_drag_region {
+            crate::regions::FALLBACK_BAR_HEIGHT
+        } else {
+            0.0
+        };
+        let (ox, oy) = self.frame.content_origin();
+        window::set_content_origin(ox, oy + self.title_bar);
+
+        // The application is told its CONTENT size: the window the
+        // compositor reports, less the fallback title bar if one is drawn.
+        let (cw, ch) = self.frame.content_size();
+        let size = (cw as f64, (ch - self.title_bar).max(0.0) as f64);
+        if window::window_size(win_id) != Some(size) {
+            window::notify_resize(win_id, size.0, size.1);
+        }
+    }
+}
+
+/// Hand the application's registered font files (`window::add_font_file`) to
+/// GPUI's text system. A file GPUI cannot parse is reported, not fatal: the
+/// family it would have provided falls back to the platform's face.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn register_fonts(cx: &mut App) {
+    let fonts = window::fonts();
+    if fonts.is_empty() {
+        return;
+    }
+    let owned: Vec<std::borrow::Cow<'static, [u8]>> = fonts
+        .iter()
+        .map(|f| std::borrow::Cow::Owned(f.as_ref().clone()))
+        .collect();
+    if let Err(e) = cx.text_system().add_fonts(owned) {
+        eprintln!("gpui-nim-shim: registering {} font file(s) failed: {e}", fonts.len());
+    }
+    publish_font_report(cx);
+}
+
+/// Minimal JSON string escaping, for the font report's family names and file
+/// paths. Both can contain a backslash or a quote on some hosts.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A family this font report is deliberately certain no host has.
+///
+/// It is the report's POSITIVE CONTROL and the reason the report can be read
+/// as the RESOLVED face rather than the REQUESTED one. A probe that echoed
+/// its input would answer this entry with monospace metrics identical to
+/// `Space Mono`'s; a probe that asks the text system answers it with
+/// whatever the fallback stack resolves to, whose `unitsPerEm` and advances
+/// differ. `controlProvesResolution` below states that comparison as a
+/// boolean so a reader does not have to make it by eye.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const FONT_REPORT_CONTROL_FAMILY: &str = "ZZ No Such Face ZZ";
+
+/// The families this report answers for: the two the CodeTracer front-end
+/// names in `chrome.nim` (`MonoFontFamily`, `WindowFontFamily`), plus the
+/// control.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const FONT_REPORT_FAMILIES: [&str; 3] =
+    ["Space Mono", "Space Grotesk", FONT_REPORT_CONTROL_FAMILY];
+
+/// What the text system RESOLVED for each family this window draws in, as
+/// JSON, published to `window::set_font_report` and — when
+/// `GPUI_FONT_REPORT_PATH` names one — written to that file.
+///
+/// WHY METRICS AND NOT A NAME. GPUI's `TextSystem` hands back a `FontId` and
+/// no way to ask it which file that id came from (`get_font_for_id` returns
+/// the REQUESTED `Font` key, not the resolved face), so a name read back here
+/// would be the request echoed. The resolved face's `unitsPerEm` and its
+/// per-character advances are read through that id from the loaded face
+/// itself, so they are properties of the FILE and not of the request: Space
+/// Mono is 1000 units per em and 612/1000 em on every character, where the
+/// platform fallbacks are 2048 units per em and proportional. That makes the
+/// metrics a fingerprint of the face, which is also the only property of it
+/// that the advance-drift question turns on.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn publish_font_report(cx: &mut App) {
+    const SIZE_PX: f32 = 16.0;
+    let text_system = cx.text_system().clone();
+    let known: Vec<String> = text_system.all_font_names();
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut fingerprints: Vec<Option<(u32, f32)>> = Vec::new();
+    for family in FONT_REPORT_FAMILIES {
+        // `resolve_font` panics only when neither the family nor any fallback
+        // resolves. A diagnostic must never take the window down with it.
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let id = text_system.resolve_font(&gpui::font(family));
+            let upem = text_system.units_per_em(id);
+            let adv = |c: char| {
+                text_system
+                    .advance(id, gpui::px(SIZE_PX), c)
+                    .map(|s| f32::from(s.width))
+                    .unwrap_or(f32::NAN)
+            };
+            (upem, adv('M'), adv('i'), adv('W'), adv('0'))
+        }));
+        match resolved {
+            Ok((upem, m, i, w, zero)) => {
+                fingerprints.push(Some((upem, m)));
+                entries.push(format!(
+                    concat!(
+                        "{{\"requested\": {}, \"knownToTextSystem\": {}, ",
+                        "\"unitsPerEm\": {}, \"sizePx\": {}, ",
+                        "\"advancePx\": {{\"M\": {}, \"i\": {}, \"W\": {}, \"0\": {}}}, ",
+                        "\"monospaced\": {}, \"advanceEm\": {}}}"
+                    ),
+                    json_str(family),
+                    known.iter().any(|n| n == family),
+                    upem,
+                    SIZE_PX,
+                    m,
+                    i,
+                    w,
+                    zero,
+                    (m - i).abs() < 0.001 && (m - w).abs() < 0.001,
+                    m / SIZE_PX
+                ));
+            }
+            Err(_) => {
+                fingerprints.push(None);
+                entries.push(format!(
+                    "{{\"requested\": {}, \"resolveFontPanicked\": true}}",
+                    json_str(family)
+                ));
+            }
+        }
+    }
+
+    // The control: the bogus family must NOT fingerprint like Space Mono.
+    let control_proves_resolution = match (fingerprints.first(), fingerprints.last()) {
+        (Some(Some((mono_upem, mono_adv))), Some(Some((ctl_upem, ctl_adv)))) => {
+            mono_upem != ctl_upem || (mono_adv - ctl_adv).abs() > 0.001
+        }
+        _ => false,
+    };
+
+    let files: Vec<String> = window::font_paths().iter().map(|p| json_str(p)).collect();
+    let json = format!(
+        concat!(
+            "{{\"probe\": \"gpui-nim-shim/register_fonts\", ",
+            "\"textSystem\": \"gpui-pre 0.3.5 (platform text system)\", ",
+            "\"registeredFileCount\": {}, \"registeredFiles\": [{}], ",
+            "\"queries\": [{}], ",
+            "\"controlFamily\": {}, \"controlProvesResolution\": {}, ",
+            "\"controlMeaning\": \"true means the control family fingerprints ",
+            "DIFFERENTLY from Space Mono, so these are resolved faces and not ",
+            "the requested names echoed back\"}}"
+        ),
+        files.len(),
+        files.join(", "),
+        entries.join(", "),
+        json_str(FONT_REPORT_CONTROL_FAMILY),
+        control_proves_resolution
+    );
+
+    if let Ok(path) = std::env::var("GPUI_FONT_REPORT_PATH") {
+        if !path.is_empty() {
+            if let Err(e) = std::fs::write(&path, &json) {
+                eprintln!("gpui-nim-shim: writing GPUI_FONT_REPORT_PATH {path}: {e}");
+            }
+        }
+    }
+    eprintln!("gpui-nim-shim: font-report {json}");
+    window::set_font_report(json);
+}
+
+/// Read the platform's view of the window's frame (GWIN).
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn sample_chrome_state(window: &Window, cx: &App, layout_reported: bool) -> window::ChromeState {
+    let (decorations, tiling) = match window.window_decorations() {
+        Decorations::Server => (window::DECORATIONS_SERVER, 0),
+        Decorations::Client { tiling } => {
+            let mut bits = 0;
+            if tiling.top {
+                bits |= window::TILING_TOP;
+            }
+            if tiling.right {
+                bits |= window::TILING_RIGHT;
+            }
+            if tiling.bottom {
+                bits |= window::TILING_BOTTOM;
+            }
+            if tiling.left {
+                bits |= window::TILING_LEFT;
+            }
+            (window::DECORATIONS_CLIENT, bits)
+        }
+    };
+    let c = window.window_controls();
+    let mut controls = 0;
+    if c.minimize {
+        controls |= window::CONTROL_MINIMIZE;
+    }
+    if c.maximize {
+        controls |= window::CONTROL_MAXIMIZE;
+    }
+    if c.fullscreen {
+        controls |= window::CONTROL_FULLSCREEN;
+    }
+    if c.window_menu {
+        controls |= window::CONTROL_WINDOW_MENU;
+    }
+    let button_layout = cx
+        .button_layout()
+        .map(|layout| {
+            let ids = |side: &[Option<gpui::WindowButton>]| -> Vec<&'static str> {
+                side.iter().flatten().map(|b| b.id()).collect()
+            };
+            window::format_button_layout(&ids(&layout.left), &ids(&layout.right))
+        })
+        .map(|layout| window::desktop_button_layout(layout, layout_reported))
+        .unwrap_or_default();
+    window::ChromeState {
+        decorations,
+        tiling,
+        controls,
+        maximized: window.is_maximized(),
+        active: window.is_window_active(),
+        button_layout,
     }
 }
 
@@ -83,6 +481,7 @@ impl Render for NimRootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Check and clear the repaint flag (so we know the frame is current).
         let _ = window::take_repaint_request();
+        drop_evicted_images(window);
 
         // Start a background polling timer that checks REPAINT_REQUESTED
         // and calls cx.notify() to trigger re-renders. We only start this
@@ -130,8 +529,18 @@ impl Render for NimRootView {
         }
         window::notify_focus(active_window_id(), handle.is_focused(window));
 
+        // PLAT-50 (CodeTracer): text a click copied goes to the platform
+        // clipboard here, where an `App` is in hand (`clipboard.rs`).
+        if let Some(text) = crate::clipboard::take_pending() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+
+        self.sync_window_registry(window, cx);
+
         let tree = crate::lock_tree();
-        let root_id = *crate::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
+        let root_id = *crate::ROOT_NODE_ID
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         if root_id.is_null() {
             return with_keyboard(div().size_full().child("No shadow tree root"), &handle)
@@ -142,11 +551,41 @@ impl Render for NimRootView {
         match crate::render_sync::build_render_plan(&tree, root_id) {
             Some(plan) => {
                 drop(tree); // release lock before building GPUI elements
-                let element = render_root_to_gpui(&plan, &handle);
+                let cursor_override = window_cursor_override().into_any_element();
+                let element = if self.frame.is_framed() || self.title_bar > 0.0 {
+                    let title_bar = (self.title_bar > 0.0).then(|| {
+                        let win_id = active_window_id();
+                        let chrome = window::chrome_state(win_id).unwrap_or_default();
+                        FallbackTitleBar {
+                            height: self.title_bar,
+                            title: window::with_window(win_id, |w| w.title.clone())
+                                .unwrap_or_default(),
+                            buttons: crate::regions::title_bar_buttons(
+                                &chrome.button_layout,
+                                chrome.controls,
+                                cfg!(target_os = "macos"),
+                            ),
+                            maximized: chrome.maximized,
+                        }
+                    });
+                    frame_client_window(
+                        render_plan_to_gpui(&plan),
+                        &self.frame,
+                        title_bar,
+                        FrameColors::of(&plan, window.is_window_active()),
+                        &handle,
+                    )
+                } else {
+                    render_root_to_gpui(&plan, &handle)
+                };
                 // PLAT-42: the render-path half of the frame budget. GPUI's
                 // layout and paint follow and are not in this number.
                 crate::frame_stats::complete_frame(started.elapsed().as_nanos() as u64);
-                element
+                div()
+                    .size_full()
+                    .child(element)
+                    .child(cursor_override)
+                    .into_any_element()
             }
             None => with_keyboard(div().size_full().child("Empty shadow tree"), &handle)
                 .into_any_element(),
@@ -164,6 +603,9 @@ impl Render for NimRootView {
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
     el.track_focus(handle)
+        // GWIN: every press starts unclaimed (`regions`); the capture phase
+        // runs before any element's own handler.
+        .capture_any_mouse_down(|_event, _window, _cx| crate::regions::begin_press())
         // A key context is what makes this element a keyboard dispatch
         // target in GPUI's tree. Named for this shim rather than for any
         // product, because the shim has no opinion about what the keys mean.
@@ -188,6 +630,66 @@ fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
                 )),
             );
         })
+        // A modifier on its own never reaches `on_key_down`; its changes are
+        // delivered as their own event, with the new set and no key.
+        .on_modifiers_changed(move |event: &gpui::ModifiersChangedEvent, _window, _cx| {
+            crate::input::deliver_key_to_focus(
+                "modifierschange",
+                Some((
+                    crate::input::GPUI_EVENT_MODIFIERS,
+                    String::new(),
+                    crate::input::modifier_bits(&event.modifiers),
+                    false,
+                )),
+            );
+        })
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+thread_local! {
+    /// The `RenderImage`s the `img` elements' pixels were decoded into, by
+    /// setting (`NodeImage::generation`), newest last; and the ones evicted,
+    /// waiting for a window to release their atlas tiles (`drop_evicted_images`).
+    static IMAGE_CACHE: std::cell::RefCell<Vec<(u64, std::sync::Arc<gpui::RenderImage>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static EVICTED_IMAGES: std::cell::RefCell<Vec<std::sync::Arc<gpui::RenderImage>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many decoded images are kept: the frames a scrub moves between.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const IMAGE_CACHE_SIZE: usize = 8;
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn cached_render_image(image: &crate::tree::NodeImage) -> std::sync::Arc<gpui::RenderImage> {
+    IMAGE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(i) = cache.iter().position(|(g, _)| *g == image.generation) {
+            let entry = cache.remove(i);
+            let render = entry.1.clone();
+            cache.push(entry);
+            return render;
+        }
+        let buffer = image::RgbaImage::from_raw(image.width, image.height, (*image.bgra).clone())
+            .unwrap_or_else(|| image::RgbaImage::new(image.width.max(1), image.height.max(1)));
+        let render = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buffer)]));
+        cache.push((image.generation, render.clone()));
+        while cache.len() > IMAGE_CACHE_SIZE {
+            let (_, old) = cache.remove(0);
+            EVICTED_IMAGES.with(|e| e.borrow_mut().push(old));
+        }
+        render
+    })
+}
+
+/// Release the atlas tiles of the images the cache let go of. Called by the
+/// root views' render, which hold the window.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn drop_evicted_images(window: &mut Window) {
+    let evicted: Vec<_> = EVICTED_IMAGES.with(|e| std::mem::take(&mut *e.borrow_mut()));
+    for old in evicted {
+        let _ = window.drop_image(old);
+    }
 }
 
 /// Build the ROOT of the render plan, with the keyboard attached.
@@ -216,11 +718,159 @@ pub fn render_root_to_gpui(
 }
 
 // ---------------------------------------------------------------------------
+// GWIN: the client-side frame (geometry in `frame.rs`)
+// ---------------------------------------------------------------------------
+
+/// The frame's colours: the application's, from attributes on its root
+/// element, or neutral defaults. A shadow is dimmed while the window is
+/// inactive, as desktops do to show which window has focus.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct FrameColors {
+    pub border: Hsla,
+    pub shadow: Hsla,
+    pub title_bar: Hsla,
+    pub title_text: Hsla,
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl FrameColors {
+    pub fn of(plan: &crate::render_sync::RenderNode, active: bool) -> Self {
+        let pick = |name: &str, default: &str| {
+            plan.attributes
+                .get(name)
+                .and_then(|v| parse_color(v))
+                .or_else(|| parse_color(default))
+                .unwrap_or_default()
+        };
+        let mut shadow = pick("data-isonim-window-shadow", "#00000066");
+        if !active {
+            shadow.a *= 0.5;
+        }
+        FrameColors {
+            border: pick("data-isonim-window-border", "#00000040"),
+            shadow,
+            title_bar: pick("data-isonim-titlebar-background", "#303030"),
+            title_text: pick("data-isonim-titlebar-foreground", "#e6e6e6"),
+        }
+    }
+}
+
+/// Wrap the application's root in the client-side frame: a transparent
+/// backdrop with a band on every untiled side, the content inside it with a
+/// border and a shadow, and the resize zones on top.
+///
+/// The keyboard is attached to the backdrop, so the whole window remains the
+/// key target. The resize zones occlude what is under them: a press there
+/// resizes and does not reach the application.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn frame_client_window(
+    content: AnyElement,
+    frame: &crate::frame::FrameGeometry,
+    title_bar: Option<FallbackTitleBar>,
+    colors: FrameColors,
+    handle: &gpui::FocusHandle,
+) -> AnyElement {
+    use crate::frame::{Edge, FRAME_BORDER};
+    use gpui::{BoxShadow, ResizeEdge};
+    let (cw, ch) = frame.content_size();
+    let side = |band: f32| if band > 0.0 { band - FRAME_BORDER } else { 0.0 };
+    let border = |band: f32| if band > 0.0 { FRAME_BORDER } else { 0.0 };
+    let body = div()
+        .w(px(cw + border(frame.left) + border(frame.right)))
+        .h(px(ch + border(frame.top) + border(frame.bottom)))
+        .border_color(colors.border)
+        .border_l(px(border(frame.left)))
+        .border_t(px(border(frame.top)))
+        .border_r(px(border(frame.right)))
+        .border_b(px(border(frame.bottom)))
+        .shadow(vec![BoxShadow::new(px(0.), px(0.), colors.shadow)
+            .blur_radius(px(crate::frame::FRAME_INSET / 2.0))])
+        .overflow_hidden()
+        .flex()
+        .flex_col();
+    let bar_h = title_bar.as_ref().map_or(0.0, |b| b.height);
+    let body = match title_bar {
+        Some(bar) => body.child(fallback_title_bar(bar, cw, &colors)),
+        None => body,
+    }
+    .child(div().w(px(cw)).h(px((ch - bar_h).max(0.0))).child(content));
+    let mut backdrop = div()
+        .size_full()
+        .pl(px(side(frame.left)))
+        .pt(px(side(frame.top)))
+        .pr(px(side(frame.right)))
+        .pb(px(side(frame.bottom)))
+        .child(body);
+    // GPUI hit-tests the LAST child on top, and `resize_zones` lists the
+    // corners first (they win where they overlap an edge), so the zones are
+    // added in reverse. Added in order, an edge's zone covered its corners:
+    // a corner drag on sway resized along one axis only (measured).
+    for (edge, zone) in frame.resize_zones().into_iter().rev() {
+        let (cursor, resize) = match edge {
+            Edge::Top => (CursorStyle::ResizeUpDown, ResizeEdge::Top),
+            Edge::Bottom => (CursorStyle::ResizeUpDown, ResizeEdge::Bottom),
+            Edge::Left => (CursorStyle::ResizeLeftRight, ResizeEdge::Left),
+            Edge::Right => (CursorStyle::ResizeLeftRight, ResizeEdge::Right),
+            Edge::TopLeft => (CursorStyle::ResizeUpLeftDownRight, ResizeEdge::TopLeft),
+            Edge::BottomRight => (CursorStyle::ResizeUpLeftDownRight, ResizeEdge::BottomRight),
+            Edge::TopRight => (CursorStyle::ResizeUpRightDownLeft, ResizeEdge::TopRight),
+            Edge::BottomLeft => (CursorStyle::ResizeUpRightDownLeft, ResizeEdge::BottomLeft),
+        };
+        backdrop = backdrop.child(
+            div()
+                .absolute()
+                .left(px(zone.x))
+                .top(px(zone.y))
+                .w(px(zone.w))
+                .h(px(zone.h))
+                .cursor(cursor)
+                .occlude()
+                .on_mouse_down(MouseButton::Left, move |_e, window, cx| {
+                    cx.stop_propagation();
+                    window.start_window_resize(resize);
+                }),
+        );
+    }
+    with_keyboard(backdrop, handle).into_any_element()
+}
+
+// ---------------------------------------------------------------------------
 // Render plan -> GPUI element conversion (module-level for testability)
 // ---------------------------------------------------------------------------
 
 /// Recursively convert a RenderNode to GPUI AnyElement.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+/// The GPUI cursor a CSS name means.
+fn cursor_style_of(name: &str) -> Option<CursorStyle> {
+    Some(match name {
+        "default" => CursorStyle::Arrow,
+        "pointer" => CursorStyle::PointingHand,
+        "text" => CursorStyle::IBeam,
+        "col-resize" => CursorStyle::ResizeColumn,
+        "row-resize" => CursorStyle::ResizeRow,
+        "grab" => CursorStyle::OpenHand,
+        "grabbing" => CursorStyle::ClosedHand,
+        "not-allowed" => CursorStyle::OperationNotAllowed,
+        _ => return None,
+    })
+}
+
+/// Paints nothing and, while the application has set a window-level cursor
+/// (`gpui_set_window_cursor`), makes it win over every element's own: a drag's
+/// shape holds wherever the pointer goes.
+fn window_cursor_override() -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        |_, _, window, _| {
+            if let Some(style) = crate::window_cursor().as_deref().and_then(cursor_style_of) {
+                window.set_window_cursor_style(style);
+            }
+        },
+    )
+    .absolute()
+    .size_0()
+}
+
 pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement {
     use crate::tree::GpuiElementKind;
 
@@ -228,6 +878,35 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
         GpuiElementKind::TextNode => {
             let text = plan.text.clone().unwrap_or_default();
             text.into_any_element()
+        }
+        GpuiElementKind::Img | GpuiElementKind::Svg
+            if plan.attributes.get("src").map_or(false, |s| !s.is_empty()) =>
+        {
+            // A PICTURE FROM A FILE: `src` names a raster image or an SVG
+            // document on disk, and GPUI's own `img()` loads it — a raster
+            // format it recognises is decoded, anything else is rendered by
+            // its SVG renderer (`ImageAssetLoader`). The element's `width`
+            // and `height` size it, like any other box. Until this arm an
+            // `img` was a grey placeholder with its alt text, so a front-end
+            // could not draw an icon at all (CodeTracer's GPUI debugger
+            // controls draw the desktop's SVG marks through it).
+            let src = plan.attributes.get("src").cloned().unwrap_or_default();
+            file_image(&src, plan.node_id, &plan.styles).into_any_element()
+        }
+        GpuiElementKind::Img if plan.image.is_some() => {
+            // THE PIXELS THE APPLICATION SET (`gpui_set_image_rgba`), drawn
+            // stretched to the element's box. The decoded image is cached by
+            // the setting's generation: GPUI uploads an image once per
+            // `RenderImage` id, so a new one per frame would upload (and keep)
+            // the same pixels again on every repaint.
+            let image = plan.image.as_ref().unwrap();
+            let render = cached_render_image(image);
+            picture_box(
+                gpui::StyledImage::object_fit(img(render), gpui::ObjectFit::Fill),
+                plan.node_id,
+                &plan.styles,
+            )
+            .into_any_element()
         }
         GpuiElementKind::Img => {
             // Placeholder: render a colored rect with alt text label.
@@ -284,17 +963,81 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
     let mut el = div();
     el = apply_styles_to_div(el, &plan.styles);
 
-    // Add children
-    for child in &plan.children {
-        el = el.child(render_plan_to_gpui(child));
-    }
+    // A DECLARED INLINE FORMATTING CONTEXT IS ONE TEXT ELEMENT, NOT ONE PER
+    // SPAN (`render_sync::INLINE_TEXT_RUNS_ATTRIBUTE`, which carries the full
+    // reasoning). GPUI rounds each text element's width up to a whole logical
+    // pixel, so a row built from one element per coloured span accumulates
+    // that rounding span by span and drifts right of where a browser puts the
+    // same text. Fused, the row is rounded once.
+    //
+    // Everything below — events, pointer listeners, window regions — is
+    // reached either way: only how the children are built changes.
+    match crate::render_sync::inline_chunks(plan) {
+        Some(chunks) => {
+            // A declared row lays its chunks out IN CHILD ORDER: each fused
+            // run becomes one text element, and every child that could not
+            // fuse is rendered exactly as it would have been. A container
+            // with its own text never reaches here (`inline_chunks`
+            // declines it), so there is no trailing text to append.
+            for chunk in chunks {
+                el = match chunk {
+                    // A run carrying a horizontal inset (a span's own
+                    // padding, admitted only in a context that promised one
+                    // line) cannot be a `StyledText`: a highlight has no
+                    // gap. It is drawn by `InsetRunText`, which keeps the
+                    // gap and still rounds the run once. Every other run is
+                    // drawn exactly as before, so the wrap and truncate
+                    // behaviour of existing fused rows does not change.
+                    crate::render_sync::InlineChunk::Fused(run)
+                        if run.runs.iter().any(crate::render_sync::InlineTextRun::has_inset) =>
+                    {
+                        if InsetRunText::can_draw(&run) {
+                            el.child(InsetRunText::new(run))
+                        } else {
+                            // Defensive: `inline_chunks` never hands over an
+                            // inset run it cannot draw, but if it did, the
+                            // spans are drawn as their own elements -- the
+                            // unfused path, gap included -- rather than as a
+                            // `StyledText` that would delete the gap.
+                            plan.children
+                                .iter()
+                                .skip(run.start)
+                                .take(run.runs.len())
+                                .fold(el, |el, child| el.child(render_plan_to_gpui(child)))
+                        }
+                    }
+                    crate::render_sync::InlineChunk::Fused(run) => el.child(fused_run_text(&run)),
+                    crate::render_sync::InlineChunk::Own(i) => {
+                        el.child(render_plan_to_gpui(&plan.children[i]))
+                    }
+                };
+            }
+        }
+        None => {
+            // `letter-spacing` applies to the text this element draws itself
+            // (its text nodes and its own text), which `SpacedText` sets
+            // glyph by glyph; an element child sets its own, as it is not
+            // passed down (GPUI's inherited text style has no such field).
+            let spacing = plan.styles.letter_spacing.as_deref().and_then(parse_letter_spacing);
+            // Add children
+            for child in &plan.children {
+                el = if spacing.is_some() && child.kind == crate::tree::GpuiElementKind::TextNode {
+                    el.child(text_with_spacing(child.text.clone().unwrap_or_default(), spacing))
+                } else {
+                    el.child(render_plan_to_gpui(child))
+                };
+            }
 
-    // If the node has direct text content, add it as a child
-    if let Some(ref text) = plan.text {
-        if !text.is_empty() {
-            el = el.child(text.clone());
+            // If the node has direct text content, add it as a child
+            if let Some(ref text) = plan.text {
+                if !text.is_empty() {
+                    el = el.child(text_with_spacing(text.clone(), spacing));
+                }
+            }
         }
     }
+
+    el = with_layout_probe(el, plan);
 
     // Wire click events
     if plan.has_click_handler {
@@ -304,7 +1047,863 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
         });
     }
 
+    el = wire_pointer_listeners(el, plan);
+    wire_window_region(el, plan)
+}
+
+/// An element that declares `data-layout-probe` gets one more child: an
+/// absolutely positioned, full-size `canvas` that paints nothing and, during
+/// prepaint, records its bounds into `layout_bounds` (read back by
+/// `gpui_layout_bounds`; that module says why and what exactly is measured).
+/// An absolute child is outside its parent's flex layout, so the probe does
+/// not move what it measures. What the canvas is laid out over is the
+/// element's PADDING box (an absolute child's containing block); the
+/// element's own border widths, from its styles, are added back on each
+/// side, so what is recorded is its BORDER box, the box a browser's
+/// `getBoundingClientRect` reports. Every other element is returned
+/// unchanged.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn with_layout_probe(el: Div, plan: &crate::render_sync::RenderNode) -> Div {
+    if !crate::layout_bounds::wants_probe(&plan.attributes) {
+        return el;
+    }
+    let node_id = plan.node_id;
+    let [top, right, bottom, left] = border_side_widths(&plan.styles).map(|w| w.unwrap_or(0.0));
+    el.child(
+        canvas(
+            move |bounds, _window, _cx| {
+                crate::layout_bounds::record(
+                    node_id,
+                    crate::layout_bounds::border_box_of(
+                        crate::layout_bounds::LaidOut {
+                            x: f32::from(bounds.origin.x),
+                            y: f32::from(bounds.origin.y),
+                            w: f32::from(bounds.size.width),
+                            h: f32::from(bounds.size.height),
+                        },
+                        [top, right, bottom, left],
+                    ),
+                );
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    )
+}
+
+/// The single text element one FUSED RUN of a declared inline formatting
+/// context collapses to (see `render_sync::inline_chunks`).
+///
+/// The per-span colours are handed over as HIGHLIGHTS rather than as finished
+/// `TextRun`s. A `TextRun` must name a concrete `Font`, which this function
+/// has no business choosing: the row's family, size and weight are inherited
+/// from an ancestor and are known only once the window lays the element out.
+/// `with_highlights` is resolved against `window.text_style()` at layout time
+/// (`gpui-pre/src/elements/text.rs`), so the fused row keeps exactly the face
+/// the unfused spans would have been drawn in, and only the colour is stated
+/// here.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn fused_run_text(fused: &crate::render_sync::FusedRun) -> StyledText {
+    let text = fused.text.clone();
+    let runs = &fused.runs;
+    let mut offset = 0usize;
+    let mut highlights = Vec::with_capacity(runs.len());
+    for run in runs {
+        let range = offset..offset + run.len;
+        offset = range.end;
+        highlights.push((range, run_highlight(run)));
+    }
+    StyledText::new(text).with_highlights(highlights)
+}
+
+/// The per-span inline style of one fused run, as a `HighlightStyle` --
+/// shared by `fused_run_text` and `InsetRunText` so the two fused drawings
+/// can never disagree about a span's colour or weight.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn run_highlight(run: &crate::render_sync::InlineTextRun) -> HighlightStyle {
+    // A span whose colour does not parse keeps the inherited colour, which
+    // is what an unparsable `color` does to an unfused span too.
+    let color = run.color.as_deref().and_then(parse_color);
+    // `font-weight` is resolved by the SAME parser the unfused path uses
+    // (`parse_font_weight`, applied at `el.font_weight(..)`), so a run that
+    // fuses is drawn in the weight it would have had as its own element. A
+    // span with no weight of its own leaves the field `None` and inherits,
+    // exactly as it does unfused.
+    let font_weight = run.font_weight.as_deref().map(parse_font_weight);
+    // `font-style` likewise, through the unfused path's own parser.
+    let font_style = run.font_style.as_deref().and_then(parse_font_style);
+    HighlightStyle {
+        color,
+        font_weight,
+        font_style,
+        ..Default::default()
+    }
+}
+
+/// ONE FUSED RUN THAT CARRIES HORIZONTAL INSETS, drawn as ONE measured
+/// layout leaf: the shaped segments of the run, with each span's own
+/// `padding-left` / `padding-right` left as a gap between them.
+///
+/// WHY IT EXISTS. A GPUI text element ceils its width to a whole logical
+/// pixel (`gpui-pre/src/elements/text.rs`, `size.width.max(line_size
+/// .width).ceil()`), and GPUI's taffy wrapper ceils every measured leaf to a
+/// device pixel again (`snap_measured_size_to_device_pixels`). Fusing spans
+/// into one `StyledText` removes that rounding within a run, but a
+/// `HighlightStyle` cannot carry padding, so a run whose spans are spaced by
+/// padding -- the editor's inline-value chip, `name` + 7 px + `value` --
+/// could not fuse without deleting the gap, and kept rounding once per span,
+/// so a row of chips drifted right of where a browser draws it. This
+/// element states the gap itself, so such a run fuses too.
+///
+/// WHY ONE LEAF. The whole run is ONE `request_measured_layout` returning
+/// its exact width, so GPUI rounds it ONCE, to a device pixel, at the end --
+/// which is how Chromium lays out inline runs (it accumulates in LayoutUnit,
+/// 1/64 px, and rounds once). Inside the leaf the pen accumulates UNROUNDED:
+/// each segment is placed at the sum of the snapped insets and the exact
+/// `ShapedLine::width()`s before it, so no per-span residue builds up.
+///
+/// HOW IT MATCHES THE UNFUSED PATH. Text runs are built exactly as
+/// `StyledText::compute_runs` builds them (`text_style.highlight(..)
+/// .to_run(len)`, with the highlight from `run_highlight`), and font size
+/// and line height exactly as `TextLayout::layout` computes them. Adjacent
+/// spans with no inset between them are shaped TOGETHER as one line, so
+/// their kerning and shaping match a `StyledText`. Each inset is snapped to
+/// the device-pixel grid with `Window::pixel_snap` (round half toward zero
+/// in device px), which is how taffy snaps the unfused span's authored
+/// padding (`Style::to_taffy` -> `round_to_device_pixel`), so the gap is
+/// the gap the unfused span is drawn with, not an approximation of it.
+///
+/// WHAT IT DOES NOT SUPPORT, and why that is safe. It draws exactly one
+/// line: no wrapping, no truncation, no `text-overflow`, no hard line
+/// breaks. `render_sync::fusable_child_text` therefore admits an inset only
+/// in a context that declared `white-space: nowrap` / `pre` and no
+/// `text-overflow` -- where the unfused spans could not wrap or elide
+/// either -- and `render_sync::inline_chunks` never hands it a run holding
+/// a line break. `can_draw` re-checks that at the call site, so a violated
+/// precondition draws the spans as their own elements (the unfused path,
+/// gap included) instead of reaching `shape_line`, which cannot shape a
+/// break. Per-span hit-testing is not provided either; spans with listeners
+/// never fuse in the first place.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct InsetRunText {
+    run: crate::render_sync::FusedRun,
+}
+
+/// One shaped segment of an `InsetRunText`, and the pen offset from the
+/// element's left edge it is painted at.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct InsetSegment {
+    x: gpui::Pixels,
+    line: gpui::ShapedLine,
+}
+
+/// What `InsetRunText::request_layout` measured, kept for `paint`.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct InsetRunLayout {
+    segments: Vec<InsetSegment>,
+    /// The run's exact width: every snapped inset plus every segment's
+    /// unrounded shaped width. GPUI ceils it to a device pixel, once.
+    width: gpui::Pixels,
+    line_height: gpui::Pixels,
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl InsetRunText {
+    /// Wrap one fused run. Callers check `can_draw` first.
+    pub fn new(run: crate::render_sync::FusedRun) -> Self {
+        Self { run }
+    }
+
+    /// Can this element draw `run` faithfully: is its text a single line
+    /// (`shape_line` cannot shape a break) and do its runs tile the text
+    /// exactly on character boundaries? A run without insets is drawn by
+    /// `fused_run_text` instead, and the caller decides that.
+    pub fn can_draw(run: &crate::render_sync::FusedRun) -> bool {
+        if run.text.contains(['\n', '\r']) {
+            return false;
+        }
+        let mut at = 0usize;
+        for r in &run.runs {
+            at += r.len;
+            if !run.text.is_char_boundary(at) {
+                return false;
+            }
+        }
+        at == run.text.len()
+    }
+
+    /// Shape the run into segments split at every non-zero inset, and
+    /// measure it. `text_style` is the inherited style at this element.
+    fn measure(&self, text_style: &gpui::TextStyle, window: &mut Window) -> InsetRunLayout {
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        // As `TextLayout::layout` computes it, so a chip's height is the
+        // height its unfused text elements had.
+        let line_height = window.pixel_snap(
+            text_style
+                .line_height
+                .to_pixels(font_size.into(), window.rem_size()),
+        );
+
+        let text = self.run.text.as_str();
+        let mut segments = Vec::new();
+        let mut pen = px(0.0);
+        let mut seg_start = 0usize;
+        let mut seg_end = 0usize;
+        let mut seg_runs: Vec<gpui::TextRun> = Vec::new();
+
+        // Shape the spans accumulated since the last inset as ONE line, so
+        // adjacent uninset spans kern and shape exactly as in a `StyledText`.
+        let mut flush = |seg_start: &mut usize,
+                         seg_end: usize,
+                         seg_runs: &mut Vec<gpui::TextRun>,
+                         pen: &mut gpui::Pixels,
+                         window: &mut Window| {
+            if seg_runs.is_empty() {
+                return;
+            }
+            // `inline_chunks` tiles the text with its runs on character
+            // boundaries; a range that is not a slice means a malformed run,
+            // and that segment is skipped rather than shaped from garbage.
+            if let Some(piece) = text.get(*seg_start..seg_end) {
+                if !piece.is_empty() {
+                    let line = window.text_system().shape_line(
+                        gpui::SharedString::from(piece.to_string()),
+                        font_size,
+                        seg_runs,
+                        None,
+                    );
+                    let width = line.width();
+                    segments.push(InsetSegment { x: *pen, line });
+                    *pen += width;
+                }
+            }
+            seg_runs.clear();
+            *seg_start = seg_end;
+        };
+
+        for run in &self.run.runs {
+            let left = run.inset_left_px();
+            if left > 0.0 {
+                flush(&mut seg_start, seg_end, &mut seg_runs, &mut pen, window);
+                pen += window.pixel_snap(px(left));
+            }
+            seg_runs.push(
+                text_style
+                    .clone()
+                    .highlight(run_highlight(run))
+                    .to_run(run.len),
+            );
+            seg_end += run.len;
+            let right = run.inset_right_px();
+            if right > 0.0 {
+                flush(&mut seg_start, seg_end, &mut seg_runs, &mut pen, window);
+                pen += window.pixel_snap(px(right));
+            }
+        }
+        flush(&mut seg_start, seg_end, &mut seg_runs, &mut pen, window);
+
+        InsetRunLayout {
+            segments,
+            width: pen,
+            line_height,
+        }
+    }
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl gpui::Element for InsetRunText {
+    type RequestLayoutState = InsetRunLayout;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let text_style = window.text_style();
+        let layout = self.measure(&text_style, window);
+        // ONE leaf, measured once: the size does not depend on the space
+        // offered, because the run is one line that never wraps or elides.
+        let measured = size(layout.width, layout.line_height);
+        let layout_id = window
+            .request_measured_layout(Default::default(), move |_known, _available, _w, _cx| {
+                measured
+            });
+        (layout_id, layout)
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<gpui::Pixels>,
+        _layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // The run is aligned AS A WHOLE within the element's bounds, as a
+        // `StyledText` line is (`aligned_origin_x` in gpui's line.rs); each
+        // segment is then painted left-aligned at its own pen offset, so a
+        // centred run does not centre every segment separately.
+        let text_align = window.text_style().text_align;
+        let slack = bounds.size.width - layout.width;
+        let shift = match text_align {
+            gpui::TextAlign::Left => px(0.0),
+            gpui::TextAlign::Center => slack / 2.0,
+            gpui::TextAlign::Right => slack,
+        };
+        for segment in &layout.segments {
+            let origin = gpui::point(bounds.origin.x + shift + segment.x, bounds.origin.y);
+            // Background before glyphs, as `TextLayout::paint` does. A
+            // failure (a glyph the atlas could not take) loses that segment
+            // for this frame and the others still paint; a `StyledText`
+            // likewise drops the error (`log_err`). It is not printed: paint
+            // runs every frame, and the shim has no logger to rate-limit it.
+            let _ = segment.line.paint_background(
+                origin,
+                layout.line_height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+            let _ = segment.line.paint(
+                origin,
+                layout.line_height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+        }
+    }
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl IntoElement for InsetRunText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// A text set with `letter-spacing`: GPUI's text styles have no letter
+/// spacing (`gpui-pre` 0.3.5's `TextStyle` and `TextRun` carry none), so the
+/// shim shapes the line with GPUI's own text system, in the inherited text
+/// style, and paints its glyphs one by one, each moved right by the spacing
+/// of the characters before it (`letter_spaced_xs`). The element is as wide
+/// as the spaced line, so what follows it moves as it does in a browser.
+///
+/// It sets ONE line and never elides: a letter-spaced text is a short label
+/// (an uppercase section title), and a browser's labels of that kind are
+/// `white-space: nowrap` too. A line longer than its box is clipped by the
+/// box, not cut with "…". Underline and strikethrough are not drawn on it.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct SpacedText {
+    text: gpui::SharedString,
+    spacing: LetterSpacing,
+}
+
+/// What `SpacedText::request_layout` measured, kept for `paint`.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct SpacedTextLayout {
+    line: gpui::ShapedLine,
+    xs: Vec<f32>,
+    width: gpui::Pixels,
+    line_height: gpui::Pixels,
+    color: Hsla,
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl SpacedText {
+    pub fn new(text: impl Into<gpui::SharedString>, spacing: LetterSpacing) -> Self {
+        Self {
+            text: text.into(),
+            spacing,
+        }
+    }
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl gpui::Element for SpacedText {
+    type RequestLayoutState = SpacedTextLayout;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        // As `TextLayout::layout` computes it, so the label is as tall as an
+        // unspaced text element in the same style.
+        let line_height = window.pixel_snap(
+            text_style
+                .line_height
+                .to_pixels(font_size.into(), window.rem_size()),
+        );
+        let line = window.text_system().shape_line(
+            self.text.clone(),
+            font_size,
+            &[text_style.to_run(self.text.len())],
+            None,
+        );
+        let (xs, width) = letter_spaced_xs(&line, &self.text, self.spacing.to_px(f32::from(font_size)));
+        let measured = size(px(width.max(0.0)), line_height);
+        let layout_id = window
+            .request_measured_layout(Default::default(), move |_known, _available, _w, _cx| {
+                measured
+            });
+        (
+            layout_id,
+            SpacedTextLayout {
+                line,
+                xs,
+                width: px(width.max(0.0)),
+                line_height,
+                color: text_style.color,
+            },
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<gpui::Pixels>,
+        _layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        // Aligned as a whole within the bounds, as a `StyledText` line is,
+        // and on the baseline `paint_line` (gpui's line.rs) puts it on: half
+        // the leading above the ascent.
+        let slack = bounds.size.width - layout.width;
+        let shift = match window.text_style().text_align {
+            gpui::TextAlign::Left => px(0.0),
+            gpui::TextAlign::Center => slack / 2.0,
+            gpui::TextAlign::Right => slack,
+        };
+        let line = &layout.line;
+        let padding_top = (layout.line_height - line.ascent - line.descent) / 2.0;
+        let baseline = bounds.origin.y + padding_top + line.ascent;
+        let mut k = 0usize;
+        for run in &line.runs {
+            for glyph in &run.glyphs {
+                let x = layout.xs.get(k).copied().unwrap_or(0.0);
+                k += 1;
+                let origin = gpui::point(
+                    bounds.origin.x + shift + px(x),
+                    baseline + glyph.position.y,
+                );
+                // A glyph the atlas cannot take is lost for this frame, as a
+                // `StyledText` drops the error; the rest still paint.
+                let _ = if glyph.is_emoji {
+                    window.paint_emoji(origin, run.font_id, glyph.id, line.font_size)
+                } else {
+                    window.paint_glyph(origin, run.font_id, glyph.id, line.font_size, layout.color)
+                };
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+impl IntoElement for SpacedText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// A text node's drawing under an element that may set `letter-spacing`:
+/// `SpacedText` when the spacing is a valid, non-zero length, else GPUI's
+/// own text element, exactly as before the property was drawn.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn text_with_spacing(text: String, spacing: Option<LetterSpacing>) -> AnyElement {
+    match spacing {
+        Some(s) if s.to_px(1.0) != 0.0 => SpacedText::new(text, s).into_any_element(),
+        _ => text.into_any_element(),
+    }
+}
+
+/// GWIN: give an element its window region (`regions.rs`). A drag region
+/// moves, maximizes and shows the window menu; a window button acts on a
+/// click; a `no-drag` element and any element listening for the pointer
+/// claim the press so that no drag region behind them acts on it.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn wire_window_region(el: Div, plan: &crate::render_sync::RenderNode) -> Div {
+    use crate::regions::{self, Region};
+    let region = plan
+        .attributes
+        .get(regions::REGION_ATTRIBUTE)
+        .and_then(|v| regions::parse_region(v));
+    let claim = |el: Div| {
+        el.on_mouse_down(MouseButton::Left, |_e, _w, _cx| regions::claim())
+            .on_mouse_down(MouseButton::Right, |_e, _w, _cx| regions::claim())
+    };
+    match region {
+        Some(Region::Drag) => drag_region(el),
+        Some(button @ (Region::Minimize | Region::Maximize | Region::Close)) => {
+            window_button(el, button)
+        }
+        Some(Region::NoDrag) => claim(el),
+        None if regions::is_pointer_listener(plan.has_click_handler, &plan.event_names) => {
+            claim(el)
+        }
+        None => el,
+    }
+}
+
+/// A drag region's behaviour (`regions.rs`): a move on the first motion
+/// after a left press, maximize on a double-click, the window menu on a
+/// right press — unless an element in front claimed the press, or the
+/// compositor draws the decorations.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn drag_region(el: Div) -> Div {
+    use crate::regions;
+    el.on_mouse_down(MouseButton::Left, |event, window, _cx| {
+        if regions::claimed() || !window::client_decorated() {
+            return;
+        }
+        // Exactly the second click: a quick third and fourth click must not
+        // toggle maximize again (measured on GNOME: a double-click soon after
+        // another arrived as counts 3 and 4, and maximized-then-restored in
+        // one gesture).
+        if event.click_count == 2 {
+            regions::disarm_move();
+            window.zoom_window();
+        } else {
+            regions::arm_move();
+        }
+    })
+    .on_mouse_move(|event, window, _cx| {
+        if event.pressed_button == Some(MouseButton::Left) && regions::take_move() {
+            window.start_window_move();
+        }
+    })
+    .on_mouse_up(MouseButton::Left, |_e, _w, _cx| regions::disarm_move())
+    .on_mouse_down(MouseButton::Right, |event, window, _cx| {
+        if !regions::claimed() && window::client_decorated() {
+            window.show_window_menu(event.position);
+        }
+    })
+}
+
+/// A window button's behaviour: it claims the press and acts on the click.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn window_button(el: Div, button: crate::regions::Region) -> Div {
+    use crate::regions::{self, Region};
+    el.on_mouse_down(MouseButton::Left, |_e, _w, _cx| regions::claim())
+        .on_mouse_down(MouseButton::Right, |_e, _w, _cx| regions::claim())
+        .on_mouse_up(MouseButton::Left, move |_e, window, _cx| {
+            let op = match button {
+                Region::Minimize => window::WindowOp::Minimize,
+                Region::Maximize => window::WindowOp::ToggleMaximize,
+                _ => window::WindowOp::Close,
+            };
+            perform_window_op(op, window, active_window_id());
+        })
+}
+
+/// The title bar the renderer draws for an application that declares none
+/// of its own (GWIN): the window's title, and the buttons the platform
+/// supports where the desktop wants them.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub struct FallbackTitleBar {
+    pub height: f32,
+    pub title: String,
+    pub buttons: (Vec<crate::regions::Region>, Vec<crate::regions::Region>),
+    pub maximized: bool,
+}
+
+/// The fallback title bar's button size, gap, and margin from the bar's ends.
+pub const FALLBACK_BUTTON: f32 = 24.0;
+pub const FALLBACK_BUTTON_GAP: f32 = 6.0;
+pub const FALLBACK_BUTTON_MARGIN: f32 = 6.0;
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn fallback_title_bar(bar: FallbackTitleBar, width: f32, colors: &FrameColors) -> Div {
+    use crate::regions::Region;
+    let fg = colors.title_text;
+    let maximized = bar.maximized;
+    let glyph = move |r: Region| -> AnyElement {
+        match r {
+            // Drawn rather than typed, so that no font has to carry them.
+            Region::Minimize => div().w(px(10.)).h(px(1.5)).bg(fg).into_any_element(),
+            Region::Maximize => {
+                let side = if maximized { 8. } else { 10. };
+                div()
+                    .w(px(side))
+                    .h(px(side))
+                    .border_1()
+                    .border_color(fg)
+                    .into_any_element()
+            }
+            _ => div().text_color(fg).child("×").into_any_element(),
+        }
+    };
+    let button = move |r: Region| {
+        window_button(
+            div()
+                .w(px(FALLBACK_BUTTON))
+                .h(px(FALLBACK_BUTTON))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(FALLBACK_BUTTON / 2.0))
+                .bg(gpui::hsla(0., 0., 1., 0.08))
+                .child(glyph(r)),
+            r,
+        )
+    };
+    let side = move |buttons: &[Region]| {
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(FALLBACK_BUTTON_GAP))
+            .children(buttons.iter().map(|r| button(*r)))
+    };
+    drag_region(
+        div()
+            .w(px(width))
+            .h(px(bar.height))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px(px(FALLBACK_BUTTON_MARGIN))
+            .bg(colors.title_bar)
+            .text_color(fg)
+            .child(side(&bar.buttons.0))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .justify_center()
+                    .overflow_hidden()
+                    .child(bar.title),
+            )
+            .child(side(&bar.buttons.1)),
+    )
+}
+
+/// Carry out a window operation on the platform window. `Close` asks the
+/// application first (`window::close_window`), as a compositor close does.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn perform_window_op(op: window::WindowOp, window: &mut Window, win_id: u32) {
+    match op {
+        window::WindowOp::Minimize => window.minimize_window(),
+        window::WindowOp::ToggleMaximize => window.zoom_window(),
+        window::WindowOp::ToggleFullscreen => window.toggle_fullscreen(),
+        window::WindowOp::Close => {
+            if window::close_window(win_id) {
+                window.remove_window();
+            }
+        }
+    }
+}
+
+/// Wire the POINTER events a node listens for (`mousedown`, `mousemove`,
+/// `mouseup`, `wheel`) to GPUI's mouse listeners, each delivering the
+/// pointer's WINDOW position — what a consumer needs to hit-test a drag, a
+/// divider or a drop zone against its own layout.
+///
+/// The position travels in the payload's `key` as `"x,y"` (logical window
+/// pixels), and a wheel's as `"x,y,dx,dy"` (the delta in pixels, lines
+/// converted at the window's line height), under the `GPUI_EVENT_POINTER_*`
+/// kinds (`input.rs`). The payload's layout is unchanged, so every consumer
+/// built against the key-only ABI still reads it.
+///
+/// Only the left button presses and releases under `mousedown` / `mouseup`: a
+/// drag is a left-button gesture, and a listener for every button would hand a
+/// right-click to a consumer that asked for a drag. The RIGHT button's press
+/// is `contextmenu` and the MIDDLE button's `auxdown`, each under a kind of
+/// its own (`GPUI_EVENT_POINTER_CONTEXT` / `_AUX`), for a consumer that asks.
+/// A press carries the modifiers held. A move is reported whether or not a
+/// button is down; the consumer knows whether a gesture is in flight.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn wire_pointer_listeners(mut el: Div, plan: &crate::render_sync::RenderNode) -> Div {
+    let has = |name: &str| plan.event_names.iter().any(|n| n == name);
+    let node_id = crate::tree::NodeId(plan.node_id);
+    if has("mousedown") {
+        el = el.on_mouse_down(MouseButton::Left, move |event, _window, _cx| {
+            crate::input::deliver_press(
+                node_id,
+                "mousedown",
+                crate::input::GPUI_EVENT_POINTER_DOWN,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                event.click_count,
+                crate::input::modifier_bits(&event.modifiers),
+            );
+        });
+    }
+    if has("contextmenu") {
+        el = el.on_mouse_down(MouseButton::Right, move |event, _window, _cx| {
+            crate::input::deliver_pointer(
+                node_id,
+                "contextmenu",
+                crate::input::GPUI_EVENT_POINTER_CONTEXT,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                None,
+                crate::input::modifier_bits(&event.modifiers),
+            );
+        });
+    }
+    if has("auxdown") {
+        el = el.on_mouse_down(MouseButton::Middle, move |event, _window, _cx| {
+            crate::input::deliver_press(
+                node_id,
+                "auxdown",
+                crate::input::GPUI_EVENT_POINTER_AUX,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                event.click_count,
+                crate::input::modifier_bits(&event.modifiers),
+            );
+        });
+    }
+    if has("mousemove") {
+        el = el.on_mouse_move(move |event, _window, _cx| {
+            crate::input::deliver_pointer(
+                node_id,
+                "mousemove",
+                crate::input::GPUI_EVENT_POINTER_MOVE,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                None,
+                crate::input::modifier_bits(&event.modifiers),
+            );
+        });
+    }
+    if has("mouseup") {
+        el = el.on_mouse_up(MouseButton::Left, move |event, _window, _cx| {
+            crate::input::deliver_pointer(
+                node_id,
+                "mouseup",
+                crate::input::GPUI_EVENT_POINTER_UP,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                None,
+                crate::input::modifier_bits(&event.modifiers),
+            );
+        });
+    }
+    if has("wheel") {
+        el = el.on_scroll_wheel(move |event, window, _cx| {
+            let delta = event.delta.pixel_delta(window.line_height());
+            crate::input::deliver_pointer(
+                node_id,
+                "wheel",
+                crate::input::GPUI_EVENT_POINTER_WHEEL,
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                Some((f32::from(delta.x), f32::from(delta.y))),
+                crate::input::modifier_bits(&event.modifiers),
+            );
+        });
+    }
     el
+}
+
+/// A picture from a file (`img` / `svg` with a `src`), in a box that carries
+/// the element's OWN styles -- its size, and also its `opacity`, margins and
+/// `flex-shrink`, which an icon beside text needs (a close mark at 0.4, a
+/// pin 4.8px before its neighbour, a mark that must not be squeezed by a
+/// full tab). The picture fills the box (`picture_box`). Until 2026-11-08
+/// this arm applied only `width` and `height` to GPUI's `img` and dropped
+/// the rest.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn file_image(src: &str, node_id: u64, styles: &crate::render_sync::GpuiStyles) -> Div {
+    picture_box(img(std::path::PathBuf::from(src)), node_id, styles)
+}
+
+/// The key under which a test reads where the window laid out the PICTURE of
+/// element `node_id` (`VisualTestContext::debug_bounds`). `debug_selector`
+/// is a no-op unless GPUI is built with `test-support`, so a production
+/// build records nothing and does not even format the key.
+pub fn picture_debug_selector(node_id: u64) -> String {
+    format!("isonim-gpui-picture-{node_id}")
+}
+
+/// The box an `img` element is drawn in: a FLEX container carrying the
+/// element's own styles, with the picture filling it.
+///
+/// The box must be a flex container, not GPUI's default block `div()`. GPUI's
+/// `Img` states the picture's intrinsic aspect ratio in its own style once
+/// the picture has loaded (`gpui-pre` `elements/img.rs`, `request_layout`),
+/// and in a BLOCK container Taffy lets that ratio, not the box's height,
+/// decide the picture's height: a 6x10 box holding a 10x16 SVG laid the
+/// picture out larger than the box and it overflowed (CodeTracer's flow-loop
+/// arrows drew at about 10x16 in a 12px button, its execution mark 7x9
+/// instead of 6x8; measured 2026-11-08). As a flex item, the picture's
+/// `size_full` resolves against the box on both axes and the ratio is
+/// ignored, which is what CSS does for an `<img>` with both `width` and
+/// `height` stated. `test_a_non_square_picture_lands_at_its_declared_size`
+/// (`tests/gpui_rendering.rs`) reads the laid-out bounds back.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn picture_box(
+    picture: gpui::Img,
+    node_id: u64,
+    styles: &crate::render_sync::GpuiStyles,
+) -> Div {
+    apply_styles_to_div(div().flex(), styles).child(
+        picture
+            .size_full()
+            .debug_selector(|| picture_debug_selector(node_id)),
+    )
 }
 
 /// Apply GpuiStyles to a div builder.
@@ -313,11 +1912,14 @@ pub fn apply_styles_to_div(
     mut el: Div,
     styles: &crate::render_sync::GpuiStyles,
 ) -> Div {
-    // Background color
-    if let Some(ref bg) = styles.bg {
-        if let Some(color) = parse_color(bg) {
-            el = el.bg(color);
-        }
+    // Background color -- painted over the whole box, or, under a
+    // `mask-image`, only through the mask (`with_mask_image`).
+    let mask = styles.mask_image.as_deref().and_then(parse_mask_url);
+    if let Some(color) = styles.bg.as_deref().and_then(parse_color) {
+        el = match mask {
+            Some(path) => with_mask_image(el, path, color),
+            None => el.bg(color),
+        };
     }
 
     // Width
@@ -354,11 +1956,39 @@ pub fn apply_styles_to_div(
         }
     }
 
+    // Per-side padding, after `p` so a side named on its own wins
+    // (2026-09-29: parsed into the plan as `padding_left` and never drawn).
+    if let Some(v) = styles.padding_top.as_deref().and_then(parse_px) {
+        el = el.pt(px(v));
+    }
+    if let Some(v) = styles.padding_right.as_deref().and_then(parse_px) {
+        el = el.pr(px(v));
+    }
+    if let Some(v) = styles.padding_bottom.as_deref().and_then(parse_px) {
+        el = el.pb(px(v));
+    }
+    if let Some(v) = styles.padding_left.as_deref().and_then(parse_px) {
+        el = el.pl(px(v));
+    }
+
     // Margin
     if let Some(ref m) = styles.m {
         if let Some(px_val) = parse_px(m) {
             el = el.m(px(px_val));
         }
+    }
+    // Per-side margins, after `m` so a side named on its own wins.
+    if let Some(v) = styles.margin_top.as_deref().and_then(parse_px) {
+        el = el.mt(px(v));
+    }
+    if let Some(v) = styles.margin_right.as_deref().and_then(parse_px) {
+        el = el.mr(px(v));
+    }
+    if let Some(v) = styles.margin_bottom.as_deref().and_then(parse_px) {
+        el = el.mb(px(v));
+    }
+    if let Some(v) = styles.margin_left.as_deref().and_then(parse_px) {
+        el = el.ml(px(v));
     }
 
     // Gap
@@ -380,6 +2010,20 @@ pub fn apply_styles_to_div(
         if let Some(px_val) = parse_px(r) {
             el = el.rounded(px(px_val));
         }
+    }
+    // A corner of its own, over `rounded`: a tab joined to its panel is
+    // rounded at the top only.
+    if let Some(v) = styles.rounded_tl.as_deref().and_then(parse_px) {
+        el = el.rounded_tl(px(v));
+    }
+    if let Some(v) = styles.rounded_tr.as_deref().and_then(parse_px) {
+        el = el.rounded_tr(px(v));
+    }
+    if let Some(v) = styles.rounded_br.as_deref().and_then(parse_px) {
+        el = el.rounded_br(px(v));
+    }
+    if let Some(v) = styles.rounded_bl.as_deref().and_then(parse_px) {
+        el = el.rounded_bl(px(v));
     }
 
     // Align items
@@ -404,11 +2048,10 @@ pub fn apply_styles_to_div(
         }
     }
 
-    // Cursor
-    if let Some(ref cursor) = styles.cursor {
-        if cursor == "pointer" {
-            el = el.cursor_pointer();
-        }
+    // Cursor: the eight CSS names. An unknown one is the render plan's to
+    // report (`render_sync::is_known_cursor`), so it changes nothing here.
+    if let Some(style) = styles.cursor.as_deref().and_then(cursor_style_of) {
+        el = el.cursor(style);
     }
 
     // THE STYLES BELOW WERE PARSED INTO THE PLAN AND NEVER DRAWN until
@@ -456,9 +2099,34 @@ pub fn apply_styles_to_div(
         }
     }
 
+    // `flex-shrink: N`, a non-negative shrink factor: how fast the item gives
+    // way on an overfull line, weighted by its flex basis (CSS Flexbox §9.7,
+    // https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths). Until
+    // 2026-11-08 only `0` was applied, so a factor such as the `100` that
+    // makes one item give way long before its neighbour was parsed and
+    // dropped. A negative or unparsable value is ignored, as in CSS.
     if let Some(ref shrink) = styles.flex_shrink {
-        if shrink.trim() == "0" {
-            el = el.flex_shrink_0();
+        if let Ok(s) = shrink.trim().parse::<f32>() {
+            if s >= 0.0 && s.is_finite() {
+                el = el.flex_shrink(s);
+            }
+        }
+    }
+
+    // `flex-grow: N`, a non-negative grow factor: the element takes its
+    // share of the free space on its parent's main axis.
+    if let Some(ref grow) = styles.flex_grow {
+        if let Ok(g) = grow.trim().parse::<f32>() {
+            if g >= 0.0 {
+                el = el.flex_grow(g);
+            }
+        }
+    }
+
+    // `flex-basis: Npx`: the item's starting size on its line's main axis.
+    if let Some(v) = styles.flex_basis.as_deref().and_then(parse_px) {
+        if v >= 0.0 {
+            el = el.flex_basis(px(v));
         }
     }
 
@@ -470,7 +2138,549 @@ pub fn apply_styles_to_div(
         }
     }
 
+    // min-height, max-width and max-height, as pixel values like min-width.
+    // Parsed and dumped since the start but not applied until 2026-10-18, so
+    // the plan reported a floor or cap the window never drew.
+    if let Some(px_val) = styles.min_h.as_deref().and_then(parse_px) {
+        el = el.min_h(px(px_val));
+    }
+    if let Some(px_val) = styles.max_w.as_deref().and_then(parse_px) {
+        el = el.max_w(px(px_val));
+    }
+    if let Some(px_val) = styles.max_h.as_deref().and_then(parse_px) {
+        el = el.max_h(px(px_val));
+    }
+
+    // BORDERS AND WEIGHT (2026-09-29). Both were parsed into the plan and
+    // never drawn — the plan said a pane was outlined and a tab was bold, the
+    // window showed neither. A width applies to every side unless a per-side
+    // width names that side; a width without a colour draws in GPUI's
+    // default border colour.
+    let widths = border_side_widths(styles);
+    if widths.iter().any(|w| w.is_some()) {
+        let st = el.style();
+        if let Some(v) = widths[0] {
+            st.border_widths.top = Some(AbsoluteLength::Pixels(px(v)));
+        }
+        if let Some(v) = widths[1] {
+            st.border_widths.right = Some(AbsoluteLength::Pixels(px(v)));
+        }
+        if let Some(v) = widths[2] {
+            st.border_widths.bottom = Some(AbsoluteLength::Pixels(px(v)));
+        }
+        if let Some(v) = widths[3] {
+            st.border_widths.left = Some(AbsoluteLength::Pixels(px(v)));
+        }
+    }
+    // A FRACTIONAL BORDER IS STROKED BY THE SHIM (`border_stroke`): GPUI
+    // keeps the width for layout but paints a quad's border snapped to whole
+    // device pixels, rounding half toward zero (`Window::paint_quad` ->
+    // `snap_border_widths` -> `round_stroke_to_device_pixel`, gpui-pre
+    // 0.3.5 window.rs and util.rs), so a 1.5px ring was drawn 1px wide. The
+    // element keeps its border widths (its box is laid out as before) but no
+    // border colour, so GPUI paints no border, and `with_border_stroke`
+    // paints it as an antialiased path of the exact width instead.
+    let stroke = border_stroke(styles);
+    if let Some(color) = styles.border_color.as_deref().and_then(parse_color) {
+        if stroke.is_none() {
+            el = el.border_color(color);
+        }
+    }
+    // `border-style: dashed` (a notice outlined rather than filled); any
+    // other value keeps GPUI's solid border, as a browser does for the
+    // styles it is not asked to vary here.
+    if styles.border_style.as_deref().map(str::trim) == Some("dashed") {
+        el = el.border_dashed();
+    }
+    if let Some(stroke) = stroke {
+        el = with_border_stroke(el, stroke);
+    }
+    // `font-family`: the face this element's text is set in.
+    if let Some(ref family) = styles.font_family {
+        let family = family.trim().trim_matches(|c| c == '"' || c == '\'');
+        if !family.is_empty() {
+            el = el.font_family(gpui::SharedString::from(family.to_string()));
+        }
+    }
+    // `font-size`, a pixel value: the text size of this element's text.
+    if let Some(ref size) = styles.text_size {
+        if let Some(px_val) = parse_px(size) {
+            el = el.text_size(px(px_val));
+        }
+    }
+    // `line-height`: a pixel value is the line box's height; a bare number
+    // is, as in CSS, a multiple of the font size.
+    if let Some(lh) = styles.line_height.as_deref().and_then(parse_line_height) {
+        el = el.line_height(lh);
+    }
+    if let Some(ref weight) = styles.font_weight {
+        el = el.font_weight(parse_font_weight(weight));
+    }
+    // `font-style`: `italic` / `oblique` select the family's italic face and
+    // `normal` its upright one (`parse_font_style`). GPUI matches a face; it
+    // does not synthesise one, so a family with no italic face (Space
+    // Grotesk) is drawn upright -- see docs/shim-design.md, "Font Style".
+    if let Some(style) = styles.font_style.as_deref().and_then(parse_font_style) {
+        el.text_style().font_style = Some(style);
+    }
+    // `font-variant-numeric`: the figures the element's digits take, as the
+    // OpenType features the text system shapes with (`tabular-nums` is
+    // `tnum`, every digit one advance wide; `parse_font_variant_numeric`).
+    // GPUI hands them to its shaper per loaded font (on Linux, cosmic-text's
+    // `font_features`), so a face without the feature draws as before.
+    if let Some(features) = styles
+        .font_variant_numeric
+        .as_deref()
+        .and_then(parse_font_variant_numeric)
+    {
+        el = el.font_features(features);
+    }
+    // `text-align`: where the element's text lines sit in its box -- a
+    // wrapped notice centred line by line, a column's figures at its right
+    // (`parse_text_align`). GPUI aligns each laid-out line in the element's
+    // width, as CSS does.
+    if let Some(align) = styles.text_align.as_deref().and_then(parse_text_align) {
+        el.text_style().text_align = Some(align);
+    }
+    // `text-decoration: underline`: a menu's access key, a link.
+    if styles
+        .text_decoration
+        .as_deref()
+        .is_some_and(|d| d.split_whitespace().any(|w| w == "underline"))
+    {
+        el = el.underline();
+    }
+
+    // `position: absolute` with its insets: an element drawn over its
+    // siblings at a fixed place — a drop zone's translucent quad, a drag's
+    // ghost label — without taking a share of the flex layout.
+    if styles.position.as_deref().map(str::trim) == Some("absolute") {
+        el = el.absolute();
+        if let Some(v) = styles.top.as_deref().and_then(parse_px) {
+            el = el.top(px(v));
+        }
+        if let Some(v) = styles.left.as_deref().and_then(parse_px) {
+            el = el.left(px(v));
+        }
+        if let Some(v) = styles.right.as_deref().and_then(parse_px) {
+            el = el.right(px(v));
+        }
+        if let Some(v) = styles.bottom.as_deref().and_then(parse_px) {
+            el = el.bottom(px(v));
+        }
+    }
+
     el
+}
+
+/// A CSS `font-weight` as GPUI's: the keywords and the hundreds.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_font_weight(s: &str) -> FontWeight {
+    match s.trim() {
+        "bold" | "bolder" => FontWeight::BOLD,
+        "normal" => FontWeight::NORMAL,
+        "lighter" => FontWeight::LIGHT,
+        other => other
+            .parse::<f32>()
+            .map(FontWeight)
+            .unwrap_or(FontWeight::NORMAL),
+    }
+}
+
+/// A CSS `font-style` as GPUI's (https://www.w3.org/TR/css-fonts-4/#font-style-prop):
+/// `normal`, `italic`, and `oblique` with or without an angle (GPUI has no
+/// angle; an oblique request matches an italic or oblique face). `None` for
+/// anything else, which keeps the inherited style, as a browser ignores an
+/// invalid declaration.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_font_style(s: &str) -> Option<gpui::FontStyle> {
+    let s = s.trim();
+    match s.split_whitespace().next()? {
+        "normal" if s == "normal" => Some(gpui::FontStyle::Normal),
+        "italic" if s == "italic" => Some(gpui::FontStyle::Italic),
+        "oblique" => Some(gpui::FontStyle::Oblique),
+        _ => None,
+    }
+}
+
+/// A CSS `font-variant-numeric` as the OpenType features it stands for
+/// (https://www.w3.org/TR/css-fonts-4/#font-variant-numeric-prop, whose
+/// table names the feature of each keyword): `lining-nums` `lnum`,
+/// `oldstyle-nums` `onum`, `proportional-nums` `pnum`, `tabular-nums`
+/// `tnum`, `diagonal-fractions` `frac`, `stacked-fractions` `afrc`,
+/// `ordinal` `ordn`, `slashed-zero` `zero`, each switched on. `normal`
+/// switches none of them on, which drops features an ancestor asked for.
+/// `None` for an invalid value -- an unknown word, a word twice, or two
+/// words of one group (`lining-nums oldstyle-nums`) -- which keeps the
+/// inherited features, as a browser ignores an invalid declaration.
+///
+/// GPUI's `FontFeatures` replace the inherited set rather than adding to
+/// it; no other property of this shim sets features, so the two agree.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_font_variant_numeric(s: &str) -> Option<gpui::FontFeatures> {
+    let s = s.trim();
+    if s == "normal" {
+        return Some(gpui::FontFeatures(std::sync::Arc::new(Vec::new())));
+    }
+    // (keyword, its group, its feature); one keyword per group at most.
+    const KEYWORDS: [(&str, u8, &str); 8] = [
+        ("lining-nums", 0, "lnum"),
+        ("oldstyle-nums", 0, "onum"),
+        ("proportional-nums", 1, "pnum"),
+        ("tabular-nums", 1, "tnum"),
+        ("diagonal-fractions", 2, "frac"),
+        ("stacked-fractions", 2, "afrc"),
+        ("ordinal", 3, "ordn"),
+        ("slashed-zero", 4, "zero"),
+    ];
+    let mut seen = [false; 5];
+    let mut features = Vec::new();
+    for word in s.split_whitespace() {
+        let &(_, group, tag) = KEYWORDS.iter().find(|(k, _, _)| *k == word)?;
+        if std::mem::replace(&mut seen[group as usize], true) {
+            return None;
+        }
+        features.push((tag.to_string(), 1));
+    }
+    if features.is_empty() {
+        return None;
+    }
+    Some(gpui::FontFeatures(std::sync::Arc::new(features)))
+}
+
+/// The file a CSS `mask-image` names (https://www.w3.org/TR/css-masking-1/#the-mask-image):
+/// `url("path")`, `url('path')` or `url(path)`. `None` for anything else --
+/// `none`, a gradient, several layers -- which leaves the background
+/// unmasked, as a browser does with a declaration it cannot use.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_mask_url(s: &str) -> Option<&str> {
+    let inner = s.trim().strip_prefix("url(")?.strip_suffix(')')?.trim();
+    let path = match inner.as_bytes().first() {
+        Some(b'"') => inner.strip_prefix('"')?.strip_suffix('"')?,
+        Some(b'\'') => inner.strip_prefix('\'')?.strip_suffix('\'')?,
+        _ => inner,
+    };
+    if path.is_empty() || path.contains(['(', ')', ',']) {
+        return None;
+    }
+    Some(path)
+}
+
+/// The border width `styles` asks for on each side -- top, right, bottom,
+/// left -- in logical pixels: a per-side width (`border-bottom-width`) where
+/// one names that side, else `border-width`, else none.
+pub fn border_side_widths(styles: &crate::render_sync::GpuiStyles) -> [Option<f32>; 4] {
+    let all_sides = styles.border_width.as_deref().and_then(parse_px);
+    let side = |s: &Option<String>| s.as_deref().and_then(parse_px).or(all_sides);
+    [
+        side(&styles.border_top_width),
+        side(&styles.border_right_width),
+        side(&styles.border_bottom_width),
+        side(&styles.border_left_width),
+    ]
+}
+
+/// A border the shim strokes itself (`with_border_stroke`), in place of
+/// GPUI's quad border.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BorderStroke {
+    /// The width, in logical pixels, on every side.
+    pub width: f32,
+    /// The radius of every corner of the border box.
+    pub radius: f32,
+    pub color: Hsla,
+}
+
+/// The border `styles` asks for, when GPUI's quad would draw it at another
+/// width: a SOLID border of one FRACTIONAL width on all four sides
+/// (`1.5px`), in a colour that parses, with one radius for every corner.
+/// GPUI snaps a quad border to whole device pixels, rounding half toward
+/// zero, so such a border is drawn a fraction of a pixel narrower than
+/// asked (1.5px as 1px). A whole width, a dashed border, per-side widths
+/// that differ or a per-corner radius are left to GPUI's quad as before.
+pub fn border_stroke(styles: &crate::render_sync::GpuiStyles) -> Option<BorderStroke> {
+    if styles.border_style.as_deref().map(str::trim) == Some("dashed") {
+        return None;
+    }
+    let widths = border_side_widths(styles);
+    let width = widths[0]?;
+    if widths.iter().any(|w| *w != Some(width)) || !(width > 0.0) || !width.is_finite() {
+        return None;
+    }
+    if (width - width.round()).abs() < 1e-3 {
+        return None;
+    }
+    if [&styles.rounded_tl, &styles.rounded_tr, &styles.rounded_br, &styles.rounded_bl]
+        .iter()
+        .any(|r| r.is_some())
+    {
+        return None;
+    }
+    let color = styles.border_color.as_deref().and_then(parse_color)?;
+    let radius = styles
+        .rounded
+        .as_deref()
+        .and_then(parse_px)
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .unwrap_or(0.0);
+    Some(BorderStroke { width, radius, color })
+}
+
+/// The centre line a border of `width` is stroked along, for a border box
+/// of `w` x `h` whose corners have `radius`: the box inset by half the
+/// width, its corners `radius - width / 2` (the radius of the border's
+/// middle, which is what keeps a stroke of `width` exactly between the
+/// border box's edge and its padding edge), at most half the inset box's
+/// shorter side. Returned as `(inset, radius)`.
+pub fn border_stroke_centre(w: f32, h: f32, width: f32, radius: f32) -> (f32, f32) {
+    let inset = width / 2.0;
+    let limit = ((w.min(h)) / 2.0 - inset).max(0.0);
+    (inset, (radius - inset).clamp(0.0, limit))
+}
+
+/// The element with its border painted by an antialiased path of the exact
+/// width (see `border_stroke`). The path is drawn by an absolutely
+/// positioned child covering the BORDER box (insets of minus the width:
+/// taffy resolves a child's insets against its parent's padding box), first
+/// among the children, so the border lies over the background and under
+/// whatever the element holds, as a browser paints it.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn with_border_stroke(el: Div, stroke: BorderStroke) -> Div {
+    let w = stroke.width;
+    el.child(
+        canvas(
+            |_bounds, _window, _cx| (),
+            move |bounds, (), window, _cx| {
+                let (inset, r) = border_stroke_centre(
+                    f32::from(bounds.size.width),
+                    f32::from(bounds.size.height),
+                    stroke.width,
+                    stroke.radius,
+                );
+                let l = f32::from(bounds.left()) + inset;
+                let t = f32::from(bounds.top()) + inset;
+                let rt = f32::from(bounds.right()) - inset;
+                let b = f32::from(bounds.bottom()) - inset;
+                if rt <= l || b <= t {
+                    return;
+                }
+                let p = |x: f32, y: f32| gpui::point(px(x), px(y));
+                let radii = gpui::point(px(r), px(r));
+                let mut path = gpui::PathBuilder::stroke(px(stroke.width));
+                path.move_to(p(l + r, t));
+                path.line_to(p(rt - r, t));
+                if r > 0.0 {
+                    path.arc_to(radii, px(0.0), false, true, p(rt, t + r));
+                }
+                path.line_to(p(rt, b - r));
+                if r > 0.0 {
+                    path.arc_to(radii, px(0.0), false, true, p(rt - r, b));
+                }
+                path.line_to(p(l + r, b));
+                if r > 0.0 {
+                    path.arc_to(radii, px(0.0), false, true, p(l, b - r));
+                }
+                path.line_to(p(l, t + r));
+                if r > 0.0 {
+                    path.arc_to(radii, px(0.0), false, true, p(l + r, t));
+                }
+                path.close();
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, stroke.color);
+                }
+            },
+        )
+        .absolute()
+        .top(px(-w))
+        .left(px(-w))
+        .right(px(-w))
+        .bottom(px(-w)),
+    )
+}
+
+/// The element's background painted THROUGH a mask: an SVG file's alpha,
+/// filling the box, in `color` -- CSS `background-color` under `mask-image`
+/// (https://www.w3.org/TR/css-masking-1/#the-mask-image), which is how a
+/// web front-end draws a one-colour icon in a theme's ink.
+///
+/// The mask is rasterised HERE, at the box's device size, into a picture of
+/// `color` whose alpha is the mask's coverage (`mask_picture`), and painted
+/// as a picture (`Window::paint_image`, a polychrome sprite) one texel per
+/// device pixel. GPUI's own `svg()` is not used, because it paints a
+/// MONOCHROME sprite, and GPUI's monochrome-sprite shader is its glyph
+/// shader: it applies the text system's light-on-dark contrast enhancement
+/// and gamma-1.8 alpha correction (`gpui-pre-wgpu` `shaders.wgsl`
+/// `fs_mono_sprite`, `apply_contrast_and_gamma_correction`) to every
+/// coverage value, which a browser does not do to a mask. Measured
+/// 2026-11-08 on CodeTracer's "+" (a 1px cross, `#b0b0b0` at 0.7 on
+/// `#333333`): the browser draws its half-covered arm pixels 94 and the
+/// three-quarter-covered centre 117, linear coverage; `svg()` drew 105 and
+/// 121, which is exactly that shader's correction of 0.5 and 0.75 (0.617
+/// and 0.800). An `img` of a recoloured SVG is no better: it is rasterised
+/// at twice its size, un-premultiplied and minified with straight-alpha
+/// filtering, which darkens every antialiased edge instead. See
+/// docs/shim-design.md, "Mask Image".
+///
+/// The mask is an absolutely positioned child under the element's own
+/// children, so it masks the BACKGROUND only: the element's children and
+/// border are drawn as usual (a browser would mask them too; no consumer puts
+/// either on a masked element). It fills the box, which is
+/// `mask-size: contain; mask-position: center` when the mask's aspect is the
+/// box's. A file that cannot be read or parsed as an SVG draws nothing.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn with_mask_image(el: Div, path: &str, color: Hsla) -> Div {
+    let path = path.to_string();
+    el.child(
+        canvas(
+            |_bounds, _window, _cx| (),
+            move |bounds, (), window, _cx| {
+                let device_w = (f32::from(bounds.size.width) * window.scale_factor()).round();
+                let device_h = (f32::from(bounds.size.height) * window.scale_factor()).round();
+                if device_w < 1.0 || device_h < 1.0 {
+                    return;
+                }
+                let key = MaskKey {
+                    path: path.clone(),
+                    width: device_w as u32,
+                    height: device_h as u32,
+                    bgra: mask_ink(color),
+                };
+                if let Some(picture) = cached_mask_picture(key) {
+                    let _ = window.paint_image(
+                        bounds,
+                        bounds,
+                        gpui::Corners::default(),
+                        picture,
+                        0,
+                        false,
+                    );
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    )
+}
+
+/// What a mask picture is drawn from: the file, its size in device pixels
+/// and the ink, as straight-alpha BGRA bytes (the order `RenderImage` keeps).
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MaskKey {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    pub bgra: [u8; 4],
+}
+
+/// `color` as straight-alpha BGRA bytes.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn mask_ink(color: Hsla) -> [u8; 4] {
+    let c = color.to_rgb();
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [byte(c.b), byte(c.g), byte(c.r), byte(c.a)]
+}
+
+/// The pixels of a mask picture: the SVG `bytes` rasterised at exactly
+/// `width` x `height` device pixels (resvg's analytic coverage, the way a
+/// browser rasterises a mask at its device size), every pixel the ink `bgra`
+/// with alpha = the ink's alpha times the mask's alpha at that pixel.
+/// Straight (not premultiplied) BGRA, `width * height * 4` bytes; `None` for
+/// bytes that are not an SVG.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn mask_picture(bytes: &[u8], width: u32, height: u32, bgra: [u8; 4]) -> Option<Vec<u8>> {
+    MASK_RASTERISER.with(|svg| {
+        let parsed = svg.parse_svg(bytes).ok()?;
+        let size = gpui::size(
+            gpui::DevicePixels(width as i32),
+            gpui::DevicePixels(height as i32),
+        );
+        let raster = svg.render_parsed(&parsed, gpui::SvgSize::ExactSize(size)).ok()?;
+        let pixels = raster.as_bytes(0)?;
+        if raster.size(0) != size {
+            return None;
+        }
+        let mut out = Vec::with_capacity(pixels.len());
+        for px in pixels.chunks_exact(4) {
+            let alpha = (px[3] as u32 * bgra[3] as u32 + 127) / 255;
+            out.extend_from_slice(&[bgra[0], bgra[1], bgra[2], alpha as u8]);
+        }
+        Some(out)
+    })
+}
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+thread_local! {
+    /// The SVG rasteriser masks are drawn with: GPUI's own (resvg), with no
+    /// asset source, since a mask is read from its file.
+    static MASK_RASTERISER: gpui::SvgRenderer =
+        gpui::SvgRenderer::new(std::sync::Arc::new(()));
+    /// The mask pictures drawn so far, newest last. Each `RenderImage` has its
+    /// own id, under which the window keeps it in its atlas, so a picture is
+    /// made once per key, not once per frame; the ones evicted go to
+    /// `EVICTED_IMAGES` for the window to release.
+    static MASK_CACHE: std::cell::RefCell<Vec<(MaskKey, Option<std::sync::Arc<gpui::RenderImage>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many mask pictures are kept: every icon a window shows, in each ink
+/// and size it shows it in.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const MASK_CACHE_SIZE: usize = 64;
+
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn cached_mask_picture(key: MaskKey) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    MASK_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
+            let entry = cache.remove(i);
+            let picture = entry.1.clone();
+            cache.push(entry);
+            return picture;
+        }
+        // A file that cannot be drawn is remembered too, so it is reported
+        // once rather than on every frame.
+        let picture = match std::fs::read(&key.path) {
+            Err(err) => {
+                eprintln!("gpui-nim-shim: mask-image: cannot read {}: {err}", key.path);
+                None
+            }
+            Ok(bytes) => match mask_picture(&bytes, key.width, key.height, key.bgra)
+                .and_then(|pixels| image::RgbaImage::from_raw(key.width, key.height, pixels))
+            {
+                None => {
+                    eprintln!("gpui-nim-shim: mask-image: {} is not an SVG it can draw", key.path);
+                    None
+                }
+                Some(buffer) => Some(std::sync::Arc::new(gpui::RenderImage::new(vec![
+                    image::Frame::new(buffer),
+                ]))),
+            },
+        };
+        cache.push((key, picture.clone()));
+        while cache.len() > MASK_CACHE_SIZE {
+            if let (_, Some(old)) = cache.remove(0) {
+                EVICTED_IMAGES.with(|e| e.borrow_mut().push(old));
+            }
+        }
+        picture
+    })
+}
+
+/// A CSS `text-align` as GPUI's (https://www.w3.org/TR/css-text-3/#text-align-property):
+/// `left` / `start`, `center`, `right` / `end` (left-to-right text). `None`
+/// for anything else (`justify` among them, which GPUI cannot draw), which
+/// keeps the inherited alignment.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_text_align(s: &str) -> Option<gpui::TextAlign> {
+    match s.trim() {
+        "left" | "start" => Some(gpui::TextAlign::Left),
+        "center" => Some(gpui::TextAlign::Center),
+        "right" | "end" => Some(gpui::TextAlign::Right),
+        _ => None,
+    }
 }
 
 /// Parse a pixel value from a CSS-like string.
@@ -481,12 +2691,99 @@ pub fn parse_px(s: &str) -> Option<f32> {
     num_str.parse::<f32>().ok()
 }
 
+/// Parse a CSS `line-height`: `22px` is absolute, a bare `1.4` is relative
+/// to the font size. `normal` and anything unparsable leave GPUI's default.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn parse_line_height(s: &str) -> Option<gpui::DefiniteLength> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix("px") {
+        let v = n.trim().parse::<f32>().ok().filter(|v| *v > 0.0)?;
+        return Some(px(v).into());
+    }
+    let v = s.parse::<f32>().ok().filter(|v| *v > 0.0)?;
+    Some(gpui::relative(v))
+}
+
+/// A CSS `letter-spacing` (https://www.w3.org/TR/css-text-3/#letter-spacing-property):
+/// a length added after every character, in pixels or in ems of the
+/// element's font size. `normal` is no extra space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LetterSpacing {
+    /// `Npx`.
+    Px(f32),
+    /// `Nem`, resolved against the font size the text is set in.
+    Em(f32),
+}
+
+impl LetterSpacing {
+    /// The spacing in pixels for text set at `font_size_px`.
+    pub fn to_px(self, font_size_px: f32) -> f32 {
+        match self {
+            LetterSpacing::Px(v) => v,
+            LetterSpacing::Em(v) => v * font_size_px,
+        }
+    }
+}
+
+/// Parse a CSS `letter-spacing`: `2px`, `0.03125em`, a bare `0`, or
+/// `normal` (zero). A negative length tightens the text, as in CSS.
+/// Anything else is `None`, which leaves the text as it is (a browser
+/// ignores an invalid declaration).
+pub fn parse_letter_spacing(s: &str) -> Option<LetterSpacing> {
+    let s = s.trim();
+    if s == "normal" {
+        return Some(LetterSpacing::Px(0.0));
+    }
+    let finite = |n: &str| n.trim().parse::<f32>().ok().filter(|v| v.is_finite());
+    if let Some(n) = s.strip_suffix("px") {
+        return finite(n).map(LetterSpacing::Px);
+    }
+    if let Some(n) = s.strip_suffix("em").filter(|n| !n.ends_with('r')) {
+        return finite(n).map(LetterSpacing::Em);
+    }
+    finite(s).filter(|v| *v == 0.0).map(LetterSpacing::Px)
+}
+
+/// Where each glyph of a line set with `spacing_px` after every character
+/// lands, and the line's width: a glyph moves right by the spacing of every
+/// character before it in the text (`ShapedGlyph::index` is its byte
+/// offset), and the line is wider by the spacing of every character,
+/// the last one included, as a browser sets `letter-spacing`
+/// (https://www.w3.org/TR/css-text-3/#letter-spacing-property: the space
+/// goes after each typographic character unit). Characters here are Unicode
+/// scalar values: the labels the shim spaces are Latin capitals, where the
+/// two agree. Returned in glyph order, run by run.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub fn letter_spaced_xs(
+    layout: &gpui::LineLayout,
+    text: &str,
+    spacing_px: f32,
+) -> (Vec<f32>, f32) {
+    let mut xs = Vec::new();
+    for run in &layout.runs {
+        for glyph in &run.glyphs {
+            let before = text
+                .get(..glyph.index.min(text.len()))
+                .map_or(0, |t| t.chars().count());
+            xs.push(f32::from(glyph.position.x) + before as f32 * spacing_px);
+        }
+    }
+    let width = f32::from(layout.width) + text.chars().count() as f32 * spacing_px;
+    (xs, width)
+}
+
 /// Parse a color from a CSS-like string.
 /// Returns an Hsla color for use with GPUI's `.bg()` and `.text_color()`.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn parse_color(s: &str) -> Option<Hsla> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix('#') {
+        // `#rrggbbaa`: a translucent fill (a drop zone's quad).
+        if hex.len() == 8 {
+            let v = u32::from_str_radix(hex, 16).ok()?;
+            let rgba_color: Rgba = rgba(v);
+            return Some(rgba_color.into());
+        }
         if hex.len() == 6 {
             let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
             let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
@@ -538,8 +2835,11 @@ pub fn parse_color(s: &str) -> Option<Hsla> {
 ///
 /// The event loop is stopped through `window::QUIT_REQUESTED` /
 /// `window::AUTO_QUIT_MS`, which a task spawned inside the loop polls and
-/// turns into `cx.quit()`. See the "Shutdown" section of `window.rs` for
-/// why the shim needs its own flags rather than a handle to GPUI's `App`.
+/// turns into `stop_platform_loop` — `cx.quit()` off macOS, and
+/// `mac_event_loop::stop_event_loop()` on it, because `App::quit()` there
+/// is `-[NSApplication terminate:]` and this function would never return.
+/// See the "Shutdown" section of `window.rs` for why the shim needs its
+/// own flags rather than a handle to GPUI's `App`.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     // Record the active window so components can reference it.
@@ -550,7 +2850,24 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
         window::show_window(window_id);
     }
 
-    let _title_static: &'static str = Box::leak(title.to_string().into_boxed_str());
+    let title_owned = title.to_string();
+    let options = window::take_launch_options();
+    let requested = window::decorations_override(
+        std::env::var("ISONIM_GPUI_DECORATIONS").ok().as_deref(),
+    )
+    .unwrap_or_else(|value| {
+        eprintln!(
+            "gpui-nim-shim: ignoring ISONIM_GPUI_DECORATIONS={value:?} \
+             (expected \"client\" or \"server\")"
+        );
+        None
+    });
+    window::set_requested_decorations(requested);
+    let decorations = match requested {
+        Some(window::DECORATIONS_CLIENT) => Some(WindowDecorations::Client),
+        Some(_) => Some(WindowDecorations::Server),
+        None => None,
+    };
     let w = width as f32;
     let h = height as f32;
 
@@ -562,11 +2879,60 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     let auto_quit_ms = window::auto_quit_ms();
     window::clear_quit_request();
 
+    // macOS: `-[NSApplication run]` sends `applicationDidFinishLaunching:`
+    // once per PROCESS, and that notification is the only thing that calls
+    // the launch closure `MacPlatform::run` parks in `state.finish_launching`.
+    // The second `gpui_launch` in a process would therefore open no window
+    // and spawn no shutdown poller — a hang, not a missed frame. Queued
+    // before the loop is entered so it runs inside it, after the delegate
+    // is installed. See `mac_event_loop.rs`.
+    #[cfg(target_os = "macos")]
+    if crate::mac_event_loop::begin_launch() {
+        crate::mac_event_loop::kick_relaunch();
+    }
+
     // RS-M14 Phase 2: pinned `gpui` requires an explicit platform implementation
     // (the old crates.io `Application::new()` constructor is gone). Use
     // `current_platform(false)` to get the windowed (non-headless) platform impl
     // appropriate for the current OS.
-    Application::with_platform(current_platform(false)).run(move |cx: &mut App| {
+    // Bind the platform so the font-smoothing policy can be applied through
+    // the SAME text system this app will render with, before any glyph is
+    // rasterised. `current_platform` is called once, not twice: the policy's
+    // memo is process-global, but creating a second platform here would also
+    // create a second AppKit app object. See
+    // `window::apply_chromium_font_smoothing_policy`.
+    let platform = current_platform(false);
+    #[cfg(target_os = "macos")]
+    let _font_smoothing =
+        crate::window::apply_and_report_font_smoothing_policy(platform.text_system().as_ref());
+
+    // macOS: let the window keep the size it is about to be asked for.
+    // `GPUIWindow` inherits `NSWindow`'s `constrainFrameRect:toScreen:`,
+    // which fits a window to the screen's visible frame — so a viewport
+    // larger than this display came back silently shrunk, where Chromium
+    // (and therefore the Electron front-end) returns the proposed frame
+    // unchanged and gets the size it asked for. See
+    // `mac_window_frame.rs` for the measurement and the scope.
+    //
+    // BEFORE `run`, and that is load-bearing: the first constraining
+    // happens inside gpui's `MacWindow::open`, when it orders the new
+    // window on screen, so an override installed once a window exists is
+    // already too late for that window's frame.
+    #[cfg(target_os = "macos")]
+    let window_frame_override = crate::mac_window_frame::install_unconstrained_window_frame();
+    #[cfg(target_os = "macos")]
+    if !window_frame_override.is_installed() {
+        // Not fatal — a clamped window still runs — but it is the one
+        // state in which a `wide` capture silently measures a different
+        // window than the one the scenario named, so it is never left to
+        // be inferred from the pixels.
+        eprintln!(
+            "gpui-nim-shim: window frame override NOT installed ({window_frame_override:?}); \
+             a window larger than the display will be clamped to its visible frame"
+        );
+    }
+
+    Application::with_platform(platform).run(move |cx: &mut App| {
         // The shim owns the quit policy; see `spawn_shutdown_poller`.
         // `QuitMode::Default` is `LastWindowClosed` off macOS, which
         // quits INSIDE the update that removes the last window and so
@@ -574,24 +2940,121 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
         // the same user-visible rule (last window gone => app quits) with
         // a drain in between.
         cx.set_quit_mode(QuitMode::Explicit);
+        // Text antialiasing as Chromium picks it on this desktop
+        // (`window::text_antialiasing`).
+        match crate::window::text_antialiasing(
+            std::env::var("ISONIM_GPUI_TEXT_RENDERING").ok().as_deref(),
+            crate::window::fontconfig_rgba().as_deref(),
+        ) {
+            Some(crate::window::TextAntialiasing::Grayscale) => {
+                cx.set_text_rendering_mode(gpui::TextRenderingMode::Grayscale)
+            }
+            Some(crate::window::TextAntialiasing::Subpixel) => {
+                cx.set_text_rendering_mode(gpui::TextRenderingMode::Subpixel)
+            }
+            None => {}
+        }
+        register_fonts(cx);
 
+        // GWIN: the title, identity, minimum size and initial state the
+        // application asked for. A maximized window keeps the launch size as
+        // its restore size.
+        // GWIN: the centred origin is SNAPPED TO WHOLE POINTS, because a
+        // fractional one costs the window the size it asked for.
+        //
+        // `Bounds::centered` halves the leftover display extent, so whenever
+        // the display extent and the launch size differ by an ODD number of
+        // points the origin lands on a half point. Measured on this host
+        // (aarch64-darwin, macOS 26.5.2, 1728x1117-point display, 1440x900
+        // launch): x is (1728-1440)/2 = 144 exactly, but y is (1117-900)/2 =
+        // **108.5**. A window opened at a fractional origin does not get the
+        // content area it asked for — AppKit snaps the origin down to a whole
+        // point and GROWS the content view by one point to cover the
+        // remainder. Driven directly against AppKit with gpui's own style
+        // mask (titled|closable|resizable|miniaturizable), a 900-point
+        // content request produced a 901-point content view at y =
+        // 108.25/108.5/108.75 and exactly 900 at y = 108 or 109. The width
+        // was never wrong here for the one reason that its centred origin
+        // happened to be integral.
+        //
+        // One surplus point is not cosmetic: the top bar is top-anchored and
+        // the status bar bottom-anchored, so the surplus lands in the pane
+        // area between them and every row below the top bar is drawn one
+        // point lower than the layout says.
+        //
+        // This is NOT macOS-specific and is deliberately not behind a
+        // `cfg(target_os)`. A window origin is a whole number of pixels on
+        // X11 and Wayland as well, so a fractional origin is an artefact of
+        // the centring arithmetic on every platform rather than a position
+        // any of them can honour; rounding it is correct everywhere and
+        // changes nothing on a display whose arithmetic already came out
+        // even.
+        let mut bounds = Bounds::centered(None, size(px(w), px(h)), cx);
+        bounds.origin.x = bounds.origin.x.round();
+        bounds.origin.y = bounds.origin.y.round();
+        let maximized = options.maximized;
         cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(
-                    Bounds::centered(None, size(px(w), px(h)), cx),
-                )),
+                window_bounds: Some(if options.maximized {
+                    WindowBounds::Maximized(bounds)
+                } else {
+                    WindowBounds::Windowed(bounds)
+                }),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title_owned.into()),
+                    ..Default::default()
+                }),
+                app_id: options.app_id,
+                window_min_size: options
+                    .min_size
+                    .map(|(mw, mh)| size(px(mw as f32), px(mh as f32))),
+                window_decorations: decorations,
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| NimRootView::new()),
+            move |window, cx| {
+                // GWIN: a window GPUI expects to decorate itself (on Wayland
+                // that is its state until the compositor answers) is created
+                // larger by the frame's band, so that its content is the
+                // launch size from the first commit on. See
+                // `NimRootView::launch_inflated`. A maximized launch keeps the
+                // size it was given: the compositor sizes it.
+                let inflated = if !maximized
+                    && matches!(window.window_decorations(), Decorations::Client { .. })
+                {
+                    let band = crate::frame::FRAME_INSET;
+                    window.set_client_inset(px(band));
+                    window.resize(size(px(w + 2.0 * band), px(h + 2.0 * band)));
+                    Some((w, h))
+                } else {
+                    None
+                };
+                cx.new(|_| {
+                    let mut view = NimRootView::new();
+                    view.launch_inflated = inflated;
+                    view
+                })
+            },
         )
         .expect("Failed to open GPUI window");
 
         spawn_shutdown_poller(cx, auto_quit_ms);
+        spawn_ticker(cx);
     });
+
+    // macOS: `MacPlatform::run` nulls the platform pointer in the delegate
+    // it created but leaves that delegate registered as a notification
+    // observer, and it creates a new one per launch. Unregister it here so
+    // a later keyboard-layout or thermal notification cannot reach a
+    // delegate whose ivar is null. See `mac_event_loop.rs`.
+    #[cfg(target_os = "macos")]
+    crate::mac_event_loop::release_delegate_observers();
 
     // The event loop has returned -- the user closed the window, or a
     // quit was requested via `gpui_quit` / the auto-quit deadline.
-    if window_id != 0 {
+    // A window already closed through `close_window` (its close button, a
+    // compositor close, `gpui_window_request_close`) has had its close
+    // callback; it is not asked again.
+    if window_id != 0 && window::window_state(window_id) != Some(window::WindowState::Closed) {
         window::close_window(window_id);
     }
 
@@ -599,12 +3062,13 @@ pub fn launch_gpui_app(title: &str, width: f64, height: f64, window_id: u32) {
     // the next one.
     window::set_auto_quit_ms(0);
     window::clear_quit_request();
+    window::set_tick(0, None);
 
     ACTIVE_WINDOW_ID.store(0, std::sync::atomic::Ordering::Release);
 }
 
 /// How long the loop keeps running after the last window has been
-/// removed, before `cx.quit()` stops it.
+/// removed, before `stop_platform_loop` stops it.
 ///
 /// This is not politeness, it is the difference between a window that is
 /// gone and a window that merely thinks it is. `Drop for WaylandWindow`
@@ -656,6 +3120,46 @@ const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_millis(150
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// End the platform event loop so `Application::run` — and with it
+/// `launch_gpui_app`, and with IT the `gpui_launch` FFI call — returns.
+///
+/// **This is not `App::quit()` everywhere, and that is the whole point.**
+/// `App::quit()` is `self.platform.quit()`, and the two platforms disagree
+/// about what that means: Linux stops the calloop `LoopSignal` and `run`
+/// returns, macOS calls `-[NSApplication terminate:]` and the process ends
+/// without unwinding. Every line after `Application::run(...)` below, and
+/// every line after `gpui_launch` in every consumer, is dead code under
+/// the second reading. See `mac_event_loop.rs` for the measurement, the
+/// three candidate routes and why this one was taken.
+///
+/// Must run inside an app update on the main thread; both callers are the
+/// shutdown poller, which runs on the foreground executor for exactly that
+/// reason.
+#[cfg(all(
+    any(feature = "gpui-backend", feature = "gpui-headless"),
+    not(target_os = "macos")
+))]
+fn stop_platform_loop(cx: &mut App) {
+    cx.quit();
+}
+
+#[cfg(all(
+    any(feature = "gpui-backend", feature = "gpui-headless"),
+    target_os = "macos"
+))]
+fn stop_platform_loop(_cx: &mut App) {
+    // A refusal here means `stop:` was armed and no event will wake the
+    // loop to read it, i.e. the process would hang rather than return.
+    // That is worth a line on stderr: the alternative is a silent hang
+    // whose only symptom is a lane timing out at its cap.
+    if !crate::mac_event_loop::stop_event_loop() {
+        eprintln!(
+            "gpui-nim-shim: could not stop the AppKit event loop \
+             (not on the main thread, or NSEvent refused the wake event)"
+        );
+    }
+}
+
 /// Spawn the task that owns this app's shutdown.
 ///
 /// It runs on the foreground executor (the same place `NimRootView`'s
@@ -692,7 +3196,7 @@ fn spawn_shutdown_poller(cx: &mut App, auto_quit_ms: u32) {
 
             if let Some(since) = draining_since {
                 if since.elapsed() >= SHUTDOWN_DRAIN {
-                    cx.update(|cx: &mut App| cx.quit());
+                    cx.update(stop_platform_loop);
                     break;
                 }
                 continue;
@@ -716,13 +3220,70 @@ fn spawn_shutdown_poller(cx: &mut App, auto_quit_ms: u32) {
     .detach();
 }
 
+/// How often the ticker looks for an armed tick while none is armed — the
+/// same slice as a re-arm's, so arming from idle is as prompt as re-arming.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const TICK_IDLE_POLL: std::time::Duration = TICK_REARM_POLL;
+
+/// The longest the ticker sleeps before looking whether the host re-armed
+/// its tick: the latency a re-arm can add to a short deadline.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+const TICK_REARM_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Run the host's tick (`gpui_set_tick`) inside the loop: wait its interval,
+/// call it on the main thread (`cx.update`, where GPUI requires app state to
+/// be touched), request a repaint. The wait is taken in slices of at most
+/// `TICK_REARM_POLL`, and a re-arm or disarm (`window::tick_generation`)
+/// restarts it — so a host that armed a long refresh can arm a short
+/// deadline and have it honoured, rather than waiting out the long one. The
+/// task ends with the loop.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn spawn_ticker(cx: &mut App) {
+    cx.spawn(async move |cx: &mut AsyncApp| loop {
+        let generation = window::tick_generation();
+        let Some((interval_ms, _)) = window::tick() else {
+            cx.background_executor().timer(TICK_IDLE_POLL).await;
+            continue;
+        };
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(interval_ms as u64);
+        let mut rearmed = false;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            cx.background_executor()
+                .timer((deadline - now).min(TICK_REARM_POLL))
+                .await;
+            if window::tick_generation() != generation {
+                rearmed = true;
+                break;
+            }
+        }
+        if rearmed {
+            continue;
+        }
+        if let Some((_, callback)) = window::tick() {
+            cx.update(|_cx: &mut App| callback());
+            window::request_repaint();
+        }
+    })
+    .detach();
+}
+
 #[cfg(test)]
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 mod tests {
     // Do NOT use `use super::*` here because it would bring gpui traits
     // (re-exported via use statements) that include a `test` proc macro
     // which shadows `#[test]` and causes infinite macro recursion.
-    use super::{active_window_id, launch_gpui_app};
+    use super::{
+        active_window_id, apply_styles_to_div, file_image, launch_gpui_app, mask_picture,
+        parse_font_style, parse_font_variant_numeric, parse_line_height, parse_mask_url,
+        parse_text_align, run_highlight,
+    };
+    use gpui::Styled as _;
 
     #[test]
     fn test_launch_gpui_app_exists() {
@@ -733,5 +3294,313 @@ mod tests {
     #[test]
     fn test_active_window_id_default() {
         assert_eq!(active_window_id(), 0);
+    }
+
+    #[test]
+    fn test_line_height_is_absolute_in_px_and_relative_bare() {
+        assert_eq!(
+            parse_line_height("22px"),
+            Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(
+                gpui::px(22.0)
+            )))
+        );
+        assert_eq!(
+            parse_line_height(" 1.5 "),
+            Some(gpui::DefiniteLength::Fraction(1.5))
+        );
+        assert_eq!(parse_line_height("normal"), None);
+        assert_eq!(parse_line_height("0px"), None);
+    }
+
+    #[test]
+    fn test_font_style_keywords_and_an_oblique_angle() {
+        assert_eq!(parse_font_style("italic"), Some(gpui::FontStyle::Italic));
+        assert_eq!(parse_font_style(" normal "), Some(gpui::FontStyle::Normal));
+        assert_eq!(parse_font_style("oblique"), Some(gpui::FontStyle::Oblique));
+        assert_eq!(parse_font_style("oblique 10deg"), Some(gpui::FontStyle::Oblique));
+        // Invalid declarations are ignored (the inherited style stays).
+        assert_eq!(parse_font_style("italics"), None);
+        assert_eq!(parse_font_style("italic bold"), None);
+        assert_eq!(parse_font_style(""), None);
+    }
+
+    /// The element builder APPLIES `font-style`: it is in the drawn
+    /// element's text style, not only in the render plan's report.
+    #[test]
+    fn test_font_style_is_applied_to_the_drawn_element() {
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.font_style = Some("italic".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(el.text_style().font_style, Some(gpui::FontStyle::Italic));
+        styles.font_style = Some("normal".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(el.text_style().font_style, Some(gpui::FontStyle::Normal));
+        // Unset or invalid: nothing stated, the parent's style is inherited.
+        styles.font_style = Some("sideways".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(el.text_style().font_style, None);
+        let mut el = apply_styles_to_div(gpui::div(), &Default::default());
+        assert_eq!(el.text_style().font_style, None);
+    }
+
+    /// Each `font-variant-numeric` keyword names its OpenType feature, and
+    /// an invalid value is refused so the inherited features stay.
+    #[test]
+    fn test_font_variant_numeric_keywords_name_their_features() {
+        let tags = |s: &str| {
+            parse_font_variant_numeric(s).map(|f| {
+                f.tag_value_list()
+                    .iter()
+                    .map(|(t, v)| format!("{t}={v}"))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(tags("tabular-nums"), Some(vec!["tnum=1".to_string()]));
+        assert_eq!(tags(" proportional-nums "), Some(vec!["pnum=1".to_string()]));
+        assert_eq!(
+            tags("slashed-zero tabular-nums oldstyle-nums"),
+            Some(vec!["zero=1".into(), "tnum=1".into(), "onum=1".into()])
+        );
+        assert_eq!(tags("normal"), Some(vec![]), "normal switches every one off");
+        // Invalid, so the inherited features stay: two of one group, a word
+        // twice, an unknown word, `normal` with another, nothing at all.
+        assert_eq!(tags("tabular-nums proportional-nums"), None);
+        assert_eq!(tags("ordinal ordinal"), None);
+        assert_eq!(tags("tabular-numbers"), None);
+        assert_eq!(tags("normal tabular-nums"), None);
+        assert_eq!(tags(""), None);
+    }
+
+    /// `font-variant-numeric` is APPLIED to the drawn element's text style,
+    /// and an invalid value leaves it unstated.
+    #[test]
+    fn test_font_variant_numeric_is_applied_to_the_drawn_element() {
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.font_variant_numeric = Some("tabular-nums".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(
+            el.text_style().font_features.as_ref().map(|f| f.tag_value_list().to_vec()),
+            Some(vec![("tnum".to_string(), 1)])
+        );
+        styles.font_variant_numeric = Some("tabular".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert!(el.text_style().font_features.is_none(), "an invalid value draws nothing");
+    }
+
+    /// `letter-spacing` lengths: px, em (not rem), a bare 0, `normal`.
+    #[test]
+    fn test_parse_letter_spacing() {
+        use super::{parse_letter_spacing, LetterSpacing};
+        assert_eq!(parse_letter_spacing("2px"), Some(LetterSpacing::Px(2.0)));
+        assert_eq!(parse_letter_spacing(" 0.03125em "), Some(LetterSpacing::Em(0.03125)));
+        assert_eq!(parse_letter_spacing("-0.5px"), Some(LetterSpacing::Px(-0.5)));
+        assert_eq!(parse_letter_spacing("normal"), Some(LetterSpacing::Px(0.0)));
+        assert_eq!(parse_letter_spacing("0"), Some(LetterSpacing::Px(0.0)));
+        for bad in ["1rem", "2", "wide", "", "NaNpx", "1e40px"] {
+            assert_eq!(parse_letter_spacing(bad), None, "{bad:?}");
+        }
+        assert_eq!(LetterSpacing::Em(0.03125).to_px(12.0), 0.375);
+        assert_eq!(LetterSpacing::Px(2.0).to_px(12.0), 2.0);
+    }
+
+    /// Which borders the shim strokes itself: a solid border of one
+    /// FRACTIONAL width on every side, in a colour, with one radius. Every
+    /// other border stays GPUI's quad.
+    #[test]
+    fn test_border_stroke_takes_only_uniform_fractional_solid_borders() {
+        use super::{border_stroke, parse_color};
+        let ring = || {
+            let mut s = crate::render_sync::GpuiStyles::default();
+            s.border_width = Some("1.5px".into());
+            s.border_color = Some("#dddddd".into());
+            s.rounded = Some("4px".into());
+            s
+        };
+        let got = border_stroke(&ring()).expect("a 1.5px ring is stroked by the shim");
+        assert_eq!((got.width, got.radius), (1.5, 4.0));
+        assert_eq!(Some(got.color), parse_color("#dddddd"));
+        // Whole widths are GPUI's: it draws them at their width.
+        let mut whole = ring();
+        whole.border_width = Some("1px".into());
+        assert_eq!(border_stroke(&whole), None);
+        let mut dashed = ring();
+        dashed.border_style = Some("dashed".into());
+        assert_eq!(border_stroke(&dashed), None);
+        let mut one_side = ring();
+        one_side.border_width = None;
+        one_side.border_left_width = Some("1.5px".into());
+        assert_eq!(border_stroke(&one_side), None);
+        let mut corner = ring();
+        corner.rounded_tl = Some("2px".into());
+        assert_eq!(border_stroke(&corner), None);
+        let mut colourless = ring();
+        colourless.border_color = None;
+        assert_eq!(border_stroke(&colourless), None);
+    }
+
+    /// The stroke's centre line: half the width in from the border box, its
+    /// radius the border's middle radius, never past half the inset box.
+    #[test]
+    fn test_border_stroke_centre_line() {
+        use super::border_stroke_centre;
+        // CodeTracer's idle ring: an 8px circle, a 1.5px border.
+        assert_eq!(border_stroke_centre(8.0, 8.0, 1.5, 4.0), (0.75, 3.25));
+        // A square box: corners square.
+        assert_eq!(border_stroke_centre(40.0, 20.0, 1.5, 0.0), (0.75, 0.0));
+        // A radius larger than the box allows is held to it.
+        assert_eq!(border_stroke_centre(10.0, 6.0, 1.5, 20.0), (0.75, 2.25));
+    }
+
+    /// A FRACTIONAL BORDER IS NOT LEFT TO GPUI'S QUAD: the element keeps
+    /// its border widths, so its box is laid out as before, but no border
+    /// colour, so GPUI paints no border (it would snap 1.5px to 1px,
+    /// `Window::paint_quad`); the shim strokes it instead. A whole width is
+    /// still GPUI's, colour and all.
+    #[test]
+    fn test_a_fractional_border_keeps_its_width_and_leaves_gpui_no_colour() {
+        use gpui::Styled;
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.border_width = Some("1.5px".into());
+        styles.border_color = Some("#dddddd".into());
+        styles.rounded = Some("4px".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        let st = el.style();
+        assert_eq!(
+            st.border_widths.left,
+            Some(gpui::AbsoluteLength::Pixels(gpui::px(1.5))),
+            "the layout keeps the 1.5px border"
+        );
+        assert!(st.border_color.is_none(), "GPUI must not paint it: {:?}", st.border_color);
+        // Control: 2px is drawn by GPUI as before.
+        styles.border_width = Some("2px".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert!(el.style().border_color.is_some(), "a whole width keeps GPUI's border");
+    }
+
+    /// `text-align` is APPLIED to the drawn element's text style, and an
+    /// alignment GPUI cannot draw leaves it unstated.
+    #[test]
+    fn test_text_align_is_applied_to_the_drawn_element() {
+        assert_eq!(parse_text_align("center"), Some(gpui::TextAlign::Center));
+        assert_eq!(parse_text_align(" end "), Some(gpui::TextAlign::Right));
+        assert_eq!(parse_text_align("start"), Some(gpui::TextAlign::Left));
+        assert_eq!(parse_text_align("justify"), None);
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.text_align = Some("right".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(el.text_style().text_align, Some(gpui::TextAlign::Right));
+        styles.text_align = Some("justify".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert_eq!(el.text_style().text_align, None);
+    }
+
+    /// A picture from a file is drawn in a box with the element's own
+    /// styles: not only its size but its opacity, margins and
+    /// `flex-shrink: 0`, which the bare `img` arm used to drop.
+    #[test]
+    fn test_file_image_box_carries_the_elements_own_styles() {
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.w = Some("9.6px".into());
+        styles.h = Some("9.6px".into());
+        styles.opacity = Some("0.4".into());
+        styles.flex_shrink = Some("0".into());
+        styles.margin_right = Some("4.8px".into());
+        let mut el = file_image("/nonexistent.svg", 1, &styles);
+        let style = el.style();
+        assert_eq!(style.opacity, Some(0.4));
+        assert_eq!(style.flex_shrink, Some(0.0));
+        assert_eq!(
+            style.size.width,
+            Some(gpui::Length::Definite(gpui::px(9.6).into()))
+        );
+        assert_eq!(
+            style.margin.right,
+            Some(gpui::Length::Definite(gpui::px(4.8).into()))
+        );
+    }
+
+    /// A fused run states its span's style in its highlight, through the
+    /// same parser, so a span draws in the same style fused or not.
+    #[test]
+    fn test_fused_run_highlight_carries_the_font_style() {
+        let run = crate::render_sync::InlineTextRun {
+            len: 3,
+            color: None,
+            font_weight: None,
+            font_style: Some("italic".into()),
+            inset_left: None,
+            inset_right: None,
+        };
+        assert_eq!(run_highlight(&run).font_style, Some(gpui::FontStyle::Italic));
+        let upright = crate::render_sync::InlineTextRun { font_style: None, ..run };
+        assert_eq!(run_highlight(&upright).font_style, None);
+    }
+
+    /// A mask picture is the ink at the mask's LINEAR coverage, rasterised
+    /// at the device size it is painted at -- what a browser composites.
+    /// The "+" is CodeTracer's `session_tab_add.svg`: two 1px bars on the
+    /// half-pixel, so at 12x12 each arm covers half of two pixel columns
+    /// (alpha 128 of 255) and the four centre pixels three quarters (191).
+    /// GPUI's `svg()` turned the same 0.5 and 0.75 into 0.617 and 0.800 with
+    /// its glyph contrast and gamma correction (see `with_mask_image`).
+    #[test]
+    fn test_mask_picture_is_the_ink_at_linear_coverage() {
+        const PLUS: &[u8] = br##"<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M6.5 5.5H12V6.5H6.5V12H5.5V6.5H0V5.5H5.5V0H6.5V5.5Z" fill="#DDDDDD"/>
+</svg>"##;
+        let ink = [0xb0, 0xb1, 0xb2, 0xff]; // B, G, R, A
+        let px = mask_picture(PLUS, 12, 12, ink).expect("an SVG");
+        assert_eq!(px.len(), 12 * 12 * 4);
+        let at = |x: usize, y: usize| &px[(y * 12 + x) * 4..(y * 12 + x) * 4 + 4];
+        // Every pixel carries the ink; only its alpha varies.
+        assert!(px.chunks_exact(4).all(|p| p[..3] == ink[..3]));
+        // Within one unit: the rasteriser rounds its coverage (resvg draws
+        // one arm's half at 127, the other's at 128). The glyph correction
+        // GPUI's `svg()` applied would read 157 and 204.
+        let near = |got: u8, want: u8| (got as i32 - want as i32).abs() <= 1;
+        assert_eq!(at(0, 0)[3], 0, "outside the cross");
+        assert!(near(at(5, 0)[3], 128), "an arm's half-covered column: {}", at(5, 0)[3]);
+        assert!(near(at(6, 11)[3], 128), "{}", at(6, 11)[3]);
+        assert!(near(at(0, 5)[3], 128), "the other arm: {}", at(0, 5)[3]);
+        assert!(near(at(5, 5)[3], 191), "the centre, three quarters: {}", at(5, 5)[3]);
+        assert!(near(at(6, 6)[3], 191), "{}", at(6, 6)[3]);
+        // At twice the size the bars cover whole device pixels.
+        let px2 = mask_picture(PLUS, 24, 24, ink).expect("an SVG");
+        assert_eq!(px2[(0 * 24 + 11) * 4 + 3], 255);
+        assert_eq!(px2[(0 * 24 + 10) * 4 + 3], 0);
+        // The ink's own alpha scales the coverage.
+        let half = mask_picture(PLUS, 12, 12, [0, 0, 0, 128]).expect("an SVG");
+        assert!(near(half[(5 * 12 + 5) * 4 + 3], 96)); // 191 * 128 / 255
+        assert_eq!(mask_picture(b"not an svg", 12, 12, ink), None);
+    }
+
+    #[test]
+    fn test_mask_url_spellings_and_refusals() {
+        assert_eq!(parse_mask_url("url(\"/a/plus.svg\")"), Some("/a/plus.svg"));
+        assert_eq!(parse_mask_url(" url('/a/plus.svg') "), Some("/a/plus.svg"));
+        assert_eq!(parse_mask_url("url(/a/plus.svg)"), Some("/a/plus.svg"));
+        // Nothing the builder could draw: the background stays unmasked.
+        assert_eq!(parse_mask_url("none"), None);
+        assert_eq!(parse_mask_url("url()"), None);
+        assert_eq!(parse_mask_url("url(\"/a.svg\"), url(\"/b.svg\")"), None);
+        assert_eq!(parse_mask_url("linear-gradient(red, blue)"), None);
+        assert_eq!(parse_mask_url("url(\"/a.svg)"), None);
+    }
+
+    /// Under a usable `mask-image` the background is NOT painted over the
+    /// box (it is painted through the mask, by a child); without one, or
+    /// with one the builder cannot use, it is.
+    #[test]
+    fn test_masked_background_is_not_painted_over_the_box() {
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.bg = Some("#b0b0b0".into());
+        let mut plain = apply_styles_to_div(gpui::div(), &styles);
+        assert!(plain.style().background.is_some());
+        styles.mask_image = Some("url(\"/tmp/plus.svg\")".into());
+        let mut masked = apply_styles_to_div(gpui::div(), &styles);
+        assert!(masked.style().background.is_none());
+        styles.mask_image = Some("none".into());
+        let mut unusable = apply_styles_to_div(gpui::div(), &styles);
+        assert!(unusable.style().background.is_some());
     }
 }

@@ -69,6 +69,27 @@ pub const GPUI_EVENT_OTHER: u32 = 0;
 pub const GPUI_EVENT_KEY_DOWN: u32 = 1;
 /// A key coming up.
 pub const GPUI_EVENT_KEY_UP: u32 = 2;
+/// The left button went down; `key` is `"x,y,count"`, the window position.
+pub const GPUI_EVENT_POINTER_DOWN: u32 = 3;
+/// The pointer moved; `key` is `"x,y"`.
+pub const GPUI_EVENT_POINTER_MOVE: u32 = 4;
+/// The left button came up; `key` is `"x,y"`.
+pub const GPUI_EVENT_POINTER_UP: u32 = 5;
+/// The wheel turned; `key` is `"x,y,dx,dy"` (the delta in pixels).
+pub const GPUI_EVENT_POINTER_WHEEL: u32 = 6;
+/// The RIGHT button went down (a node listening for `contextmenu`); `key` is
+/// `"x,y"`. A kind of its own, so a consumer that asked for a left-button
+/// drag (`mousedown`) never receives a right-click as one.
+pub const GPUI_EVENT_POINTER_CONTEXT: u32 = 7;
+/// The MIDDLE button went down (a node listening for `auxdown`); `key` is
+/// `"x,y,count"`.
+pub const GPUI_EVENT_POINTER_AUX: u32 = 8;
+/// The held modifiers changed — a modifier key went down or up ON ITS OWN,
+/// which no keydown reports (`gpui::ModifiersChangedEvent`); `key` is empty
+/// and `modifiers` is the NEW set. Delivered as `modifierschange` to the
+/// focused element, like a key, so a consumer can recognise a modifier
+/// pressed and released alone (VS Code's "Alt focuses the menu bar").
+pub const GPUI_EVENT_MODIFIERS: u32 = 9;
 
 /// Modifier bits. The five GPUI itself distinguishes (`gpui::Modifiers`), in
 /// the order that struct declares them, so the mapping is a transcription
@@ -263,6 +284,63 @@ pub fn deliver(node_id: NodeId, event: &str, payload: Option<(u32, String, u32, 
     // `key_c` must outlive the loop; naming it here makes that explicit to a
     // reader rather than leaving it to drop order.
     drop(key_c);
+    reached
+}
+
+/// Deliver a POINTER event: its window position (and a wheel's delta)
+/// spelled into the payload's `key` as `input.rs`'s `GPUI_EVENT_POINTER_*`
+/// kinds document. Positions are written with one decimal, which is finer
+/// than a logical pixel and stable across platforms' float formatting.
+///
+/// `modifiers` are the `GPUI_MOD_*` bits held when the button changed (a
+/// press with Control is a different gesture to a consumer than a plain one —
+/// a source editor's Ctrl+click is "jump to line").
+pub fn deliver_pointer(
+    node_id: NodeId,
+    event: &str,
+    kind: u32,
+    x: f32,
+    y: f32,
+    delta: Option<(f32, f32)>,
+    modifiers: u32,
+) -> u32 {
+    // GWIN: positions are the CONTENT's, not the platform window's. When
+    // the renderer draws a frame around the content (client-side
+    // decorations) the window is larger than the content by the frame's
+    // band, and an application that hit-tests its own layout must not see it.
+    let (ox, oy) = crate::window::content_origin();
+    let (x, y) = (x - ox, y - oy);
+    let key = match delta {
+        Some((dx, dy)) => format!("{:.1},{:.1},{:.1},{:.1}", x, y, dx, dy),
+        None => format!("{:.1},{:.1}", x, y),
+    };
+    let reached = deliver(node_id, event, Some((kind, key.clone(), modifiers, false)));
+    // `ISONIM_GPUI_TRACE_POINTER=1`: one line per pointer event and how many
+    // listeners it reached — for diagnosing a window lane's pointer path.
+    if std::env::var_os("ISONIM_GPUI_TRACE_POINTER").is_some() {
+        eprintln!("pointer {} {} node {} reached {}", event, key, node_id.0, reached);
+    }
+    reached
+}
+
+/// A button press, carrying the platform's click count as a third key field
+/// (`x,y,count`): `MouseDownEvent.click_count`, which follows the OS's interval
+/// and distance. An application's own count needs it as an upper bound.
+pub fn deliver_press(
+    node_id: NodeId,
+    event: &str,
+    kind: u32,
+    x: f32,
+    y: f32,
+    click_count: usize,
+    modifiers: u32,
+) -> u32 {
+    let (ox, oy) = crate::window::content_origin();
+    let key = format!("{:.1},{:.1},{}", x - ox, y - oy, click_count);
+    let reached = deliver(node_id, event, Some((kind, key.clone(), modifiers, false)));
+    if std::env::var_os("ISONIM_GPUI_TRACE_POINTER").is_some() {
+        eprintln!("pointer {} {} node {} reached {}", event, key, node_id.0, reached);
+    }
     reached
 }
 

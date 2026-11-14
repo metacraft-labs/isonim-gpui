@@ -196,6 +196,28 @@ API contract. Re-read them on every pin bump. At 0.3.5 all three still hold:
 - `App::quit()` → `Platform::quit()`, and on Linux that is
   `self.inner.with_common(|common| common.signal.stop())` — the calloop
   `LoopSignal` (`gpui-pre-linux-0.3.5/src/linux/platform.rs:335`).
+- **macOS is the OPPOSITE of that line and the shim no longer uses
+  `App::quit()` there.** `MacPlatform::quit`
+  (`gpui-pre-macos-0.3.5/src/platform.rs:557`) dispatches
+  `-[NSApplication terminate:]` onto the main queue, which ENDS THE
+  PROCESS: `app.run()` never returns, `MacPlatform::run`'s `pool.drain()`
+  and ivar teardown are dead code, `Application::run` never returns, and
+  neither does `gpui_launch`. The audit in this section covered only the
+  Linux half until 2026-10-02, which is how an FFI call that is one-way on
+  one platform survived four milestones
+  (`issues/2026-09-29-gpui-launch-never-returns-on-macos.md`).
+  `gpui_app.rs`'s `stop_platform_loop` now calls `cx.quit()` off macOS and
+  `mac_event_loop::stop_event_loop()` on it (`-[NSApplication stop:]` plus
+  a posted `NSEventTypeApplicationDefined` event to wake the event wait).
+  **Re-read `MacPlatform::run` on every pin bump**: if it ever stops being
+  `[NSApp run]`, the stop will silently not land.
+- **macOS also sends `applicationDidFinishLaunching:` once per PROCESS**,
+  and `MacPlatform::run` parks the launch closure in
+  `state.finish_launching` for that notification to pick up (`:535`,
+  taken at `:1350`). A second `gpui_launch` would therefore open no
+  window, spawn no shutdown poller, and hang. `mac_event_loop::
+  kick_relaunch` delivers the selector itself for launches after the
+  first. Re-read those two line numbers with the one above.
 - `QuitMode::Explicit` still exists, and `QuitMode::Default` is still
   `LastWindowClosed` off macOS — so `launch_gpui_app` still has to set
   `Explicit` itself.
@@ -204,6 +226,41 @@ API contract. Re-read them on every pin bump. At 0.3.5 all three still hold:
   detaching it (`…/src/linux/wayland/window.rs:757`). The 150 ms drain
   between window removal and `cx.quit()` in `gpui_app.rs` is still
   load-bearing for that reason.
+
+## Window-framing internals this repository overrides
+
+`rust/gpui-nim-shim/src/mac_window_frame.rs` adds
+`constrainFrameRect:toScreen:` to gpui's **`GPUIWindow`** class at run time,
+through the Objective-C runtime, so a window keeps the frame it is given
+instead of being fitted to the screen's visible frame. Read that file's
+header for why (Chromium overrides the same method, and this shim is matching
+Electron's behaviour window-for-window). What a pin bump has to re-check:
+
+- **The class is still named `GPUIWindow`, and still built by a `#[ctor]`**
+  (`gpui-pre-macos-0.3.5/src/window.rs:132-136`). A rename makes the lookup
+  miss; `install_unconstrained_window_frame` then returns `ClassMissing`,
+  the launch path prints it to stderr, and the `wide` viewport comes back
+  clamped. **The lane does not fail silently, but nothing fails loudly
+  either** — the window simply shrinks — so the stderr line is the signal.
+- **`WindowKind::Normal` still allocates `GPUIWindow`, not `GPUIPanel`**
+  (`:1012-1025`). Only `GPUIWindow` is overridden, deliberately: popups,
+  dialogs and floating panels keep stock AppKit constraining.
+- **`GPUIWindow` still does NOT define `constrainFrameRect:toScreen:`
+  itself.** At 0.3.5 `build_window_class` (`:435`) adds 27 methods and
+  this is not one of them. If upstream adds its own, `class_addMethod`
+  refuses, the shim reports `DefinedUpstream` and **leaves it alone** rather
+  than clobbering it — at which point someone has to read the new upstream
+  method and decide. This is the one variant that is a judgement call rather
+  than a breakage.
+- **Nothing else in the crate clamps the launch frame.** Its only other
+  `visibleFrame` reference is the zoom path (`:870`), which this window does
+  not take. A new clamp upstream would be invisible to the override.
+
+Measured 2026-10-18 on aarch64-darwin, macOS 26.5.2, a 1728x1117-point
+display: a `--width=1920 --height=1080` window reports
+`topBar.window.content` `[1920, 1080]` in a 1920x1108 frame at x = -96, where
+the same binary with the pre-change shim reported `[1728, 1056]` in a
+1728x1084 frame. The 1440x900 window is byte-identical either way.
 
 ## Related decisions
 

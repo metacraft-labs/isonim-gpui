@@ -17,7 +17,8 @@
 // infinite recursion in the compiler.
 use gpui::{div, AppContext, TestAppContext};
 use gpui_nim_shim::gpui_app::{
-    apply_styles_to_div, parse_color, parse_px, render_plan_to_gpui, NimRootView,
+    apply_styles_to_div, parse_color, parse_px, picture_debug_selector, render_plan_to_gpui,
+    NimRootView,
 };
 use gpui_nim_shim::render_sync::{build_render_plan, count_render_nodes, GpuiStyles, RenderNode};
 use gpui_nim_shim::tree::{EventListener, GpuiElementKind, Node, NodeId};
@@ -191,6 +192,7 @@ fn test_render_plan_to_gpui_text_node() {
 
         let _window = cx.add_window(|_window, _cx| {
             let plan = RenderNode {
+            image: None,
                 node_id: 999,
                 kind: GpuiElementKind::TextNode,
                 tag: "#text".to_string(),
@@ -221,6 +223,7 @@ fn test_render_plan_to_gpui_styled_div() {
 
         let _window = cx.add_window(|_window, _cx| {
             let plan = RenderNode {
+            image: None,
                 node_id: 100,
                 kind: GpuiElementKind::Div,
                 tag: "div".to_string(),
@@ -239,6 +242,7 @@ fn test_render_plan_to_gpui_styled_div() {
                 event_names: vec![],
                 attributes: Default::default(),
                 children: vec![RenderNode {
+            image: None,
                     node_id: 101,
                     kind: GpuiElementKind::TextNode,
                     tag: "#text".to_string(),
@@ -270,6 +274,7 @@ fn test_render_plan_to_gpui_img_placeholder() {
 
         let _window = cx.add_window(|_window, _cx| {
             let plan = RenderNode {
+            image: None,
                 node_id: 200,
                 kind: GpuiElementKind::Img,
                 tag: "img".to_string(),
@@ -300,6 +305,7 @@ fn test_render_plan_to_gpui_svg_placeholder() {
 
         let _window = cx.add_window(|_window, _cx| {
             let plan = RenderNode {
+            image: None,
                 node_id: 300,
                 kind: GpuiElementKind::Svg,
                 tag: "svg".to_string(),
@@ -330,6 +336,7 @@ fn test_render_plan_to_gpui_text_container() {
 
         let _window = cx.add_window(|_window, _cx| {
             let plan = RenderNode {
+            image: None,
                 node_id: 400,
                 kind: GpuiElementKind::TextContainer,
                 tag: "span".to_string(),
@@ -586,13 +593,17 @@ fn test_apply_styles_to_div_all_fields() {
             font_weight: None,
             font_style: None,
             line_height: None,
-            letter_spacing: None,
             cursor: Some("pointer".to_string()),
             display: None,
             position: None,
             white_space: None,
             text_overflow: None,
             flex_shrink: None,
+            // Every field added after this case was written (per-side
+            // borders, weight, placement, …) stays unset: the case asserts
+            // the fields above, and a new style field must not stop the
+            // test target from compiling.
+            ..Default::default()
         };
         let el = div();
         let _styled = apply_styles_to_div(el, &styles);
@@ -870,3 +881,626 @@ fn test_empty_root_element_renders() {
         assert!(result.is_ok());
     });
 }
+
+// ---------------------------------------------------------------------------
+// The RIGHT and MIDDLE buttons reach their own listeners (CodeTracer PLAT-50)
+// ---------------------------------------------------------------------------
+//
+// A real GPUI press, simulated on a window that draws the shadow tree, goes
+// through `wire_pointer_listeners`: the left button to `mousedown` (kind
+// `GPUI_EVENT_POINTER_DOWN`), the right to `contextmenu`
+// (`GPUI_EVENT_POINTER_CONTEXT`), the middle to `auxdown`
+// (`GPUI_EVENT_POINTER_AUX`) — each with the modifiers held — and a right or
+// middle press never to the `mousedown` listener a left-button drag asks for.
+// CodeTracer's context menus and middle-click "Jump to line" depend on this.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static DOWNS: AtomicU32 = AtomicU32::new(0);
+static CONTEXTS: AtomicU32 = AtomicU32::new(0);
+static AUXES: AtomicU32 = AtomicU32::new(0);
+static LAST_KIND: AtomicU32 = AtomicU32::new(0);
+static LAST_MODS: AtomicU32 = AtomicU32::new(0);
+
+fn record(p: *const gpui_nim_shim::input::GpuiEventPayload) {
+    if !p.is_null() {
+        let payload = unsafe { &*p };
+        LAST_KIND.store(payload.kind, Ordering::SeqCst);
+        LAST_MODS.store(payload.modifiers, Ordering::SeqCst);
+    }
+}
+extern "C" fn on_down(p: *const gpui_nim_shim::input::GpuiEventPayload) {
+    DOWNS.fetch_add(1, Ordering::SeqCst);
+    record(p);
+}
+extern "C" fn on_context(p: *const gpui_nim_shim::input::GpuiEventPayload) {
+    CONTEXTS.fetch_add(1, Ordering::SeqCst);
+    record(p);
+}
+extern "C" fn on_aux(p: *const gpui_nim_shim::input::GpuiEventPayload) {
+    AUXES.fetch_add(1, Ordering::SeqCst);
+    record(p);
+}
+
+#[test]
+#[serial]
+fn test_right_and_middle_buttons_reach_their_listeners() {
+    run_gpui_test("test_right_and_middle_buttons_reach_their_listeners", |cx| {
+        reset_global_tree();
+        {
+            let mut tree = gpui_nim_shim::lock_tree();
+            let mut root = Node::new_element("root");
+            let root_id = root.id;
+            let mut target = Node::new_element("div");
+            let target_id = target.id;
+            target.styles.insert("width".to_string(), "200px".to_string());
+            target.styles.insert("height".to_string(), "100px".to_string());
+            target.set_text_content("row");
+            target.parent = root_id;
+            for (name, cb) in [
+                ("mousedown", on_down as gpui_nim_shim::EventCallback),
+                ("contextmenu", on_context as gpui_nim_shim::EventCallback),
+                ("auxdown", on_aux as gpui_nim_shim::EventCallback),
+            ] {
+                target
+                    .event_listeners
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(EventListener { callback: cb, callback_id: 0 });
+            }
+            root.children.push(target_id);
+            tree.insert(root);
+            tree.insert(target);
+            drop(tree);
+            *gpui_nim_shim::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner()) = root_id;
+        }
+        DOWNS.store(0, Ordering::SeqCst);
+        CONTEXTS.store(0, Ordering::SeqCst);
+        AUXES.store(0, Ordering::SeqCst);
+
+        let (_view, vcx) = cx.add_window_view(|_window, _cx| NimRootView::new());
+        vcx.run_until_parked();
+        let at = gpui::point(gpui::px(20.0), gpui::px(20.0));
+
+        // The right button, with Control held: `contextmenu`, nothing else.
+        vcx.simulate_mouse_down(at, gpui::MouseButton::Right,
+                                gpui::Modifiers { control: true, ..Default::default() });
+        vcx.run_until_parked();
+        assert_eq!(CONTEXTS.load(Ordering::SeqCst), 1, "the right button reached contextmenu");
+        assert_eq!(DOWNS.load(Ordering::SeqCst), 0, "a right press is not a mousedown");
+        assert_eq!(LAST_KIND.load(Ordering::SeqCst), gpui_nim_shim::input::GPUI_EVENT_POINTER_CONTEXT);
+        assert_eq!(LAST_MODS.load(Ordering::SeqCst), gpui_nim_shim::input::GPUI_MOD_CONTROL);
+        vcx.simulate_mouse_up(at, gpui::MouseButton::Right, gpui::Modifiers::default());
+
+        // The middle button: `auxdown`.
+        vcx.simulate_mouse_down(at, gpui::MouseButton::Middle, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert_eq!(AUXES.load(Ordering::SeqCst), 1, "the middle button reached auxdown");
+        assert_eq!(DOWNS.load(Ordering::SeqCst), 0, "a middle press is not a mousedown");
+        assert_eq!(LAST_KIND.load(Ordering::SeqCst), gpui_nim_shim::input::GPUI_EVENT_POINTER_AUX);
+        vcx.simulate_mouse_up(at, gpui::MouseButton::Middle, gpui::Modifiers::default());
+
+        // The left button: `mousedown`, the other two untouched.
+        vcx.simulate_mouse_down(at, gpui::MouseButton::Left,
+                                gpui::Modifiers { alt: true, ..Default::default() });
+        vcx.run_until_parked();
+        assert_eq!(DOWNS.load(Ordering::SeqCst), 1);
+        assert_eq!(LAST_KIND.load(Ordering::SeqCst), gpui_nim_shim::input::GPUI_EVENT_POINTER_DOWN);
+        assert_eq!(LAST_MODS.load(Ordering::SeqCst), gpui_nim_shim::input::GPUI_MOD_ALT);
+        assert_eq!(CONTEXTS.load(Ordering::SeqCst), 1);
+        assert_eq!(AUXES.load(Ordering::SeqCst), 1);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test: `min-height`, `max-width` and `max-height` are LAID OUT, not just
+// reported.
+//
+// Until 2026-10-18 the three were parsed into `GpuiStyles` and dumped in the
+// render plan, but `apply_styles_to_div` applied only `min-width`, so the plan
+// claimed a capped or floored box the window never drew
+// (issues/2026-10-18-min-height-max-width-max-height-are-parsed-and-reported-but-never-applied.md).
+// These cases measure the element GPUI actually laid out: the probe is
+// tagged with a `debug_selector`, drawn in a real (test-platform) window,
+// and its bounds are read back from the rendered frame. Each case has a
+// control without the property, so a pass cannot come from the fixture.
+// ---------------------------------------------------------------------------
+
+/// A 400×400 flex column (children stretch to its width) holding a single
+/// probe child styled by `apply_styles_to_div`.
+struct ConstraintProbe {
+    styles: GpuiStyles,
+}
+
+impl gpui::Render for ConstraintProbe {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{InteractiveElement, ParentElement, Styled};
+        div()
+            .flex()
+            .flex_col()
+            .w(gpui::px(400.0))
+            .h(gpui::px(400.0))
+            .child(apply_styles_to_div(div(), &self.styles).debug_selector(|| "probe".into()))
+    }
+}
+
+/// Lay out a probe child with `styles` and return its drawn (width, height).
+fn probe_size(cx: &mut TestAppContext, styles: GpuiStyles) -> (f32, f32) {
+    let (_view, vcx) = cx.add_window_view(move |_window, _cx| ConstraintProbe { styles });
+    vcx.run_until_parked();
+    let b = vcx
+        .debug_bounds("probe")
+        .expect("the probe was drawn and its bounds recorded");
+    (f32::from(b.size.width), f32::from(b.size.height))
+}
+
+#[test]
+#[serial]
+fn test_max_width_caps_the_laid_out_width() {
+    run_gpui_test("test_max_width_caps_the_laid_out_width", |cx| {
+        // Control: a stretching child of the 400px column is 400px wide.
+        let (w, _) = probe_size(
+            cx,
+            GpuiStyles {
+                h: Some("10px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(w, 400.0, "control: the child stretches to its parent");
+
+        let (w, _) = probe_size(
+            cx,
+            GpuiStyles {
+                h: Some("10px".into()),
+                max_w: Some("50px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(w, 50.0, "max-width: 50px laid out {w}px wide");
+    });
+}
+
+#[test]
+#[serial]
+fn test_max_height_caps_the_laid_out_height() {
+    run_gpui_test("test_max_height_caps_the_laid_out_height", |cx| {
+        // Control: an explicit 100px height is drawn as 100px.
+        let (_, h) = probe_size(
+            cx,
+            GpuiStyles {
+                h: Some("100px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(h, 100.0, "control: the explicit height is drawn");
+
+        let (_, h) = probe_size(
+            cx,
+            GpuiStyles {
+                h: Some("100px".into()),
+                max_h: Some("30px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(h, 30.0, "max-height: 30px laid out {h}px tall");
+    });
+}
+
+#[test]
+#[serial]
+fn test_min_height_floors_the_laid_out_height() {
+    run_gpui_test("test_min_height_floors_the_laid_out_height", |cx| {
+        // Control: an empty child of a column has no height of its own.
+        let (_, h) = probe_size(cx, GpuiStyles::default());
+        assert_eq!(h, 0.0, "control: the empty child has no height of its own");
+
+        let (_, h) = probe_size(
+            cx,
+            GpuiStyles {
+                min_h: Some("80px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(h, 80.0, "min-height: 80px laid out {h}px tall");
+    });
+}
+
+#[test]
+#[serial]
+fn test_min_width_floors_the_laid_out_width() {
+    // Positive control for the fixture: `min-width` was always applied, so
+    // this passes before and after the fix. An explicit narrow width opts
+    // out of the column's stretch, and min-width must then override it.
+    run_gpui_test("test_min_width_floors_the_laid_out_width", |cx| {
+        let (w, _) = probe_size(
+            cx,
+            GpuiStyles {
+                w: Some("20px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(w, 20.0, "control: the explicit width is drawn");
+
+        let (w, _) = probe_size(
+            cx,
+            GpuiStyles {
+                w: Some("20px".into()),
+                min_w: Some("120px".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(w, 120.0, "min-width: 120px laid out {w}px wide");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test: an inline-value chip is ROUNDED ONCE, not once per span.
+//
+// The editor's inline-value chips drifted right of a browser's rendering. A
+// GPUI text element ceils its own width to a whole logical pixel and taffy
+// then ceils every measured leaf to a device pixel, so a chip drawn as a
+// name element plus a padded value element rounds TWICE and a row of chips
+// accumulates the residue. A chip that declares
+// itself a one-line inline formatting context must be drawn as one measured
+// leaf: name, 7 px inset, value, accumulated unrounded and ceiled once.
+//
+// WHY THESE NUMBERS DISCRIMINATE. The test platform's text system is gpui's
+// `NoopTextSystem`, which is no mock of ours: it is what `TestAppContext`
+// installs. It advances every BMP character by 0.6 em, so at 13 px each glyph
+// is 7.8 px -- fractional, which is what lets a single rounding and a
+// per-span rounding land on different widths. The test window's scale factor
+// is 2.0, so a device pixel is 0.5 logical px. The CONTROL (the same chip
+// without the declaration) must measure the per-span prediction, which proves
+// the fixture really produces fractional advances: if a future gpui changed
+// either fact the control would fail first, instead of the main assertion
+// passing for the wrong reason.
+// ---------------------------------------------------------------------------
+
+/// The chip as `leaves.nim` builds it, minus its decoration: a flex box
+/// holding the name and the value, the value spaced 7 px off the name by its
+/// own `padding-left`. `declare` makes it a one-line inline formatting
+/// context (the declaration plus `white-space: nowrap`).
+fn chip_plan(declare: bool, name: &str, value: &str) -> RenderNode {
+    use gpui_nim_shim::render_sync::INLINE_TEXT_RUNS_ATTRIBUTE;
+    use gpui_nim_shim::tree::Tree;
+    let mut tree = Tree::new();
+    let mut chip = Node::new_element("div");
+    chip.styles.insert("display".into(), "flex".into());
+    chip.styles.insert("flex-shrink".into(), "0".into());
+    chip.styles.insert("font-size".into(), "13px".into());
+    if declare {
+        chip.attributes
+            .insert(INLINE_TEXT_RUNS_ATTRIBUTE.into(), "1".into());
+        chip.styles.insert("white-space".into(), "nowrap".into());
+    }
+    let chip_id = tree.insert(chip);
+    let spans: [(&str, &[(&str, &str)]); 2] = [
+        (name, &[("color", "#9cdcfe"), ("flex-shrink", "0")]),
+        (
+            value,
+            &[
+                ("color", "#d4d4d4"),
+                ("font-weight", "600"),
+                ("padding-left", "7px"),
+                ("flex-shrink", "0"),
+            ],
+        ),
+    ];
+    for (text, styles) in spans {
+        let mut span = Node::new_element("div");
+        for (k, v) in styles {
+            span.styles.insert((*k).into(), (*v).into());
+        }
+        let span_id = tree.insert(span);
+        let text_id = tree.insert(Node::new_text(text));
+        tree.append_child(span_id, text_id);
+        tree.append_child(chip_id, span_id);
+    }
+    build_render_plan(&tree, chip_id).expect("plan")
+}
+
+/// A wide row holding the chip in a wrapper the size of its content, which
+/// is what `debug_bounds` reads back.
+struct ChipProbe {
+    plan: RenderNode,
+}
+
+impl gpui::Render for ChipProbe {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{InteractiveElement, ParentElement, Styled};
+        div().flex().flex_row().w(gpui::px(600.0)).h(gpui::px(100.0)).child(
+            div()
+                .flex()
+                .flex_shrink_0()
+                .debug_selector(|| "chip".into())
+                .child(render_plan_to_gpui(&self.plan)),
+        )
+    }
+}
+
+fn chip_width(cx: &mut TestAppContext, plan: RenderNode) -> f32 {
+    let (_view, vcx) = cx.add_window_view(move |_window, _cx| ChipProbe { plan });
+    vcx.run_until_parked();
+    let b = vcx
+        .debug_bounds("chip")
+        .expect("the chip was drawn and its bounds recorded");
+    f32::from(b.size.width)
+}
+
+#[test]
+#[serial]
+fn test_a_one_line_chip_is_rounded_once_not_per_span() {
+    run_gpui_test("test_a_one_line_chip_is_rounded_once_not_per_span", |cx| {
+        const GLYPH: f32 = 0.6 * 13.0; // NoopTextSystem's advance at 13 px
+        const SCALE: f32 = 2.0; // the test window's scale factor
+        let (name, value) = ("abc", "1234");
+        let name_w = GLYPH * name.len() as f32; // 23.4
+        let value_w = GLYPH * value.len() as f32; // 31.2
+        let device_ceil = |w: f32| (w * SCALE).ceil() / SCALE;
+        // Per span: each text element ceils to a logical px, then to a
+        // device px; the 7 px padding sits between them.
+        let per_span = device_ceil(name_w.ceil()) + 7.0 + device_ceil(value_w.ceil());
+        // Once: the whole chip is one leaf, ceiled to a device px.
+        let once = device_ceil(name_w + 7.0 + value_w);
+        assert!(
+            (per_span - once).abs() >= 0.5,
+            "fixture must discriminate: per-span {per_span} vs once {once}"
+        );
+
+        // CONTROL: undeclared, the chip is drawn span by span.
+        let w = chip_width(cx, chip_plan(false, name, value));
+        assert_eq!(w, per_span, "control: an undeclared chip rounds per span");
+
+        // The declared chip is rounded once, and keeps its 7 px gap: `once`
+        // includes it, and a fused width that had lost the gap would be
+        // 7 px short of `once`.
+        let w = chip_width(cx, chip_plan(true, name, value));
+        assert_eq!(w, once, "a declared nowrap chip must be rounded once");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// A picture lands at the size its element states, whatever its own aspect.
+// ---------------------------------------------------------------------------
+
+/// A row like the ones CodeTracer draws an icon in (`display: flex`,
+/// `align-items: center`, wider and taller than the icon), holding one
+/// picture element.
+struct PictureProbe {
+    plan: RenderNode,
+}
+
+impl gpui::Render for PictureProbe {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{ParentElement, Styled};
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w(gpui::px(200.0))
+            .h(gpui::px(40.0))
+            .child(render_plan_to_gpui(&self.plan))
+    }
+}
+
+/// An `img` element of the shadow tree, sized `w` x `h` px, built through
+/// the same render-plan path an application's element takes.
+fn picture_plan(w: u32, h: u32, src: Option<&str>) -> RenderNode {
+    reset_global_tree();
+    let mut tree = gpui_nim_shim::lock_tree();
+    let mut node = Node::new_element("img");
+    node.styles.insert("width".into(), format!("{w}px"));
+    node.styles.insert("height".into(), format!("{h}px"));
+    node.styles.insert("flex-shrink".into(), "0".into());
+    if let Some(src) = src {
+        node.attributes.insert("src".into(), src.into());
+    }
+    let id = tree.insert(node);
+    build_render_plan(&tree, id).expect("plan")
+}
+
+/// Where the window laid out the picture of `plan` (logical px), after the
+/// picture has loaded: GPUI states a picture's intrinsic aspect ratio in its
+/// layout only once its data is there, so the first frame cannot show the
+/// defect this guards against.
+fn picture_bounds(cx: &mut TestAppContext, plan: RenderNode) -> gpui::Bounds<gpui::Pixels> {
+    let node_id = plan.node_id;
+    let (_view, vcx) = cx.add_window_view(move |_window, _cx| PictureProbe { plan });
+    let selector: &'static str = Box::leak(picture_debug_selector(node_id).into_boxed_str());
+    vcx.run_until_parked();
+    vcx.refresh().expect("window");
+    vcx.run_until_parked();
+    vcx.debug_bounds(selector)
+        .expect("the picture was drawn and its bounds recorded")
+}
+
+/// A NON-SQUARE picture, drawn in a box of a different aspect, LANDS AT THE
+/// BOX's size: its laid-out bounds are read back from the window, not its
+/// styles. This is the case that regressed on 2026-11-08: with the picture
+/// in a block box, GPUI let the picture's own aspect ratio size it, so the
+/// picture was laid out at a size its element never stated (a 10x16 arrow
+/// at 6x8 came out 6x9.5) and drew over its neighbours. Both orientations,
+/// a file SVG and an application's pixel buffer (the two arms that draw an
+/// `img`). Without the fix, the three cases whose picture is taller than its
+/// box fail: 6x8 -> 6x9.5, 7x9 -> 7x9.5 and the pixel buffer 6x8 -> 6x9.5.
+#[test]
+#[serial]
+fn test_a_non_square_picture_lands_at_its_declared_size() {
+    run_gpui_test("test_a_non_square_picture_lands_at_its_declared_size", |cx| {
+        let dir = std::env::temp_dir().join(format!("isonim-gpui-picture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let svg = |name: &str, w: u32, h: u32| {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" \
+                     viewBox=\"0 0 {w} {h}\"><path d=\"M{w} 0 L0 {hh} L{w} {h}\" \
+                     stroke=\"#fff\" fill=\"none\"/></svg>",
+                    hh = h / 2
+                ),
+            )
+            .expect("write svg");
+            path.to_string_lossy().into_owned()
+        };
+        let portrait = svg("portrait.svg", 10, 16);
+        let landscape = svg("landscape.svg", 16, 10);
+        // The shape of CodeTracer's execution mark (`highlight_line_arrow.svg`,
+        // 8x11), which it states at 7x9.
+        let mark = svg("mark.svg", 8, 11);
+
+        // Every case is measured before any is judged, so a failure names
+        // all the cases that land wrong, not only the first.
+        let mut wrong = Vec::new();
+        let mut judge = |what: String, b: gpui::Bounds<gpui::Pixels>, w: u32, h: u32| {
+            let got = (f32::from(b.size.width), f32::from(b.size.height));
+            if got != (w as f32, h as f32) {
+                wrong.push(format!("{what} stated at {w}x{h} laid out at {}x{}", got.0, got.1));
+            }
+        };
+        for (src, w, h) in [(&portrait, 6, 10), (&portrait, 6, 8), (&landscape, 10, 6),
+                            (&landscape, 8, 6), (&mark, 7, 9)] {
+            judge(src.clone(), picture_bounds(cx, picture_plan(w, h, Some(src))), w, h);
+        }
+
+        // The pixel-buffer arm: a 10x16 image the application set, stated
+        // at 6x8.
+        let mut plan = picture_plan(6, 8, None);
+        plan.image = Some(gpui_nim_shim::tree::NodeImage {
+            width: 10,
+            height: 16,
+            bgra: std::sync::Arc::new(vec![0xff; 10 * 16 * 4]),
+            generation: 1,
+        });
+        judge("a 10x16 pixel buffer".into(), picture_bounds(cx, plan), 6, 8);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(wrong.is_empty(), "pictures not at their stated size:\n  {}", wrong.join("\n  "));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// `flex-shrink: N` shrinks an overfull line in proportion to factor x basis.
+// ---------------------------------------------------------------------------
+
+/// A 200px row holding two items, each a 150px flex basis, shrinking at the
+/// factors given -- styled through `apply_styles_to_div`, the element
+/// builder's own path.
+struct ShrinkProbe {
+    factors: (&'static str, &'static str),
+}
+
+impl gpui::Render for ShrinkProbe {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{InteractiveElement, ParentElement, Styled};
+        let item = |shrink: &str, name: &'static str| {
+            let styles = GpuiStyles {
+                flex_basis: Some("150px".into()),
+                flex_shrink: Some(shrink.into()),
+                min_w: Some("0px".into()),
+                h: Some("10px".into()),
+                ..Default::default()
+            };
+            apply_styles_to_div(div(), &styles).debug_selector(move || name.into())
+        };
+        div()
+            .flex()
+            .flex_row()
+            .w(gpui::px(200.0))
+            .h(gpui::px(20.0))
+            .child(item(self.factors.0, "first"))
+            .child(item(self.factors.1, "second"))
+    }
+}
+
+fn shrunk_widths(cx: &mut TestAppContext, factors: (&'static str, &'static str)) -> (f32, f32) {
+    let (_view, vcx) = cx.add_window_view(move |_window, _cx| ShrinkProbe { factors });
+    vcx.run_until_parked();
+    let w = |vcx: &mut gpui::VisualTestContext, name: &'static str| {
+        f32::from(vcx.debug_bounds(name).expect("drawn").size.width)
+    };
+    (w(vcx, "first"), w(vcx, "second"))
+}
+
+/// The 100px overflow is taken in proportion to shrink factor x basis
+/// (https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths): at 1 and
+/// 3 the second item gives three quarters of it. Before 2026-11-08 the
+/// builder applied only `0`, so both shrank at the default 1 (100 / 100).
+/// `0` still freezes an item at its basis.
+#[test]
+#[serial]
+fn test_flex_shrink_factor_is_applied_to_the_layout() {
+    run_gpui_test("test_flex_shrink_factor_is_applied_to_the_layout", |cx| {
+        assert_eq!(shrunk_widths(cx, ("1", "1")), (100.0, 100.0), "control: equal factors");
+        assert_eq!(shrunk_widths(cx, ("1", "3")), (125.0, 75.0));
+        assert_eq!(shrunk_widths(cx, ("0", "1")), (150.0, 50.0));
+        // Ignored, as CSS ignores an invalid declaration: the default 1.
+        assert_eq!(shrunk_widths(cx, ("-2", "1")), (100.0, 100.0));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// `letter-spacing` is drawn: the shim sets the element's own text glyph by
+// glyph (`SpacedText`), the space added after every character.
+// ---------------------------------------------------------------------------
+
+/// A span (`font-size: 10px`, `letter-spacing` as given) holding `text`, in
+/// a wrapper the size of its content.
+fn spaced_plan(text: &str, spacing: Option<&str>) -> RenderNode {
+    use gpui_nim_shim::tree::Tree;
+    let mut tree = Tree::new();
+    let mut span = Node::new_element("span");
+    span.styles.insert("font-size".into(), "10px".into());
+    span.styles.insert("white-space".into(), "nowrap".into());
+    if let Some(s) = spacing {
+        span.styles.insert("letter-spacing".into(), s.into());
+    }
+    let span_id = tree.insert(span);
+    let text_id = tree.insert(Node::new_text(text));
+    tree.append_child(span_id, text_id);
+    build_render_plan(&tree, span_id).expect("plan")
+}
+
+/// THE ELEMENT IS AS WIDE AS THE SPACED LINE, through the plan path the
+/// window takes (`render_plan_to_gpui`). `TestAppContext`'s text system
+/// advances every character 0.6 em (6px at 10px), so "ABCD" is 24px and
+/// each character adds the spacing after itself: 2px makes 32, 0.25em
+/// (2.5px) makes 34. Without the shim's spacing the label stays 24px, which
+/// is how CodeTracer's uppercase titles came out 3-7px narrower than the
+/// browser's.
+#[test]
+#[serial]
+fn test_letter_spacing_widens_the_text_by_the_spacing_of_every_character() {
+    run_gpui_test(
+        "test_letter_spacing_widens_the_text_by_the_spacing_of_every_character",
+        |cx| {
+            assert_eq!(chip_width(cx, spaced_plan("ABCD", None)), 24.0, "control: unspaced");
+            assert_eq!(chip_width(cx, spaced_plan("ABCD", Some("normal"))), 24.0);
+            assert_eq!(chip_width(cx, spaced_plan("ABCD", Some("2px"))), 32.0);
+            assert_eq!(chip_width(cx, spaced_plan("ABCD", Some("0.25em"))), 34.0);
+            // An invalid value draws nothing, as a browser ignores it.
+            assert_eq!(chip_width(cx, spaced_plan("ABCD", Some("wide"))), 24.0);
+        },
+    );
+}
+
+// Where the spaced glyphs land, shaped by the platform's own text system, is
+// `test_letter_spaced_glyphs_move_by_the_spacing_of_the_characters_before_them`
+// in `gpui_text_shaping.rs`, beside the `tabular-nums` case: on macOS the
+// platform can be built only on the main thread, which a `#[test]` here never
+// runs on.

@@ -25,6 +25,13 @@ via `NimRootView`. The `gpui-backend` Cargo feature gates actual GPUI
 rendering; without it the shim provides the shadow tree API only (for testing
 and CI).
 
+To keep featureless and windowed builds side by side, use separate Cargo
+`--target-dir` directories and compile Nim with `-d:gpuiShimPath=<path>`,
+using the library's absolute path. This selects that library on Linux, macOS
+and Windows;
+an unavailable explicit path fails to load instead of falling back to the
+shared build.
+
 ## Prerequisites
 
 - [Nix](https://nixos.org/) with flakes enabled
@@ -86,6 +93,56 @@ LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} \
 > Window mode requires a running X11 or Wayland display. For headless CI
 > environments, use the Xvfb wrapper (see Testing below).
 
+## Windows on every desktop
+
+Some desktops draw a window's frame, and some leave it to the application.
+GNOME on Wayland is the common case of the second kind. isonim-gpui handles
+both, so an application gets a normal window everywhere without code per
+desktop.
+
+- **The frame.** When the application is expected to decorate its own
+  window, the renderer draws a border and a shadow around it, with resize
+  edges and corners that show resize cursors. No frame is drawn where the
+  desktop provides one, or where the window is maximized, tiled or
+  fullscreen. Colour the frame with `data-isonim-window-border` and
+  `data-isonim-window-shadow` on the root element. Pointer positions are
+  always the content's, and the launch size is the content's size.
+- **A title bar of your own.** Mark elements with
+  `data-window-region` (`windowRegionAttribute`):
+  - `drag` moves the window, toggles maximize on a double-click and opens
+    the window menu on a right-click;
+  - `no-drag` keeps a press for the application, as does any element that
+    listens for the pointer;
+  - `minimize`, `maximize` and `close` act on a click.
+
+  `windowEnvironment(launchWindow())` (`isonim_gpui/window_environment`)
+  says whether to draw the title bar and which buttons the platform
+  supports, and gives the side and order the desktop is configured for.
+  Re-read it in `onWindowState`.
+- **Or none.** An application that declares no `drag` region gets a 32px
+  title bar from the renderer, with the window title and the desktop's
+  buttons (`data-isonim-titlebar-background` / `-foreground` colour it).
+- **Window operations** for menus and key bindings: `minimize`,
+  `toggleMaximize`, `toggleFullscreen` and `requestClose`. Closing, by any
+  route including the desktop's own, asks `onClose` first.
+- **Identity and size.** Call these before `gpui_launch`: `setAppId` (match
+  your `.desktop` file), `setMinWindowSize` and `setInitialWindowState`.
+  `setTitle` changes the title at any time. `onResize` reports every
+  content-size change before the frame at that size is drawn.
+- **Coming back to the window.** `onWindowActivated` runs once each time
+  the window goes from inactive to active, when the user returns to it from
+  another program. Use it to re-read state another program may have changed
+  in the meantime, as a web page does on its window `focus` event. It is not
+  called while the window stays active or when it loses activation. A return
+  to a window that drew nothing while you were away, such as one on another
+  workspace or a minimized one, counts too.
+- **`ISONIM_GPUI_DECORATIONS=client|server`** overrides the decoration mode
+  the window asks for.
+
+`just test-gui-window-frame` checks all of this on two real compositors,
+headless sway and headless GNOME Shell, using GuiAssert's desktop
+targets (`../GuiAssert`).
+
 ## Testing
 
 ### Nim tests
@@ -109,7 +166,15 @@ The task-manager demo's end-to-end tests live in `isonim-examples/tests/`
 just rust-test                                   # lib + integration tests (stub mode)
 cd rust/gpui-nim-shim && cargo test              # same, from crate dir
 cd rust/gpui-nim-shim && cargo test --features gpui-backend -- --test-threads=1
+just rust-test-window-frame                      # macOS only, needs a GUI session
 ```
+
+`just rust-test-window-frame` runs `tests/test_mac_window_frame.rs`, which
+opens real AppKit windows larger than the main screen and checks that a
+`GPUIWindow` keeps the frame it asked for once the shim's override is
+installed, while a stock `NSWindow` and a `GPUIWindow` created before the
+install are fitted to the screen. It is also part of `cargo test --features gpui-backend`, so
+that command needs a macOS GUI session too.
 
 > Note: with `--features gpui-backend`, use `--test-threads=1` to avoid mutex
 > contention on the global shadow tree.

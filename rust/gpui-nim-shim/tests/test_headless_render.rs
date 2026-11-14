@@ -19,8 +19,30 @@
 //! pinned revision) `gpui_render_to_pixels` returns the
 //! `RendererUnavailable` error code (2). The Linux path falls back to
 //! RS-M14b (Xvfb / weston-headless) per the RS-M14 milestone scope.
+//!
+//! # Why `harness = false`
+//!
+//! On macOS `gpui_render_to_pixels` builds the platform
+//! (`gpui_platform::current_platform`) on the CALLING thread to obtain its
+//! text system, and gpui builds that platform (`MacPlatform::new`) only on
+//! the main thread: anywhere else it panics with "Mac platform not created
+//! on main thread" (`gpui-pre-macos-0.3.5/src/platform.rs:210`), which the
+//! entry point catches and returns as `6` (`Panic`). libtest runs every
+//! `#[test]` on a worker thread, so as a `#[test]`
+//! `headless_render_produces_non_empty_buffer` could never meet that
+//! precondition on macOS. This file is its own `main` (declared
+//! `harness = false` in `Cargo.toml`, with `required-features =
+//! ["gpui-headless"]` in place of the `#![cfg]` it carried) and runs every
+//! case on the main thread through `main_thread_harness::run`
+//! (`tests/main_thread_harness/mod.rs`), as `test_async_render.rs` does.
+//!
+//! The WHOLE file moved, not only that case: all four share `seed_root`
+//! and the process-wide shadow tree, and the three error-path cases are
+//! indifferent to the thread they are called from. Every assertion is
+//! unchanged, on every platform, and the cases still run one at a time,
+//! as `#[serial]` ran them.
 
-#![cfg(feature = "gpui-headless")]
+mod main_thread_harness;
 
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -31,7 +53,6 @@ use gpui_nim_shim::{
     gpui_append_child, gpui_create_element, gpui_create_text_node, gpui_destroy_element,
     gpui_reset_tree, gpui_set_style, GpuiElement, ROOT_NODE_ID,
 };
-use serial_test::serial;
 
 fn c(s: &str) -> CString {
     CString::new(s).unwrap()
@@ -69,8 +90,6 @@ unsafe fn seed_root() -> *mut GpuiElement {
 /// On non-macOS platforms `current_headless_renderer()` returns `None`,
 /// so we expect `RendererUnavailable` (error code 2). We never get to
 /// the histogram check on those hosts.
-#[test]
-#[serial]
 fn headless_render_produces_non_empty_buffer() {
     unsafe {
         let root = seed_root();
@@ -132,10 +151,7 @@ fn headless_render_produces_non_empty_buffer() {
             // Linux / other platforms: `current_headless_renderer()`
             // returns `None` at the pinned commit, so the entry point
             // bails out with error code 2 (RendererUnavailable).
-            assert_eq!(
-                rc, 2,
-                "non-macOS hosts expect RendererUnavailable (code 2)"
-            );
+            assert_eq!(rc, 2, "non-macOS hosts expect RendererUnavailable (code 2)");
             assert!(out_ptr.is_null());
             assert_eq!(out_len, 0);
         }
@@ -148,8 +164,6 @@ fn headless_render_produces_non_empty_buffer() {
     }
 }
 
-#[test]
-#[serial]
 fn headless_render_rejects_zero_dimensions() {
     unsafe {
         let _root = seed_root();
@@ -162,8 +176,6 @@ fn headless_render_rejects_zero_dimensions() {
     }
 }
 
-#[test]
-#[serial]
 fn headless_render_rejects_invalid_scale() {
     unsafe {
         let _root = seed_root();
@@ -179,12 +191,34 @@ fn headless_render_rejects_invalid_scale() {
     }
 }
 
-#[test]
-#[serial]
 fn headless_free_pixels_is_null_safe() {
     unsafe {
         // Should not panic / segfault.
         gpui_free_pixels(std::ptr::null_mut(), 0);
         gpui_free_pixels(std::ptr::null_mut(), 1024);
     }
+}
+
+/// The cases, in the order they ran as `#[test]`s, all on the main thread.
+const CASES: &[main_thread_harness::Case] = &[
+    (
+        "headless_render_produces_non_empty_buffer",
+        headless_render_produces_non_empty_buffer,
+    ),
+    (
+        "headless_render_rejects_zero_dimensions",
+        headless_render_rejects_zero_dimensions,
+    ),
+    (
+        "headless_render_rejects_invalid_scale",
+        headless_render_rejects_invalid_scale,
+    ),
+    (
+        "headless_free_pixels_is_null_safe",
+        headless_free_pixels_is_null_safe,
+    ),
+];
+
+fn main() {
+    main_thread_harness::run(CASES);
 }

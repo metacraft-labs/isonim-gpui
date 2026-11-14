@@ -27,12 +27,158 @@
 ##   LD_LIBRARY_PATH=rust/target/debug nim c -r --path:../isonim/src tests/test_gui.nim
 
 import unittest
-import std/[json, strutils]
+import std/[json, strutils, exitprocs]
 import isonim_gpui/renderer
 import isonim_gpui/bindings
 
 when defined(gpuiBackend):
   import std/[os, osproc, strformat, times]
+
+# ============================================================================
+# THE COMPLETION SENTINEL
+# ============================================================================
+#
+# THIS FILE MUST NOT BE ABLE TO EXIT 0 WHILE SKIPPING ITS OWN CASES, AND
+# ON 2026-09-29 IT COULD. Measured on aarch64-darwin at isonim-gpui
+# `159df3e`: built `-d:gpuiBackend` against the windowed shim, it printed
+# the nine render-plan `[OK]`s, printed the *"GUI - Launch Integration
+# Tests"* header, and ENDED — exit code 0, 2.9 s wall. Seven cases across
+# the last three suites never ran, nothing said a case was skipped, and a
+# caller reading the exit status was told the run passed.
+#
+# The cause was a one-way FFI call (`gpui_launch` reached
+# `-[NSApplication terminate:]` and never returned; see
+# `issues/2026-09-29-gpui-launch-never-returns-on-macos.md`) and it is
+# fixed in the shim. THIS GUARD IS NOT THAT FIX AND MUST OUTLIVE IT. The
+# defect that made a Linux-only campaign blind for four milestones was not
+# the terminate — it was that a suite could stop in the middle and report
+# success. Any future cause with that shape (a `quit` in a helper, a
+# platform `abort`, an `exit(0)` inside a C library) produces exactly the
+# same silent pass, and the only instrument that can see it is one that
+# knows which suites were supposed to report.
+#
+# ## Why `atexit` and why `_exit`
+#
+# The guard has to survive a process that is being torn down by someone
+# else. `terminate:` ends in `exit(0)`, which RUNS atexit handlers — so an
+# `addExitProc` guard fires even then, which a check written after the
+# last suite could not. And it cannot report by setting `programResult`,
+# because the status `exit` was called with is already chosen by the time
+# any handler runs; `_exit(70)` is how a non-zero status is forced from
+# inside one. `70` is `EX_SOFTWARE`, chosen so the status is
+# distinguishable from the `1` an ordinary failing `check` produces.
+#
+# ## Why a roster and not a counter
+#
+# A count of cases that reported is satisfied by the wrong cases
+# reporting. The roster below is the set of suites this file DECLARES,
+# built under the same `when` as the declarations themselves, and each
+# suite announces itself at its own end. A suite that dies at its third
+# case of five never announces, so partial execution is caught at suite
+# granularity rather than only whole-suite omission.
+
+when defined(gpuiBackend):
+  const ExpectedSuites = @[
+    "GUI - Render Plan Smoke Tests",
+    "GUI - Launch Integration Tests",
+    "GUI - GPUI Backend Compile Check",
+    "GUI - Windowed pixel capture (Wayland)"]
+else:
+  const ExpectedSuites = @[
+    "GUI - Render Plan Smoke Tests",
+    "GUI - Launch Integration Tests"]
+
+var finishedSuites: seq[string] = @[]
+
+proc suiteFinished(name: string) =
+  ## Called as the LAST statement of each suite's body.
+  finishedSuites.add(name)
+
+# A suite can also end early because one of its own `require`s failed:
+# `require` sets `abortOnError` and `fail()` then does `quit(1)`, so the
+# PROCESS ends there and the statements after the last case never run.
+# That outcome is already loud — the case printed, the status is 1 — and
+# escalating it would tell the reader the wrong thing about what went
+# wrong. So the sentinel needs to know whether a failure was REPORTED,
+# and `unittest`'s own formatter interface is where that is observable.
+#
+# `ensureInitialized` installs the console formatter only when the list is
+# empty, so adding a second formatter means adding the first one too; this
+# is the same `defaultConsoleFormatter()` it would have installed.
+type FailureWitness = ref object of OutputFormatter
+
+var anyFailureReported = false
+
+# AND THE ROSTER ITSELF IS A POPULATION CLAIM, SO SOMETHING HAS TO ASSERT
+# IT. `ExpectedSuites` is a hand-written literal, and a hand-written
+# population that nothing re-derives is the shape
+# `Testing/Verification-Harness-Traps.md` §34 is about: a suite added to
+# this file and NOT added to the roster is invisible to the guard, so the
+# guard would keep reporting a complete run while the thing it is counting
+# has stopped being the file. `unittest` announces every suite it enters
+# (`suite` calls `formatter.suiteStarted(name)`), so the set that RAN is
+# observable, and a name in it that the roster does not carry is roster
+# drift — reported with the same force as a suite that never finished.
+var startedSuites: seq[string] = @[]
+
+method suiteStarted(f: FailureWitness, suiteName: string) =
+  # The base method is `{.gcsafe.}` and this appends to a global `seq`, so
+  # the cast is required. It is sound for the same reason the plain global
+  # above is: `unittest` calls its formatters from the thread running the
+  # suites, which is the thread that reads both of them in the exit proc.
+  {.cast(gcsafe).}:
+    startedSuites.add(suiteName)
+
+method failureOccurred(f: FailureWitness, checkpoints: seq[string],
+                       stackTrace: string) =
+  anyFailureReported = true
+
+method testEnded(f: FailureWitness, testResult: TestResult) =
+  if testResult.status == TestStatus.FAILED:
+    anyFailureReported = true
+
+addOutputFormatter(OutputFormatter(defaultConsoleFormatter()))
+addOutputFormatter(FailureWitness())
+
+proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+
+proc completionSentinel() {.noconv.} =
+  var missing: seq[string] = @[]
+  for name in ExpectedSuites:
+    if name notin finishedSuites:
+      missing.add(name)
+  var unrostered: seq[string] = @[]
+  for name in startedSuites:
+    if name notin ExpectedSuites:
+      unrostered.add(name)
+  if missing.len == 0 and unrostered.len == 0:
+    return
+  stdout.flushFile()
+  stderr.write("\n")
+  if missing.len > 0:
+    stderr.write("test_gui did not run its own suite to the end.\n")
+  else:
+    stderr.write("test_gui's completion roster no longer covers this file.\n")
+  stderr.write("  declared suites: " & $ExpectedSuites.len &
+    "   started: " & $startedSuites.len &
+    "   completed: " & $finishedSuites.len & "\n")
+  for name in missing:
+    stderr.write("  NEVER COMPLETED: " & name & "\n")
+  for name in unrostered:
+    stderr.write("  RAN BUT NOT ON THE ROSTER: " & name & "\n")
+  # The state this guard exists for: the roster disagrees with the run AND
+  # nothing was reported as a failure, so the process is about to call this
+  # a pass.
+  if not anyFailureReported:
+    stderr.write("  No case reported a failure, so the exit status would " &
+      "have been a pass. Forcing 70 (EX_SOFTWARE).\n")
+    stderr.flushFile()
+    cExit(70)
+  stderr.write("  A failure WAS reported above, so the status is already " &
+    "non-zero: this is a report and not an escalation.\n")
+  stderr.flushFile()
+
+addExitProc(completionSentinel)
 
 # ============================================================================
 # Helpers
@@ -209,6 +355,8 @@ suite "GUI - Render Plan Smoke Tests":
     check plan["has_click_handler"].getBool == false
     check plan["has_input_handler"].getBool == false
     check plan["event_names"].len == 0
+
+  suiteFinished("GUI - Render Plan Smoke Tests")
 
 # ============================================================================
 # Launch Integration Tests
@@ -387,6 +535,8 @@ suite "GUI - Launch Integration Tests":
     check r.verifyRenderPlan(rootEl)
     check r.renderPlanElementCount(rootEl) >= 4
 
+  suiteFinished("GUI - Launch Integration Tests")
+
 # ============================================================================
 # GPUI Window Tests (require a Wayland compositor)
 # ============================================================================
@@ -412,6 +562,8 @@ when defined(gpuiBackend):
       check gpui_window_state(winId) == 4  # Closed state
 
       gpui_destroy_window(winId)
+
+    suiteFinished("GUI - GPUI Backend Compile Check")
 
   # ==========================================================================
   # Windowed pixel capture (RS-M14b) — THE FIRST ASSERTION IN THIS LANE
@@ -827,3 +979,5 @@ when defined(gpuiBackend):
       check bst.other == blank.w * blank.h
 
       removeDir(capDir)
+
+    suiteFinished("GUI - Windowed pixel capture (Wayland)")

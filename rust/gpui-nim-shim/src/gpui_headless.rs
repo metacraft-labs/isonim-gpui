@@ -65,7 +65,10 @@ use std::sync::{
 };
 use std::thread;
 
-use gpui::{px, size, AnyWindowHandle, App, AppContext, HeadlessAppContext, Pixels, Size, Window};
+use gpui::{
+    px, size, AnyWindowHandle, App, AppContext, HeadlessAppContext, Pixels, PlatformTextSystem,
+    Size, Window,
+};
 use gpui_platform::{current_headless_renderer, current_platform};
 use image::imageops::FilterType;
 
@@ -85,6 +88,12 @@ enum ErrorCode {
     /// `current_headless_renderer()` returned `None` for the current
     /// platform. macOS is the supported headless target; Linux falls back
     /// to RS-M14b (Xvfb / weston-headless) per the milestone scope.
+    ///
+    /// The async path also answers this on macOS when
+    /// [`gpui_render_submit_async`] was called off the process's main
+    /// thread before any main-thread call had obtained the platform's
+    /// text system: without one the worker has nothing to render with.
+    /// See [`async_text_system_for_this_call`].
     RendererUnavailable = 2,
     /// Opening a window via `HeadlessAppContext::open_window` failed.
     WindowOpenFailed = 3,
@@ -140,6 +149,14 @@ enum ErrorCode {
 /// zero / non-finite); the F/M/I bridge always passes 1.0. A future
 /// revision can introduce explicit DPR control once GPUI exposes a
 /// configurable headless scale factor.
+///
+/// # Threading (macOS)
+///
+/// Call this on the process's main thread. It builds the platform to
+/// obtain its text system, and on macOS `MacPlatform::new` panics on any
+/// other thread (`gpui-pre-macos-0.3.5/src/platform.rs:210`); the panic is
+/// caught and returned as `6` (`Panic`). [`gpui_render_submit_async`] has
+/// the same precondition for its first call.
 ///
 /// # Safety
 ///
@@ -265,6 +282,11 @@ fn render_to_rgba(width: u32, height: u32, scale: f32) -> Result<Vec<u8>, ErrorC
     // PlatformTextSystem>` the platform's renderer is configured against.
     let platform = current_platform(true);
     let text_system = platform.text_system();
+    // Disable CoreGraphics stem darkening for this process before anything is
+    // rasterised, so an off-screen capture matches the windowed path and the
+    // Electron reference. See `window::apply_chromium_font_smoothing_policy`.
+    #[cfg(target_os = "macos")]
+    let _ = crate::window::apply_and_report_font_smoothing_policy(text_system.as_ref());
 
     // The headless renderer factory is platform-specific. On macOS it
     // returns `Some(MetalHeadlessRenderer)`; on Linux it returns `None`
@@ -284,6 +306,7 @@ fn render_to_rgba(width: u32, height: u32, scale: f32) -> Result<Vec<u8>, ErrorC
 
     let window: AnyWindowHandle = cx
         .open_window(window_size, |_, cx: &mut App| {
+            crate::gpui_app::register_fonts(cx);
             cx.new(|_| NimRootView::new())
         })
         .map_err(|_| ErrorCode::WindowOpenFailed)?
@@ -385,7 +408,11 @@ fn refresh_window(cx: &mut HeadlessAppContext, window: AnyWindowHandle) {
 //
 //   1. Constructs ``HeadlessAppContext::with_platform`` **once**
 //      (EMC-M1's biggest single cost item — paid once instead of per
-//      frame).
+//      frame), from the platform text system the SUBMITTING thread
+//      obtained and sent with the request. The worker never calls
+//      ``current_platform``: on macOS that builds ``MacPlatform``,
+//      which panics on any thread but the main one (see
+//      ``async_text_system_for_this_call``).
 //   2. Opens a window at the first-requested size and keeps it open
 //      across frames; resizes (reopens) on demand when the requested
 //      ``(width, height)`` changes. Window reuse skips the pump-from-
@@ -552,6 +579,12 @@ struct RenderRequest {
     width: u32,
     height: u32,
     scale: f32,
+    /// The platform text system the worker builds its context from,
+    /// obtained on the submitting thread (see
+    /// [`async_text_system_for_this_call`]). `None` where none could be
+    /// obtained; the worker then answers `RendererUnavailable` if it
+    /// has no context yet.
+    text_system: Option<Arc<dyn PlatformTextSystem>>,
     /// Snapshot of ``WorkerState::current_generation`` taken at
     /// submit time. Worker echoes it back into the completed slot so
     /// ``try_take`` can compare against the live counter and detect
@@ -636,7 +669,7 @@ fn worker_main(state: Arc<WorkerState>, rx: mpsc::Receiver<RenderRequest>) {
         }
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            render_via_cached(&mut cached, req.width, req.height)
+            render_via_cached(&mut cached, req.width, req.height, req.text_system.as_ref())
         }));
         match result {
             Ok(Ok(bytes)) => publish_success(&state, token, generation, bytes),
@@ -666,19 +699,28 @@ struct WorkerCtx {
 
 /// Render via the cached context if available; lazily construct on
 /// first call. Reopens the window on size change.
+///
+/// `text_system` is the one the submitting thread obtained; this
+/// function runs on the worker and must not build a platform itself
+/// (see [`async_text_system_for_this_call`]).
 fn render_via_cached(
     cached: &mut Option<WorkerCtx>,
     width: u32,
     height: u32,
+    text_system: Option<&Arc<dyn PlatformTextSystem>>,
 ) -> Result<Vec<u8>, ErrorCode> {
     if cached.is_none() {
         if current_headless_renderer().is_none() {
             return Err(ErrorCode::RendererUnavailable);
         }
-        let platform = current_platform(true);
-        let text_system = platform.text_system();
+        // No text system: the submit came off the main thread on macOS
+        // before any main-thread submit had obtained one. Answer the
+        // documented code rather than panicking into `Panic`.
+        let Some(text_system) = text_system else {
+            return Err(ErrorCode::RendererUnavailable);
+        };
         let cx = HeadlessAppContext::with_platform(
-            text_system,
+            text_system.clone(),
             Arc::new(()),
             || current_headless_renderer(),
         );
@@ -709,6 +751,7 @@ fn render_via_cached(
         let new_window: AnyWindowHandle = entry
             .cx
             .open_window(window_size, |_, cx: &mut App| {
+                crate::gpui_app::register_fonts(cx);
                 cx.new(|_| NimRootView::new())
             })
             .map_err(|_| ErrorCode::WindowOpenFailed)?
@@ -796,7 +839,65 @@ fn publish_failure(state: &WorkerState, token: u32, generation: u64, code: Error
     slots.insert(token, RenderSlot::Failed { generation, code });
 }
 
+/// The process's platform text system for the async path, once a call on
+/// the main thread has obtained it. Kept for the process lifetime: the
+/// worker rebuilds its context from it after a failed render, and a
+/// context already re-registers the shim's fonts into the same text
+/// system on every window it opens, so reuse adds nothing new.
+#[cfg(target_os = "macos")]
+static ASYNC_TEXT_SYSTEM: Mutex<Option<Arc<dyn PlatformTextSystem>>> = Mutex::new(None);
+
+/// The platform text system to send with this submit, obtained ON THE
+/// CALLING THREAD, never on the worker.
+///
+/// **Threading precondition (macOS).** The text system comes from
+/// `gpui_platform::current_platform`, which on macOS builds
+/// `MacPlatform`; `MacPlatform::new` takes a `MainThreadMarker` and
+/// panics on any other thread (`gpui-pre-macos-0.3.5/src/platform.rs:210`).
+/// The text system itself is `Send + Sync` (`PlatformTextSystem`), so it
+/// is obtained here and handed to the worker. This gives
+/// [`gpui_render_submit_async`] the precondition the synchronous
+/// [`gpui_render_to_pixels`] already has on macOS: the FIRST submit must
+/// come from the process's main thread. Later submits may come from any
+/// thread, because the text system is kept. No run loop is required: the
+/// render itself still happens on the worker.
+///
+/// A submit off the main thread before that returns `None` without
+/// building anything; the worker then answers `RendererUnavailable`
+/// (`-2` from [`gpui_render_try_take`]) instead of a caught panic
+/// (`-6`). A later main-thread submit obtains the text system then.
+///
+/// The CoreGraphics font-smoothing policy is applied through the text
+/// system here, once, before the worker can rasterise a glyph with it --
+/// the order the worker kept when it built the platform itself.
+///
+/// Off macOS the pinned gpui has no headless renderer, so the worker
+/// answers `RendererUnavailable` before it needs a text system, and
+/// nothing is obtained here: the async path behaves exactly as before.
+#[cfg(target_os = "macos")]
+fn async_text_system_for_this_call() -> Option<Arc<dyn PlatformTextSystem>> {
+    let mut slot = ASYNC_TEXT_SYSTEM.lock().unwrap_or_else(|p| p.into_inner());
+    if slot.is_none() && objc2::MainThreadMarker::new().is_some() {
+        let text_system = current_platform(true).text_system();
+        let _ = crate::window::apply_and_report_font_smoothing_policy(text_system.as_ref());
+        *slot = Some(text_system);
+    }
+    slot.clone()
+}
+
+/// See the macOS arm: off macOS there is no headless renderer for the
+/// worker to use, so it never needs a text system.
+#[cfg(not(target_os = "macos"))]
+fn async_text_system_for_this_call() -> Option<Arc<dyn PlatformTextSystem>> {
+    None
+}
+
 /// Submit a render request to the dedicated GPUI render thread.
+///
+/// **Threading precondition (macOS):** the first call in the process
+/// must be made on the main thread, as for [`gpui_render_to_pixels`];
+/// a call off it before then is answered `-2` (`RendererUnavailable`)
+/// by [`gpui_render_try_take`]. See [`async_text_system_for_this_call`].
 ///
 /// Returns a non-zero token on success; the caller can poll for the
 /// result via [`gpui_render_try_take`]. Returns ``0`` if the worker
@@ -810,6 +911,9 @@ fn publish_failure(state: &WorkerState, token: u32, generation: u64, code: Error
 /// to continue ticking.
 #[no_mangle]
 pub extern "C" fn gpui_render_submit_async(width: u32, height: u32, scale: f32) -> u32 {
+    // On the calling thread, before anything is queued: the worker must
+    // never build the platform (see `async_text_system_for_this_call`).
+    let text_system = async_text_system_for_this_call();
     let state = WORKER.clone();
     let token = state.next_token.fetch_add(1, Ordering::AcqRel);
     // Reserve token 0 for failure; if the counter wraps, skip 0.
@@ -849,6 +953,7 @@ pub extern "C" fn gpui_render_submit_async(width: u32, height: u32, scale: f32) 
                 width,
                 height,
                 scale,
+                text_system,
                 generation,
             })
             .is_err()

@@ -113,8 +113,22 @@ fi
 # What the image actually exports. `T` is a defined text symbol; `W` a
 # weak one. Filtered to the shim's own prefix so Rust runtime and libc
 # symbols do not enter the comparison.
-IMAGE_SYMS=$("$NM_BIN" -D --defined-only "$LIB_PATH" 2>/dev/null |
-	awk '$2 == "T" || $2 == "W" { print $3 }' |
+#
+# THE FLAGS ARE NOT PORTABLE AND THE FAILURE WAS SILENT-ISH. `nm -D
+# --defined-only` is GNU/ELF spelling; on macOS `nm` has no `-D` and the
+# equivalent is `-gU` (global, defined only). Until 2026-10-02 this gate
+# ran the ELF spelling everywhere, read ZERO symbols out of a perfectly
+# good Mach-O dylib, and stopped at the `MIN_SYMBOLS` floor with *"the
+# enumeration is not reading the artifact"* — which is the floor doing
+# exactly its job, and is also the only reason this was not a false pass.
+# The Mach-O ABI prepends `_` to every C symbol, so it is stripped here
+# and the two platforms compare on the same names.
+case "$(uname -s)" in
+Darwin) NM_ARGS=(-gU) ;;
+*) NM_ARGS=(-D --defined-only) ;;
+esac
+IMAGE_SYMS=$("$NM_BIN" "${NM_ARGS[@]}" "$LIB_PATH" 2>/dev/null |
+	awk '$2 == "T" || $2 == "W" { sub(/^_/, "", $3); print $3 }' |
 	grep "^$SYMBOL_PREFIX" | sort -u || true)
 IMAGE_COUNT=$(printf '%s\n' "$IMAGE_SYMS" | grep -c . || true)
 

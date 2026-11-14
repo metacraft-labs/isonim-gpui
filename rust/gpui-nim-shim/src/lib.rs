@@ -45,9 +45,18 @@
 // exported symbol set does not depend on which features the cdylib was built
 // with (see `gpui_headless_unavailable.rs`'s module docs for what that rule
 // exists to prevent).
+pub mod frame;
+pub mod regions;
 pub mod input;
+// PLAT-50 (CodeTracer): the system clipboard, for a click that copies.
+// Feature-less for `input`'s reason.
+pub mod clipboard;
 // PLAT-42: frame timing. Feature-less for `input`'s reason.
 pub mod frame_stats;
+// CTF-P1b (CodeTracer): where the window laid an opted-in element out, read
+// back for a host comparing its layout with another renderer's. Feature-less
+// for `input`'s reason.
+pub mod layout_bounds;
 pub mod render_sync;
 #[allow(dead_code)]
 pub mod tree;
@@ -61,8 +70,22 @@ pub mod window;
 // headless path too.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub mod gpui_app;
+// macOS only, and it is the reason `gpui_launch` returns at all on that
+// platform: `MacPlatform::quit` is `-[NSApplication terminate:]`, which
+// does not unwind. Read this module's header before touching the shutdown
+// poller. The file carries its own `#![cfg(…)]`, so the `mod` here is
+// unconditional and the module is empty off macOS.
 #[cfg(feature = "gpui-headless")]
 pub mod gpui_headless;
+pub mod mac_event_loop;
+// macOS only, and the reason the `wide` viewport is honoured at all on a
+// display narrower than it: gpui's window class inherits `NSWindow`'s
+// `constrainFrameRect:toScreen:`, which fits the window to the screen's
+// visible frame, and Chromium — hence the Electron front-end this one is
+// being matched to — overrides exactly that. The file carries its own
+// `#![cfg(…)]`, so the `mod` here is unconditional and the module is empty
+// off macOS.
+pub mod mac_window_frame;
 // …and its feature-less counterpart, so the cdylib's EXPORTED SYMBOL SET
 // does not depend on which features it was built with. Without this a
 // plain `cargo build` produced 56 exports while `bindings.nim` imported
@@ -296,6 +319,72 @@ pub extern "C" fn gpui_remove_attribute(node: *mut GpuiElement, name: *const c_c
 }
 
 // ---------------------------------------------------------------------------
+// 7b. setImageRgba — the pixels an `img` element shows
+// ---------------------------------------------------------------------------
+
+static IMAGE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The attribute an `img` element with pixels carries: `<width>x<height>`, so
+/// a reader of the render plan sees which elements draw a picture and at
+/// what size.
+pub const IMAGE_SIZE_ATTRIBUTE: &str = "data-gpui-image";
+
+/// Give `node` (an `img` element) the `width` x `height` RGBA8888 pixels at
+/// `data` (`len` bytes, `width * height * 4`) to draw, stretched to the
+/// element's box. The bytes are copied. A null `data`, an empty extent or a
+/// length that does not match clears the picture (the element then draws its
+/// placeholder) and answers 0; a picture set answers 1.
+#[no_mangle]
+pub extern "C" fn gpui_set_image_rgba(
+    node: *mut GpuiElement,
+    data: *const u8,
+    len: usize,
+    width: u32,
+    height: u32,
+) -> i32 {
+    let node_id = unsafe { handle_to_node_id(node) };
+    if node_id.is_null() {
+        return 0;
+    }
+    let expected = (width as usize) * (height as usize) * 4;
+    let image = if data.is_null() || width == 0 || height == 0 || len != expected {
+        None
+    } else {
+        let src = unsafe { std::slice::from_raw_parts(data, len) };
+        let mut bgra = Vec::with_capacity(len);
+        for px in src.chunks_exact(4) {
+            bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        }
+        Some(crate::tree::NodeImage {
+            width,
+            height,
+            bgra: std::sync::Arc::new(bgra),
+            generation: IMAGE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        })
+    };
+    let set = image.is_some();
+    let mut tree = lock_tree();
+    if let Some(n) = tree.get_mut(node_id) {
+        match &image {
+            Some(im) => {
+                n.attributes.insert(
+                    IMAGE_SIZE_ATTRIBUTE.to_string(),
+                    format!("{}x{}", im.width, im.height),
+                );
+            }
+            None => {
+                n.attributes.remove(IMAGE_SIZE_ATTRIBUTE);
+            }
+        }
+        n.image = image;
+        window::request_repaint();
+        if set { 1 } else { 0 }
+    } else {
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 8. setTextContent
 // ---------------------------------------------------------------------------
 
@@ -507,6 +596,16 @@ pub extern "C" fn gpui_launch(
 
     let root_handle = node_id_to_handle(root_id);
 
+    // GWIN: the window is registered BEFORE the root builder runs,
+    // so the application can find it (`gpui_launch_window_id`) and register
+    // its resize and window-state callbacks for the window being launched.
+    #[cfg(feature = "gpui-backend")]
+    let win_id = {
+        let id = window::create_window(title_str, width, height);
+        window::LAUNCH_WINDOW_ID.store(id, std::sync::atomic::Ordering::Release);
+        id
+    };
+
     // Call back to Nim so it can build the initial tree
     root_builder(root_handle);
 
@@ -514,8 +613,8 @@ pub extern "C" fn gpui_launch(
     // window with the shadow tree renderer as the root view.
     #[cfg(feature = "gpui-backend")]
     {
-        let win_id = window::create_window(title_str, width, height);
         gpui_app::launch_gpui_app(title_str, width, height, win_id);
+        window::LAUNCH_WINDOW_ID.store(0, std::sync::atomic::Ordering::Release);
     }
 
     // Without the feature, the function returns after building the shadow tree.
@@ -524,6 +623,32 @@ pub extern "C" fn gpui_launch(
     {
         let _ = title_str;
     }
+}
+
+/// Returns 1 if this build of the shim can open a window — that is, if it
+/// was compiled with `--features gpui-backend`, so `gpui_launch` enters
+/// GPUI's event loop — and 0 otherwise.
+///
+/// WHY AN APPLICATION NEEDS TO ASK. Without the feature `gpui_launch` builds
+/// the shadow tree, calls the root builder and RETURNS, by design (that is
+/// the stub the test suites and the render-plan tooling run against). An
+/// application that calls it to show a window therefore sees an ordinary
+/// return and has no way to tell "the user closed the window" from "there
+/// never was one" — so it exits 0 having shown nothing, and says nothing.
+/// Asking first lets it refuse by name instead (CodeTracer's GPUI front-end
+/// does, with exit 3).
+///
+/// It answers about the WINDOWED feature only. `gpui-headless` renders
+/// off-screen through `gpui_render_to_pixels` and opens no window, so a
+/// headless-only build answers 0, which is the truth about `gpui_launch`.
+///
+/// The symbol exists in EVERY build, for the reason the shutdown exports
+/// below give: a symbol that came and went with a Cargo feature could not be
+/// imported unconditionally from Nim, and the question would be answered by
+/// a load failure instead of by a value.
+#[no_mangle]
+pub extern "C" fn gpui_has_window_backend() -> u8 {
+    u8::from(cfg!(feature = "gpui-backend"))
 }
 
 /// RS-M14 Phase 2: set the global `ROOT_NODE_ID` to the given element
@@ -737,6 +862,88 @@ pub extern "C" fn gpui_get_attribute(
     needed
 }
 
+/// The whole subtree under `root`, in ONE call: every node in pre-order
+/// (a node, then each of its children's subtrees in child order), each as
+///
+///   * its node id, a u64, little-endian (`gpui_node_id`'s value);
+///   * the index of its parent in this sequence, a u32, little-endian, and
+///     `u32::MAX` for `root` itself;
+///   * how many attributes it carries, a u32, little-endian;
+///   * each attribute as `name\0value\0`, in name order -- the ones the
+///     program set: `__`-prefixed keys are the shim's own storage
+///     (`__text_content`), left out as render-sync leaves them out.
+///
+/// Written into `buf` (at most `buf_len` bytes); returns the number of bytes
+/// the whole encoding needs, or 0 when `root` is null or not in the tree.
+///
+/// A caller that classifies every element of a window after each redraw --
+/// which kind of control it is, which rows take clicks -- would otherwise
+/// walk it with `gpui_child_count` / `gpui_nth_child` and ask
+/// `gpui_get_attribute` once per attribute NAME it knows, each a lock of the
+/// tree and nearly every answer "absent": about 50 ms a redraw over a
+/// thousand elements. Attribute names and values come from C strings, so
+/// neither can contain the NUL that ends them. `gpui_element_of_node_id`
+/// turns an id from here into a handle, for the few elements the caller
+/// then changes.
+#[no_mangle]
+pub extern "C" fn gpui_snapshot_tree(root: *mut GpuiElement, buf: *mut u8, buf_len: u64) -> u64 {
+    let root_id = unsafe { handle_to_node_id(root) };
+    if root_id.is_null() {
+        return 0;
+    }
+    let tree = lock_tree();
+    if tree.get(root_id).is_none() {
+        return 0;
+    }
+    let mut out = Vec::new();
+    // (node, its parent's index) -- children pushed in reverse so they are
+    // popped, and so encoded, in child order.
+    let mut stack: Vec<(NodeId, u32)> = vec![(root_id, u32::MAX)];
+    let mut index: u32 = 0;
+    while let Some((id, parent)) = stack.pop() {
+        let Some(node) = tree.get(id) else { continue };
+        out.extend_from_slice(&id.0.to_le_bytes());
+        out.extend_from_slice(&parent.to_le_bytes());
+        let mut pairs: Vec<(&String, &String)> = node
+            .attributes
+            .iter()
+            .filter(|(k, _)| !k.starts_with("__"))
+            .collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        out.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+        for (name, value) in pairs {
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+            out.extend_from_slice(value.as_bytes());
+            out.push(0);
+        }
+        for child in node.children.iter().rev() {
+            stack.push((*child, index));
+        }
+        index += 1;
+    }
+    let needed = out.len() as u64;
+    if buf.is_null() || buf_len == 0 {
+        return needed;
+    }
+    let to_copy = std::cmp::min(out.len(), buf_len as usize);
+    unsafe {
+        std::ptr::copy_nonoverlapping(out.as_ptr(), buf, to_copy);
+    }
+    needed
+}
+
+/// A handle for the node `id` names (an id `gpui_snapshot_tree` or
+/// `gpui_node_id` answered), or null when no such node is in the tree.
+#[no_mangle]
+pub extern "C" fn gpui_element_of_node_id(id: u64) -> *mut GpuiElement {
+    let tree = lock_tree();
+    match tree.get(NodeId(id)) {
+        Some(_) => node_id_to_handle(NodeId(id)),
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Get the Nth child of a node (0-indexed).
 /// Returns null if out of bounds or node not found.
 #[no_mangle]
@@ -948,6 +1155,18 @@ pub extern "C" fn gpui_quit_requested() -> u8 {
     u8::from(window::quit_requested())
 }
 
+/// Arm a PERIODIC callback into the host: `callback` runs every
+/// `interval_ms` milliseconds on the event loop's own (main) thread, from
+/// inside the loop, and a repaint is requested after it — so a host whose
+/// state moves without any input (a view of the file system, refreshed on a
+/// clock the way a web page's `setTimeout` would) can redraw. `0` or a null
+/// callback disarms it. Exists in every build; without `gpui-backend` there
+/// is no loop to tick, and the registration only round-trips.
+#[no_mangle]
+pub extern "C" fn gpui_set_tick(interval_ms: u32, callback: Option<window::TickCallback>) {
+    window::set_tick(interval_ms, callback);
+}
+
 /// Register a callback for window resize events.
 /// The callback receives (width: f64, height: f64).
 #[no_mangle]
@@ -1043,6 +1262,228 @@ pub extern "C" fn gpui_notify_focus(window_id: u32, focused: u8) {
     window::notify_focus(window_id, focused != 0);
 }
 
+// ---------------------------------------------------------------------------
+// GWIN — window chrome state
+// ---------------------------------------------------------------------------
+//
+// Sampled from the live GPUI window once per frame. Every query takes the
+// window id like `gpui_window_width`; an unknown id answers as a window
+// nothing has been sampled for (`ChromeState::default`).
+
+fn chrome_of(window_id: u32) -> window::ChromeState {
+    window::chrome_state(window_id).unwrap_or_default()
+}
+
+/// `0` the compositor draws the frame, `1` the application is expected to.
+#[no_mangle]
+pub extern "C" fn gpui_window_decorations(window_id: u32) -> u8 {
+    chrome_of(window_id).decorations
+}
+
+/// Tiled edges: top 1, right 2, bottom 4, left 8.
+#[no_mangle]
+pub extern "C" fn gpui_window_tiling(window_id: u32) -> u8 {
+    chrome_of(window_id).tiling
+}
+
+/// Supported controls: minimize 1, maximize 2, fullscreen 4, window menu 8.
+#[no_mangle]
+pub extern "C" fn gpui_window_controls(window_id: u32) -> u8 {
+    chrome_of(window_id).controls
+}
+
+#[no_mangle]
+pub extern "C" fn gpui_window_is_maximized(window_id: u32) -> u8 {
+    u8::from(chrome_of(window_id).maximized)
+}
+
+#[no_mangle]
+pub extern "C" fn gpui_window_is_active(window_id: u32) -> u8 {
+    u8::from(chrome_of(window_id).active)
+}
+
+/// The desktop's button layout in GNOME `button-layout` syntax
+/// (`"close:minimize,maximize"`), or `""` when the platform reports none.
+/// Free with `gpui_free_string`.
+#[no_mangle]
+pub extern "C" fn gpui_window_button_layout(window_id: u32) -> *mut c_char {
+    std::ffi::CString::new(chrome_of(window_id).button_layout)
+        .unwrap_or_default()
+        .into_raw()
+}
+
+/// Register the process-wide window-state dispatcher.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_state_dispatcher(dispatcher: window::WindowStateDispatcher) {
+    window::set_state_dispatcher(dispatcher);
+}
+
+/// Opt `window_id` into window-state delivery. Returns 1 if it exists.
+#[no_mangle]
+pub extern "C" fn gpui_on_window_state_id(window_id: u32) -> u8 {
+    u8::from(window::enable_state_dispatch(window_id))
+}
+
+/// Register the process-wide window-ACTIVATION dispatcher: called with the
+/// window's id when that window goes from inactive to active — the user
+/// came back to it from another program. Fired from the same per-frame
+/// sample as the window-state dispatcher, after it, on the event loop's
+/// thread. See `window::WindowActivatedDispatcher`.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_activated_dispatcher(
+    dispatcher: window::WindowActivatedDispatcher,
+) {
+    window::set_activated_dispatcher(dispatcher);
+}
+
+/// Opt `window_id` into activation delivery. Returns 1 if it exists.
+#[no_mangle]
+pub extern "C" fn gpui_on_window_activated_id(window_id: u32) -> u8 {
+    u8::from(window::enable_activated_dispatch(window_id))
+}
+
+/// Record an activation change as if the platform had reported it (for
+/// testing / event bridging, like `gpui_notify_window_state`): what GPUI's
+/// activation observer tells the shim the moment it happens, frame or no
+/// frame. `active` 0 marks the window as having been inactive, so the next
+/// active state sample is an activation even when no sample saw it
+/// inactive: a window on another workspace draws no frame while the user is
+/// away. Dispatches nothing itself. Returns 1 if the window exists.
+#[no_mangle]
+pub extern "C" fn gpui_notify_window_activation(window_id: u32, active: u8) -> u8 {
+    u8::from(window::note_activation(window_id, active != 0))
+}
+
+/// Record a chrome state as if the window had reported it (for testing /
+/// event bridging, like `gpui_notify_resize`). `button_layout` may be null.
+/// An `active` of 1 after 0 is an activation, delivered exactly as a live
+/// window's (`gpui_on_window_activated_id`).
+#[no_mangle]
+pub extern "C" fn gpui_notify_window_state(
+    window_id: u32,
+    decorations: u8,
+    tiling: u8,
+    controls: u8,
+    maximized: u8,
+    active: u8,
+    button_layout: *const c_char,
+) {
+    let layout = unsafe { cstr_to_str(button_layout) }.to_string();
+    window::update_chrome_state(
+        window_id,
+        window::ChromeState {
+            decorations,
+            tiling,
+            controls,
+            maximized: maximized != 0,
+            active: active != 0,
+            button_layout: layout,
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GWIN — identity, minimum size, initial state, title
+// ---------------------------------------------------------------------------
+
+/// Register a font file (TrueType/OpenType) for every launch of this process,
+/// so `font-family` can name its family. Returns 1 on success, 0 if the file
+/// cannot be read (the reason is printed to stderr). Call before `gpui_launch`.
+#[no_mangle]
+pub extern "C" fn gpui_add_font_file(path: *const c_char) -> u8 {
+    match window::add_font_file(unsafe { cstr_to_str(path) }) {
+        Ok(()) => 1,
+        Err(e) => {
+            eprintln!("gpui-nim-shim: gpui_add_font_file: {e}");
+            0
+        }
+    }
+}
+
+/// What the text system RESOLVED for the faces this process draws in, as a
+/// JSON string, or NULL before a launch has registered fonts.
+///
+/// Free with `gpui_free_string`. The same JSON is written to the file named
+/// by `GPUI_FONT_REPORT_PATH` when that variable is set, which is how a
+/// capture lane records it without having to call back into a running window.
+#[no_mangle]
+pub extern "C" fn gpui_font_report() -> *mut c_char {
+    let Some(json) = window::font_report() else {
+        return std::ptr::null_mut();
+    };
+    match std::ffi::CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// The registry id of the window `gpui_launch` is opening (valid inside the
+/// root builder and while the loop runs), 0 otherwise.
+#[no_mangle]
+pub extern "C" fn gpui_launch_window_id() -> u32 {
+    window::launch_window_id()
+}
+
+/// Before `gpui_launch`: the Wayland `app_id` / X11 `WM_CLASS`.
+#[no_mangle]
+pub extern "C" fn gpui_set_app_id(app_id: *const c_char) {
+    window::set_launch_app_id(unsafe { cstr_to_str(app_id) });
+}
+
+/// Before `gpui_launch`: the smallest content size. Non-positive clears it.
+#[no_mangle]
+pub extern "C" fn gpui_set_min_window_size(width: f64, height: f64) {
+    window::set_launch_min_size(width, height);
+}
+
+/// Before `gpui_launch`: `1` opens the window maximized (the launch size is
+/// then the restore size), `0` windowed and centred.
+#[no_mangle]
+pub extern "C" fn gpui_set_initial_window_state(maximized: u8) {
+    window::set_launch_maximized(maximized != 0);
+}
+
+/// Change a window's title; applied to the platform window on the next
+/// frame. Returns 1 if the window exists.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_title(window_id: u32, title: *const c_char) -> u8 {
+    u8::from(window::set_window_title(window_id, unsafe {
+        cstr_to_str(title)
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GWIN — window operations from outside a title-bar press
+// ---------------------------------------------------------------------------
+//
+// For a menu entry or a key binding. Each latches a request that the next
+// frame carries out on the launched window; callable from any thread.
+
+/// Minimize the window (where the platform supports it).
+#[no_mangle]
+pub extern "C" fn gpui_window_minimize() {
+    window::request_window_op(window::WindowOp::Minimize);
+}
+
+/// Maximize the window, or restore it if it is maximized.
+#[no_mangle]
+pub extern "C" fn gpui_window_toggle_maximize() {
+    window::request_window_op(window::WindowOp::ToggleMaximize);
+}
+
+/// Enter or leave fullscreen.
+#[no_mangle]
+pub extern "C" fn gpui_window_toggle_fullscreen() {
+    window::request_window_op(window::WindowOp::ToggleFullscreen);
+}
+
+/// Close the window through its normal close path: the application's close
+/// callback decides, as it does for a close the compositor asks for.
+#[no_mangle]
+pub extern "C" fn gpui_window_request_close() {
+    window::request_window_op(window::WindowOp::Close);
+}
+
 /// Reset all windows (for testing).
 #[no_mangle]
 pub extern "C" fn gpui_reset_windows() {
@@ -1089,6 +1530,44 @@ pub extern "C" fn gpui_render_plan_json(root: *mut GpuiElement) -> *mut c_char {
         Ok(cs) => cs.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+static WINDOW_CURSOR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The cursor that wins over every element's own while it is set; `None`
+/// when no gesture holds one.
+pub(crate) fn window_cursor() -> Option<String> {
+    WINDOW_CURSOR
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Set the window-level cursor (a CSS name), or clear it with null or `""`.
+/// Set while a gesture is in flight; cleared on its release and on its cancel.
+#[no_mangle]
+pub extern "C" fn gpui_set_window_cursor(name: *const c_char) {
+    let wanted = if name.is_null() {
+        None
+    } else {
+        let text = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+        (!text.is_empty()).then(|| text.into_owned())
+    };
+    let mut slot = WINDOW_CURSOR.lock().unwrap_or_else(|p| p.into_inner());
+    if *slot != wanted {
+        *slot = wanted;
+        drop(slot);
+        window::REPAINT_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The window-level cursor now set, `""` for none. Free with
+/// `gpui_free_string`.
+#[no_mangle]
+pub extern "C" fn gpui_window_cursor() -> *mut c_char {
+    std::ffi::CString::new(window_cursor().unwrap_or_default())
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Free a string returned by `gpui_render_plan_json`.
@@ -1204,24 +1683,57 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(text_size, "text_size");
         push_style!(text_color, "text_color");
         push_style!(rounded, "rounded");
+        push_style!(rounded_tl, "rounded_tl");
+        push_style!(rounded_tr, "rounded_tr");
+        push_style!(rounded_br, "rounded_br");
+        push_style!(rounded_bl, "rounded_bl");
         push_style!(items, "items");
         push_style!(justify, "justify");
         push_style!(border_width, "border_width");
         push_style!(border_color, "border_color");
+        push_style!(border_style, "border_style");
         push_style!(shadow, "shadow");
         push_style!(opacity, "opacity");
         push_style!(overflow, "overflow");
         push_style!(font_family, "font_family");
         push_style!(font_weight, "font_weight");
         push_style!(font_style, "font_style");
-        push_style!(line_height, "line_height");
+        push_style!(font_variant_numeric, "font_variant_numeric");
         push_style!(letter_spacing, "letter_spacing");
+        push_style!(text_decoration, "text_decoration");
+        push_style!(text_align, "text_align");
+        push_style!(mask_image, "mask_image");
+        push_style!(line_height, "line_height");
         push_style!(cursor, "cursor");
+        if let Some(ref name) = s.cursor {
+            if !render_sync::is_known_cursor(name) {
+                style_entries.push(format!("\"cursor_unknown\":\"{}\"", json_escape(name)));
+            }
+        }
         push_style!(display, "display");
         push_style!(position, "position");
         push_style!(white_space, "white_space");
         push_style!(text_overflow, "text_overflow");
         push_style!(flex_shrink, "flex_shrink");
+        // 2026-09-29: the styles the window now draws, so the plan says so.
+        push_style!(flex_grow, "flex_grow");
+        push_style!(flex_basis, "flex_basis");
+        push_style!(border_top_width, "border_top_width");
+        push_style!(border_right_width, "border_right_width");
+        push_style!(border_bottom_width, "border_bottom_width");
+        push_style!(border_left_width, "border_left_width");
+        push_style!(padding_top, "padding_top");
+        push_style!(padding_right, "padding_right");
+        push_style!(padding_bottom, "padding_bottom");
+        push_style!(padding_left, "padding_left");
+        push_style!(margin_top, "margin_top");
+        push_style!(margin_right, "margin_right");
+        push_style!(margin_bottom, "margin_bottom");
+        push_style!(margin_left, "margin_left");
+        push_style!(top, "top");
+        push_style!(right, "right");
+        push_style!(bottom, "bottom");
+        push_style!(left, "left");
         let styles_json = format!("{{{}}}", style_entries.join(","));
 
         let event_names: Vec<String> = plan
@@ -1497,6 +2009,96 @@ mod tests {
         assert_eq!(len, 0);
 
         gpui_destroy_element(node);
+    }
+
+    /// Decode `gpui_snapshot_tree`'s bytes as (id, parent, attributes).
+    fn decode_snapshot(bytes: &[u8]) -> Vec<(u64, u32, Vec<(String, String)>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        let zstr = |i: &mut usize| {
+            let end = bytes[*i..].iter().position(|b| *b == 0).unwrap() + *i;
+            let s = String::from_utf8(bytes[*i..end].to_vec()).unwrap();
+            *i = end + 1;
+            s
+        };
+        while i < bytes.len() {
+            let id = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+            let parent = u32::from_le_bytes(bytes[i + 8..i + 12].try_into().unwrap());
+            let count = u32::from_le_bytes(bytes[i + 12..i + 16].try_into().unwrap());
+            i += 16;
+            let mut attrs = Vec::new();
+            for _ in 0..count {
+                let name = zstr(&mut i);
+                let value = zstr(&mut i);
+                attrs.push((name, value));
+            }
+            out.push((id, parent, attrs));
+        }
+        out
+    }
+
+    #[test]
+    #[serial]
+    fn test_snapshot_tree_preorder_with_attributes() {
+        gpui_reset_tree();
+        let (div, span) = (c("div"), c("span"));
+        let root = gpui_create_element(div.as_ptr());
+        let a = gpui_create_element(span.as_ptr());
+        let a1 = gpui_create_element(span.as_ptr());
+        let b = gpui_create_element(span.as_ptr());
+        let text = c("hi");
+        let t = gpui_create_text_node(text.as_ptr());
+        gpui_append_child(root, a);
+        gpui_append_child(a, a1);
+        gpui_append_child(root, b);
+        gpui_append_child(b, t);
+        let (zn, one, an, two, en, blank) =
+            (c("z-name"), c("1"), c("a-name"), c("two"), c("empty"), c(""));
+        gpui_set_attribute(a, zn.as_ptr(), one.as_ptr());
+        gpui_set_attribute(a, an.as_ptr(), two.as_ptr());
+        gpui_set_attribute(b, en.as_ptr(), blank.as_ptr());
+        // The shim's own storage (`__text_content`) is not an attribute here.
+        let words = c("words");
+        gpui_set_text_content(a1, words.as_ptr());
+
+        let needed = gpui_snapshot_tree(root, std::ptr::null_mut(), 0);
+        let mut buf = vec![0xffu8; needed as usize];
+        assert_eq!(gpui_snapshot_tree(root, buf.as_mut_ptr(), needed), needed);
+        let nodes = decode_snapshot(&buf);
+        let ids: Vec<u64> = nodes.iter().map(|n| n.0).collect();
+        // Pre-order, children in child order: root, a, a1, b, the text node.
+        assert_eq!(ids, vec![gpui_node_id(root), gpui_node_id(a), gpui_node_id(a1),
+                             gpui_node_id(b), gpui_node_id(t)]);
+        let parents: Vec<u32> = nodes.iter().map(|n| n.1).collect();
+        assert_eq!(parents, vec![u32::MAX, 0, 1, 0, 3]);
+        // Attributes in name order, an empty value kept; none on the rest.
+        assert_eq!(nodes[1].2, vec![("a-name".to_string(), "two".to_string()),
+                                    ("z-name".to_string(), "1".to_string())]);
+        assert_eq!(nodes[3].2, vec![("empty".to_string(), String::new())]);
+        assert!(nodes[0].2.is_empty() && nodes[2].2.is_empty() && nodes[4].2.is_empty());
+
+        // A short buffer is filled as far as it goes, and still told the size.
+        let mut short = vec![0xffu8; 4];
+        assert_eq!(gpui_snapshot_tree(root, short.as_mut_ptr(), 4), needed);
+        assert_eq!(&short[..], &buf[..4]);
+
+        // A subtree is snapshotted from its own root.
+        let sub_needed = gpui_snapshot_tree(a, std::ptr::null_mut(), 0);
+        let mut sub = vec![0u8; sub_needed as usize];
+        gpui_snapshot_tree(a, sub.as_mut_ptr(), sub_needed);
+        let sub_nodes = decode_snapshot(&sub);
+        assert_eq!(sub_nodes.len(), 2);
+        assert_eq!(sub_nodes[0].1, u32::MAX);
+        assert_eq!(sub_nodes[1].1, 0);
+
+        // An id becomes a handle to the same node; an unknown id, null.
+        let h = gpui_element_of_node_id(gpui_node_id(b));
+        assert!(!h.is_null());
+        assert_eq!(gpui_node_id(h), gpui_node_id(b));
+        assert!(gpui_element_of_node_id(u64::MAX).is_null());
+        assert_eq!(gpui_snapshot_tree(std::ptr::null_mut(), std::ptr::null_mut(), 0), 0);
+
+        gpui_destroy_tree(root);
     }
 
     #[test]
@@ -2075,6 +2677,55 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_window_activation_through_the_c_abi() {
+        // The exported path end to end: the dispatcher and the opt-in as a
+        // host registers them, the bridging entry point standing in for the
+        // per-frame sample, and the activation read back through the query.
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static LAST: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn on_activated(id: u32) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            LAST.store(id, Ordering::SeqCst);
+        }
+        gpui_reset_windows();
+        CALLS.store(0, Ordering::SeqCst);
+        gpui_set_window_activated_dispatcher(on_activated);
+        let title = c("activated");
+        let id = gpui_create_window(title.as_ptr(), 100.0, 100.0);
+        assert_eq!(gpui_on_window_activated_id(id), 1);
+        assert_eq!(gpui_on_window_activated_id(999), 0);
+        let layout = c(":close");
+        // Inactive -> active: delivered, once.
+        gpui_notify_window_state(id, 0, 0, 15, 0, 0, layout.as_ptr());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+        gpui_notify_window_state(id, 0, 0, 15, 0, 1, layout.as_ptr());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(LAST.load(Ordering::SeqCst), id);
+        assert_eq!(gpui_window_is_active(id), 1);
+        // Active -> active (a maximize) and active -> inactive: not edges.
+        gpui_notify_window_state(id, 0, 0, 15, 1, 1, layout.as_ptr());
+        gpui_notify_window_state(id, 0, 0, 15, 1, 0, std::ptr::null());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        // Back again: the second activation.
+        gpui_notify_window_state(id, 0, 0, 15, 1, 1, std::ptr::null());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        // Away while HIDDEN: the observer reports the deactivation and no
+        // frame samples it, so the next sample reads active after active.
+        // That is still a return, delivered once and by the sample.
+        assert_eq!(gpui_notify_window_activation(id, 0), 1);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(gpui_notify_window_activation(id, 1), 1);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        gpui_notify_window_state(id, 0, 0, 15, 1, 1, std::ptr::null());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        gpui_notify_window_state(id, 0, 0, 15, 1, 1, std::ptr::null());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        assert_eq!(gpui_notify_window_activation(999, 0), 0);
+        gpui_reset_windows();
+    }
+
+    #[test]
+    #[serial]
     #[cfg(not(feature = "gpui-backend"))]
     fn test_launch_callback() {
         gpui_reset_tree();
@@ -2100,6 +2751,20 @@ mod tests {
         assert_eq!(BUILDER_CALLED.load(Ordering::SeqCst), 1);
         // Root + span child = 2 nodes
         assert_eq!(gpui_tree_node_count(), 2);
+    }
+
+    /// `gpui_has_window_backend` answers for the feature this very test
+    /// binary was compiled with, in both directions: the default lane
+    /// (`cargo test`) checks the 0 a featureless build must report, and
+    /// `cargo test --features gpui-backend` checks the 1. The expected value
+    /// is spelled per `cfg` rather than computed with `cfg!`, so the test
+    /// does not restate the implementation it is checking.
+    #[test]
+    fn test_has_window_backend_matches_the_build() {
+        #[cfg(feature = "gpui-backend")]
+        assert_eq!(gpui_has_window_backend(), 1);
+        #[cfg(not(feature = "gpui-backend"))]
+        assert_eq!(gpui_has_window_backend(), 0);
     }
 
     // -----------------------------------------------------------------------

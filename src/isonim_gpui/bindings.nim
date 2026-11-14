@@ -20,31 +20,25 @@ type
 const shimTargetDir = currentSourcePath().parentDir.parentDir.parentDir /
   "rust" / "target" / "debug"
 
+const gpuiShimPath {.strdefine.} = ""
+  ## `-d:gpuiShimPath=<file>` pins the shim this binary loads to one file
+  ## on every platform. Featureless and windowed tests can then coexist
+  ## without swapping the shared `rust/target/debug` library beneath users.
+
 when defined(macosx):
-  const localShimLib = shimTargetDir / "libgpui_nim_shim.dylib"
-  when fileExists(localShimLib):
-    const shimLib = localShimLib
-  else:
-    const shimLib = "libgpui_nim_shim.dylib"
+  const shimFileName = "libgpui_nim_shim.dylib"
 elif defined(windows):
-  const localShimLib = shimTargetDir / "gpui_nim_shim.dll"
-  when fileExists(localShimLib):
-    const shimLib = localShimLib
-  else:
-    const shimLib = "gpui_nim_shim.dll"
+  const shimFileName = "gpui_nim_shim.dll"
 else:
-  const gpuiShimPath {.strdefine.} = ""
-    ## `-d:gpuiShimPath=<file>` pins the shim this binary loads to one file,
-    ## instead of the shared `rust/target/debug` one. A window lane that needs
-    ## the WINDOWED shim builds its binary with this rather than swapping the
-    ## shared file under every other process that loads it.
-  const localShimLib = shimTargetDir / "libgpui_nim_shim.so"
-  when gpuiShimPath.len > 0:
-    const shimLib = gpuiShimPath
-  elif fileExists(localShimLib):
-    const shimLib = localShimLib
-  else:
-    const shimLib = "libgpui_nim_shim.so"
+  const shimFileName = "libgpui_nim_shim.so"
+
+const localShimLib = shimTargetDir / shimFileName
+when gpuiShimPath.len > 0:
+  const shimLib = gpuiShimPath
+elif fileExists(localShimLib):
+  const shimLib = localShimLib
+else:
+  const shimLib = shimFileName
 
 # --- The event payload (PLAT-38) ---
 
@@ -71,6 +65,21 @@ const
   GpuiEventOther* = 0'u32
   GpuiEventKeyDown* = 1'u32
   GpuiEventKeyUp* = 2'u32
+  GpuiEventPointerDown* = 3'u32
+    ## The left button went down; the key is `"x,y"`, the window position.
+  GpuiEventPointerMove* = 4'u32
+    ## The pointer moved; the key is `"x,y"`.
+  GpuiEventPointerUp* = 5'u32
+    ## The left button came up; the key is `"x,y"`.
+  GpuiEventPointerWheel* = 6'u32
+    ## The wheel turned; the key is `"x,y,dx,dy"` (the delta in pixels).
+  GpuiEventPointerContext* = 7'u32
+    ## The RIGHT button went down (`contextmenu`); the key is `"x,y"`.
+  GpuiEventPointerAux* = 8'u32
+    ## The MIDDLE button went down (`auxdown`); the key is `"x,y"`.
+  GpuiEventModifiers* = 9'u32
+    ## The held modifiers changed (`modifierschange`) — a modifier pressed or
+    ## released on its own; the modifiers are the NEW set, the key is empty.
 
   GpuiModControl* = 1'u32 shl 0
   GpuiModAlt* = 1'u32 shl 1
@@ -97,6 +106,14 @@ type WindowResizeDispatcher* = proc(windowId: uint32; width: cdouble;
                                      height: cdouble) {.cdecl.}
 type WindowFocusDispatcher* = proc(windowId: uint32; focused: uint8) {.cdecl.}
 type WindowCloseDispatcher* = proc(windowId: uint32): uint8 {.cdecl.}
+type WindowStateDispatcher* = proc(windowId: uint32) {.cdecl.}
+  ## GWIN: the window's chrome state changed; read it back with the
+  ## `gpui_window_*` queries.
+type WindowActivatedDispatcher* = proc(windowId: uint32) {.cdecl.}
+  ## The window went from inactive to active (`gpui_window_is_active` 0 then
+  ## 1): the user came back to it from another program. An EDGE — not every
+  ## chrome change, and not the per-frame keyboard focus `gpui_notify_focus`
+  ## reports.
 
 {.push cdecl, dynlib: shimLib.}
 
@@ -127,6 +144,14 @@ proc gpui_remove_attribute*(node: GpuiElement; name: cstring)
 
 proc gpui_set_text_content*(node: GpuiElement; text: cstring)
   {.importc: "gpui_set_text_content".}
+
+proc gpui_set_image_rgba*(node: GpuiElement; data: pointer; len: csize_t;
+                          width, height: uint32): cint
+  {.importc: "gpui_set_image_rgba".}
+  ## The pixels an `img` element shows: `width * height` RGBA8888 pixels,
+  ## `len` bytes, copied; stretched to the element's box. Answers 1 when
+  ## they were set, 0 when they were refused (the element then draws its
+  ## placeholder).
 
 proc gpui_set_style*(node: GpuiElement; prop, value: cstring)
   {.importc: "gpui_set_style".}
@@ -160,6 +185,16 @@ proc gpui_parent_node*(node: GpuiElement): GpuiElement
 proc gpui_launch*(title: cstring; width, height: cdouble;
                   root_builder: RootBuilderCallback)
   {.importc: "gpui_launch".}
+
+proc gpui_has_window_backend*(): uint8
+  {.importc: "gpui_has_window_backend".}
+  ## 1 if the loaded shim was built with `--features gpui-backend`, so
+  ## `gpui_launch` opens a real window and blocks until it closes; 0 if it
+  ## was not, in which case `gpui_launch` only builds the shadow tree and
+  ## RETURNS — indistinguishable, afterwards, from a window the user closed.
+  ## Ask before `gpui_launch` and refuse by name when a window is the point
+  ## (see `display_session` for the other way a launch shows nothing: no
+  ## graphical session on Linux). Present in every build of the shim.
 
 proc gpui_dispatch_event*(node: GpuiElement; event: cstring)
   {.importc: "gpui_dispatch_event".}
@@ -208,6 +243,19 @@ proc gpui_key_latency_count*(): uint64 {.importc: "gpui_key_latency_count".}
 proc gpui_key_latency_ns*(index: uint64): uint64
   {.importc: "gpui_key_latency_ns".}
 proc gpui_frame_stats_reset*() {.importc: "gpui_frame_stats_reset".}
+
+# --- laid-out bounds (CTF-P1b) ---
+#
+# Where the window laid an element out, read off GPUI's own layout. Only an
+# element carrying the attribute `data-layout-probe` is recorded; see the
+# shim's `layout_bounds` module for what exactly is measured (the border box,
+# window coordinates, logical pixels).
+
+proc gpui_layout_bounds*(node: GpuiElement; outXywh: ptr array[4, float64]): uint8
+  {.importc: "gpui_layout_bounds".}
+  ## Writes x, y, width, height to `outXywh` and answers 1, or answers 0 for
+  ## an element no frame has laid out (or that did not opt in).
+proc gpui_layout_bounds_reset*() {.importc: "gpui_layout_bounds_reset".}
 
 # --- the element store, read back ---
 
@@ -326,6 +374,18 @@ proc gpui_get_text_content*(node: GpuiElement; buf: pointer; bufLen: uint64): ui
 proc gpui_get_attribute*(node: GpuiElement; name: cstring; buf: pointer; bufLen: uint64): uint64
   {.importc: "gpui_get_attribute".}
 
+proc gpui_snapshot_tree*(root: GpuiElement; buf: pointer; bufLen: uint64): uint64
+  {.importc: "gpui_snapshot_tree".}
+  ## The subtree under `root` in pre-order: per node its id (u64), its
+  ## parent's index (u32, `high(uint32)` for `root`), its attribute count
+  ## (u32), all little-endian, then each attribute as `name\0value\0` (not
+  ## the shim's own `__`-prefixed ones); the size the whole encoding needs.
+  ## `renderer.snapshotTree` wraps it.
+
+proc gpui_element_of_node_id*(id: uint64): GpuiElement
+  {.importc: "gpui_element_of_node_id".}
+  ## A handle for the node `id` names, nil when it is not in the tree.
+
 proc gpui_nth_child*(node: GpuiElement; index: uint64): GpuiElement
   {.importc: "gpui_nth_child".}
 
@@ -389,6 +449,15 @@ proc gpui_quit_requested*(): uint8
   {.importc: "gpui_quit_requested".}
   ## 1 if a quit is latched and not yet consumed. Observation only.
 
+type GpuiTickCallback* = proc() {.cdecl.}
+  ## A host's periodic callback (`gpui_set_tick`).
+
+proc gpui_set_tick*(interval_ms: uint32; callback: GpuiTickCallback)
+  {.importc: "gpui_set_tick".}
+  ## Run `callback` every `interval_ms` ms on the event loop's main thread,
+  ## then repaint; `0` or `nil` disarms. For state that moves without input
+  ## — a repository's working tree, re-read on a clock.
+
 proc gpui_on_resize*(window_id: uint32; callback: ResizeCallback)
   {.importc: "gpui_on_resize".}
 
@@ -424,12 +493,123 @@ proc gpui_notify_resize*(window_id: uint32; width, height: cdouble)
 proc gpui_notify_focus*(window_id: uint32; focused: uint8)
   {.importc: "gpui_notify_focus".}
 
+# --- GWIN: window chrome state ---
+
+proc gpui_window_decorations*(window_id: uint32): uint8
+  {.importc: "gpui_window_decorations".}
+  ## 0: the compositor draws the frame. 1: the application is expected to.
+
+proc gpui_window_tiling*(window_id: uint32): uint8
+  {.importc: "gpui_window_tiling".}
+  ## Tiled edges: top 1, right 2, bottom 4, left 8.
+
+proc gpui_window_controls*(window_id: uint32): uint8
+  {.importc: "gpui_window_controls".}
+  ## Supported controls: minimize 1, maximize 2, fullscreen 4, window menu 8.
+
+proc gpui_window_is_maximized*(window_id: uint32): uint8
+  {.importc: "gpui_window_is_maximized".}
+
+proc gpui_window_is_active*(window_id: uint32): uint8
+  {.importc: "gpui_window_is_active".}
+
+proc gpui_window_button_layout*(window_id: uint32): pointer
+  {.importc: "gpui_window_button_layout".}
+  ## GNOME `button-layout` syntax, `""` when unknown. Free with
+  ## `gpui_free_string`.
+
+proc gpui_set_window_state_dispatcher*(dispatcher: WindowStateDispatcher)
+  {.importc: "gpui_set_window_state_dispatcher".}
+
+proc gpui_on_window_state_id*(window_id: uint32): uint8
+  {.importc: "gpui_on_window_state_id".}
+
+proc gpui_set_window_activated_dispatcher*(
+    dispatcher: WindowActivatedDispatcher)
+  {.importc: "gpui_set_window_activated_dispatcher".}
+
+proc gpui_on_window_activated_id*(window_id: uint32): uint8
+  {.importc: "gpui_on_window_activated_id".}
+  ## Opt `window_id` into activation delivery; 1 if the window exists.
+
+proc gpui_notify_window_activation*(window_id: uint32; active: uint8): uint8
+  {.importc: "gpui_notify_window_activation".}
+  ## Bridging, like `gpui_notify_window_state`: the platform's activation
+  ## report as it happens, frame or no frame. An `active` of 0 makes the next
+  ## active state sample an activation even if no sample saw the window
+  ## inactive (a window on another workspace draws nothing while the user is
+  ## away). Dispatches nothing itself; 1 if the window exists.
+
+proc gpui_notify_window_state*(window_id: uint32; decorations, tiling,
+                               controls, maximized, active: uint8;
+                               button_layout: cstring)
+  {.importc: "gpui_notify_window_state".}
+  ## Record a chrome state as if the window reported it (tests, bridging).
+
+# --- GWIN: identity, minimum size, initial state, title ---
+
+proc gpui_add_font_file*(path: cstring): uint8
+  {.importc: "gpui_add_font_file".}
+  ## Before `gpui_launch`: register a TrueType/OpenType file so `font-family`
+  ## can name its family. 1 on success, 0 if unreadable.
+
+proc gpui_font_report*(): pointer
+  {.importc: "gpui_font_report".}
+  ## What the text system RESOLVED for the faces this process draws in, as
+  ## JSON; nil before a launch has registered fonts. Free with
+  ## `gpui_free_string`. Also written to `GPUI_FONT_REPORT_PATH` when set.
+
+proc gpui_launch_window_id*(): uint32
+  {.importc: "gpui_launch_window_id".}
+  ## The window `gpui_launch` is opening: valid inside the root builder and
+  ## while the loop runs, 0 otherwise.
+
+proc gpui_set_app_id*(app_id: cstring)
+  {.importc: "gpui_set_app_id".}
+  ## Before `gpui_launch`.
+
+proc gpui_set_min_window_size*(width, height: cdouble)
+  {.importc: "gpui_set_min_window_size".}
+  ## Before `gpui_launch`. Non-positive clears it.
+
+proc gpui_set_initial_window_state*(maximized: uint8)
+  {.importc: "gpui_set_initial_window_state".}
+  ## Before `gpui_launch`.
+
+proc gpui_set_window_title*(window_id: uint32; title: cstring): uint8
+  {.importc: "gpui_set_window_title".}
+
+# --- GWIN: window operations from outside a title-bar press ---
+
+proc gpui_window_minimize*()
+  {.importc: "gpui_window_minimize".}
+
+proc gpui_window_toggle_maximize*()
+  {.importc: "gpui_window_toggle_maximize".}
+
+proc gpui_window_toggle_fullscreen*()
+  {.importc: "gpui_window_toggle_fullscreen".}
+
+proc gpui_window_request_close*()
+  {.importc: "gpui_window_request_close".}
+  ## Close through the normal close path: the close callback decides.
+
 proc gpui_reset_windows*()
   {.importc: "gpui_reset_windows".}
 
 # ===========================================================================
 # Render plan inspection
 # ===========================================================================
+
+proc gpui_set_window_cursor*(name: cstring)
+  {.importc: "gpui_set_window_cursor".}
+  ## The cursor that wins over every element's own: a CSS name, or `""` to
+  ## clear it.
+
+proc gpui_window_cursor*(): pointer
+  {.importc: "gpui_window_cursor".}
+  ## The window-level cursor now set, `""` for none. Free with
+  ## `gpui_free_string`.
 
 proc gpui_render_plan_json*(root: GpuiElement): pointer
   {.importc: "gpui_render_plan_json".}
@@ -526,6 +706,13 @@ proc gpui_render_cancel*(token: cuint)
 # process-wide.
 proc gpui_bump_generation*(): uint64
   {.importc: "gpui_bump_generation".}
+
+# PLAT-50 (CodeTracer): the system clipboard, for a click that copies
+# (`clipboard.rs`): the text is taken by GPUI's platform clipboard on the next
+# frame; the last text written is readable back.
+proc gpui_write_clipboard*(text: cstring) {.importc: "gpui_write_clipboard".}
+proc gpui_clipboard_text*(buf: pointer; bufLen: uint64): uint64
+  {.importc: "gpui_clipboard_text".}
 
 {.pop.}
 

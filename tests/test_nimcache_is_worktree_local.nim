@@ -48,11 +48,14 @@ const
 
 var failures = 0
 
-proc fail(msg: string) =
+# NOT `fail` / `pass`: this is not a `unittest` suite, and a helper spelled
+# like `unittest.fail` is what `tools/trap13-assertion-helper-sweep.py`
+# (rightly) reports as an assertion inside a plain proc.
+proc recordFailure(msg: string) =
   inc failures
   echo "  FAIL  ", msg
 
-proc pass(msg: string) =
+proc recordPass(msg: string) =
   echo "  ok    ", msg
 
 proc comparable(p: string): string =
@@ -112,19 +115,19 @@ proc nimcacheOf(workDir, project: string; extra: seq[string] = @[];
     code = p.waitForExit()
     p.close()
   except CatchableError as e:
-    fail("could not run " & what & ": " & e.msg)
+    recordFailure("could not run " & what & ": " & e.msg)
     return ""
   if code != 0:
-    fail(what & " exited " & $code & ":\n" & output)
+    recordFailure(what & " exited " & $code & ":\n" & output)
     return ""
   for line in output.splitLines():
     if line.startsWith("{"):
       try:
         return parseJson(line)["nimcache"].getStr()
       except CatchableError as e:
-        fail(what & " printed unparseable JSON (" & e.msg & "): " & line)
+        recordFailure(what & " printed unparseable JSON (" & e.msg & "): " & line)
         return ""
-  fail(what & " printed no JSON:\n" & output)
+  recordFailure(what & " printed no JSON:\n" & output)
   ""
 
 proc expectedFor(projectRel, suffix: string): string =
@@ -139,21 +142,21 @@ proc checkLayout(label, got, want: string) =
   if got.len == 0:
     return # the probe failure is already recorded
   if not isInside(got, root):
-    fail(label & ": resolves OUTSIDE the checkout, to " & got &
+    recordFailure(label & ": resolves OUTSIDE the checkout, to " & got &
          " -- a cache every checkout on this machine shares")
   elif not sameDir(got, want):
-    fail(label & ": resolves to " & got & ", not the documented " & want)
+    recordFailure(label & ": resolves to " & got & ", not the documented " & want)
   else:
-    pass(label & " -> " & relativePath(got, root))
+    recordPass(label & " -> " & relativePath(got, root))
 
 let selfRel = relativePath(selfFile, root).replace('\\', '/')
 
 # ---------------------------------------------------------------------------
 echo "nimcache-locality: [1] the cache this test binary was compiled with"
 if isInside(SelfNimcache, root):
-  pass("this binary was compiled in " & relativePath(SelfNimcache, root))
+  recordPass("this binary was compiled in " & relativePath(SelfNimcache, root))
 else:
-  fail("this test binary was compiled with the nimcache " & SelfNimcache &
+  recordFailure("this test binary was compiled with the nimcache " & SelfNimcache &
        ", OUTSIDE the checkout: whatever built it bypassed config.nims " &
        "without naming a checkout-local --nimcache:")
 
@@ -166,7 +169,7 @@ checkLayout(selfRel & " (from its own directory)",
             expectedFor(selfRel, "_d"))
 for m in MainModules:
   if not fileExists(root / m):
-    fail(m & ": listed as a main module to probe, but it does not exist")
+    recordFailure(m & ": listed as a main module to probe, but it does not exist")
     continue
   checkLayout(m & " (debug)", nimcacheOf(root, m), expectedFor(m, "_d"))
   checkLayout(m & " (-d:release)", nimcacheOf(root, m, @["-d:release"]),
@@ -176,9 +179,9 @@ let explicitDir = getTempDir() / "nimcache-locality-explicit"
 let explicitGot = nimcacheOf(root, selfRel, @["--nimcache:" & explicitDir])
 if explicitGot.len > 0:
   if sameDir(explicitGot, explicitDir):
-    pass("an explicit --nimcache: on the command line still wins")
+    recordPass("an explicit --nimcache: on the command line still wins")
   else:
-    fail("an explicit --nimcache:" & explicitDir & " resolved to " &
+    recordFailure("an explicit --nimcache:" & explicitDir & " resolved to " &
          explicitGot & ": the config overrides the command line")
 
 # ---------------------------------------------------------------------------
@@ -191,7 +194,7 @@ controlEnv["XDG_CACHE_HOME"] = fakeXdg
 let controlGot = nimcacheOf(root, selfRel, @["--skipParentCfg"], controlEnv)
 if controlGot.len > 0:
   if isInside(controlGot, root):
-    fail("CONTROL did not fail: with the repo-root config switched off the " &
+    recordFailure("CONTROL did not fail: with the repo-root config switched off the " &
          "probe still reports " & controlGot & ", inside the checkout -- so " &
          "it cannot tell a shared cache from a local one, and every verdict " &
          "above is vacuous")
@@ -199,13 +202,13 @@ if controlGot.len > 0:
     when defined(posix):
       let want = fakeXdg / "nim" / (selfFile.splitFile.name & "_d")
       if sameDir(controlGot, want):
-        pass("with the config off, this file resolves to Nim's shared " &
+        recordPass("with the config off, this file resolves to Nim's shared " &
              "default " & controlGot)
       else:
-        fail("CONTROL resolved outside the checkout but not to Nim's " &
+        recordFailure("CONTROL resolved outside the checkout but not to Nim's " &
              "default formula ($XDG_CACHE_HOME/nim/<project>_d): " & controlGot)
     else:
-      pass("with the config off, this file resolves outside the checkout: " &
+      recordPass("with the config off, this file resolves outside the checkout: " &
            controlGot)
 
 if failures > 0:
