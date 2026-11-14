@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | in progress: the manager's decision of 2026-11-12 (below) is implemented, unverified on macOS; closes when a macOS CI lane passes `cargo test --features gpui-headless` with it |
+| Status | resolved 2026-11-14: the manager's decision of 2026-11-12 (below) passed on macOS CI at `5ab25b3` — see "Resolution" |
 | Recorded | 2026-10-02 |
 | Observed in | isonim-gpui @ `4b3ed3e` (`agents`), aarch64-darwin (macOS 15), shim built `--features gpui-headless` |
 | Area | `rust/gpui-nim-shim/src/gpui_headless.rs` `spawn_worker` / `worker_main` / `render_via_cached`; the lane step `rust: cargo test --features gpui-headless` in `ci/run-suite.sh --with-gpui` |
@@ -234,3 +234,27 @@ x86_64-linux only, where the macOS arms do not compile; whether the worker's
 remaining path (`HeadlessAppContext::with_platform`, the Metal headless
 renderer) is free of further main-thread requirements is read from the gpui
 sources, not observed.
+
+## Resolution (2026-11-14)
+
+The closing condition above is met. On PR #10 (`agents-to-dev-2026-11-08`),
+CI run [43307312907](https://github.com/metacraft-labs/isonim-gpui/actions/runs/43307312907)
+at `5ab25b3` ran both macOS legs green on aarch64-darwin:
+
+- **"Suite incl. GPUI (Array)"**, runner `m3-mcl-005`
+  (job 131493915326): `ci/run-suite.sh --with-gpui` reported
+  `rust: --features gpui-headless rc=0 cases=261` and
+  `LANE RESULT: OK — 403 cases, 0 failing steps`. The `test_async_render`
+  target in that step reported `running 7 tests` /
+  `test result: ok. 7 passed; 0 failed`, so the two cases this issue was
+  filed for (`async_render_produces_non_empty_buffer`,
+  `async_submit_is_non_blocking`) now return `0` instead of `-6`, with their
+  assertions unchanged.
+- **"Suite (Array)"**, runner `m3-mcl-002` (job 131493915409):
+  `LANE RESULT: OK — 403 cases, 0 failing steps`. This leg runs without
+  `--with-gpui`, so it does not exercise the async path; it shows the change
+  left the non-GPUI macOS lane green.
+
+That also answers the open question in the decision: the worker's remaining
+path (`HeadlessAppContext::with_platform`, the Metal headless renderer) has
+no further main-thread requirement that these seven cases reach.

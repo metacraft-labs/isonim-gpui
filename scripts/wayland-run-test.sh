@@ -248,7 +248,8 @@ COMPOSITOR_LOG="$XDG_RUNTIME_DIR/$COMPOSITOR.log"
 # --- The session bus (headless) ---------------------------------------
 #
 # Headless: a PRIVATE session bus, started here from the dev shell's own
-# dbus with the dev shell's own `session.conf`. Without it the run depends
+# dbus with a configuration written here (see "THE BUS ACTIVATES NOTHING"
+# below). Without it the run depends
 # on the host in a way nothing in this repository declares:
 #
 #   * nixpkgs' `sway` is a wrapper that, when DBUS_SESSION_BUS_ADDRESS is
@@ -267,6 +268,33 @@ COMPOSITOR_LOG="$XDG_RUNTIME_DIR/$COMPOSITOR.log"
 # present" branch and execs sway itself, so COMPOSITOR_PID stays sway's
 # PID and the cleanup below stops the compositor and this bus separately.
 #
+# THE BUS ACTIVATES NOTHING. Its configuration is written here rather than
+# taken from the dev shell's `session.conf`, because that file is not
+# self-contained: it declares `<standard_session_servicedirs/>`, i.e. every
+# `dbus-1/services` directory on `XDG_DATA_DIRS` -- which inherits the
+# host's `/run/current-system/sw/share` -- and it includes
+# `/etc/dbus-1/session.conf`, a host file again. So whatever D-Bus services
+# the host has installed became activatable on this "private" bus. On a
+# host with xdg-desktop-portal installed -- the CI runner of the run cited
+# below is one, while a host without it never showed the defect -- GPUI's
+# startup query of the Settings portal (`gpui_linux`'s xdg_desktop_portal)
+# activated `xdg-desktop-portal`, which activated `xdg-document-portal`,
+# which mounted a FUSE filesystem at `$XDG_RUNTIME_DIR/doc`. Stopping the
+# bus ends the portal, its mount goes stale, and the `rm -rf` below fails
+# on it (isonim-gpui CI run 43307312907, 2026-11-12):
+#     rm: cannot remove '/tmp/isonim-gpui-wl-127zFd/doc/by-app':
+#         Transport endpoint is not connected
+# leaving the runtime directory behind and failing the lane after every
+# test had passed. It also made the run host-dependent in the way the
+# private bus exists to prevent: GPUI's appearance settings came from
+# whatever portal the host provided, or from none.
+#
+# Nothing this harness runs needs an activatable service, so the bus has
+# no service directories at all: a client asking for one gets
+# `ServiceUnknown` (GPUI then uses its built-in defaults), the same answer
+# on every host. The policy is the permissive one of the stock session bus
+# (`dbus-daemon(1)`, CONFIGURATION FILE; the dev shell's `session.conf`).
+#
 # Nested (`--window`): keep the host's bus, for the reason the runtime
 # directory above is kept.
 DBUS_DAEMON_PID=""
@@ -282,18 +310,31 @@ if [[ "$USE_HEADLESS" == "1" ]]; then
     rm -rf "$XDG_RUNTIME_DIR"
     exit 1
   fi
-  _dbus_session_conf="$(dirname "$(readlink -f "$_dbus_daemon")")/../share/dbus-1/session.conf"
-  if [[ ! -f "$_dbus_session_conf" ]]; then
-    echo "Error: no session.conf beside $_dbus_daemon (looked for $_dbus_session_conf)" >&2
-    rm -rf "$XDG_RUNTIME_DIR"
-    exit 1
-  fi
+  # No <servicedir>, no <standard_session_servicedirs/> and no <include>:
+  # see "THE BUS ACTIVATES NOTHING" above. The heredoc expands only
+  # `$XDG_RUNTIME_DIR`, which `mktemp` above made of characters that need
+  # no XML escaping.
+  _dbus_conf="$XDG_RUNTIME_DIR/dbus-session.conf"
+  cat >"$_dbus_conf" <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <keep_umask/>
+  <listen>unix:path=$XDG_RUNTIME_DIR/bus</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+EOF
   # `--fork` returns once the bus is listening; the address is printed
   # first and the PID second (dbus-daemon(1), --print-address/--print-pid).
-  if ! _dbus_out="$(dbus-daemon --config-file="$_dbus_session_conf" \
-    --address="unix:path=$XDG_RUNTIME_DIR/bus" --nopidfile --fork \
-    --print-address=1 --print-pid=1)"; then
-    echo "Error: could not start a private session bus with $_dbus_session_conf" >&2
+  if ! _dbus_out="$(dbus-daemon --config-file="$_dbus_conf" \
+    --nopidfile --fork --print-address=1 --print-pid=1)"; then
+    echo "Error: could not start a private session bus with $_dbus_conf" >&2
     rm -rf "$XDG_RUNTIME_DIR"
     exit 1
   fi
