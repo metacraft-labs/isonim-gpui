@@ -582,6 +582,25 @@ proc layoutBounds*(node: GpuiElement;
   h = xywh[3]
   true
 
+const EllipsisTrimAttribute* = "data-ellipsis-trim"
+  ## The attribute an element that declares `text-overflow` names, one
+  ## character each, what its cut drops from the end of what it keeps
+  ## before the ellipsis, besides whitespace (`"·—"`: `a · b` cut after the
+  ## `·` reads `a…`, not `a ·…`). See the shim's `cut_text` module.
+
+proc drawnText*(node: GpuiElement): string =
+  ## The text an element that declares `text-overflow` drew in the latest
+  ## frame: whole, or cut and ended with the ellipsis. Empty for an element
+  ## no frame has drawn such a text for, or in a build without the GPUI
+  ## backend. See the shim's `cut_text` module.
+  if node == nil: return ""
+  let needed = gpui_drawn_text(node, nil, 0)
+  if needed == 0: return ""
+  var buf = newString(int(needed) + 1)
+  discard gpui_drawn_text(node, addr buf[0], uint64(buf.len))
+  buf.setLen(int(needed))
+  buf
+
 proc textContent*(node: GpuiElement): string =
   let needed = gpui_get_text_content(node, nil, 0)
   if needed == 0:

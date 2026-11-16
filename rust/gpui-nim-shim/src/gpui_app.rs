@@ -1019,10 +1019,30 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
             // glyph by glyph; an element child sets its own, as it is not
             // passed down (GPUI's inherited text style has no such field).
             let spacing = plan.styles.letter_spacing.as_deref().and_then(parse_letter_spacing);
+            // A text this element cuts (`text-overflow`) is drawn by
+            // `CutText`, which drops the characters the element names in
+            // `data-ellipsis-trim` before the ellipsis and records what it
+            // drew (`cut_text.rs`). A letter-spaced text is never cut
+            // (`SpacedText`), so spacing keeps its own element.
+            let cuts = plan.styles.text_overflow.is_some() && spacing.is_none();
+            let own_text = |text: String| -> AnyElement {
+                if cuts {
+                    crate::cut_text::CutText::new(
+                        text,
+                        crate::cut_text::trim_chars_of(&plan.attributes),
+                        plan.node_id,
+                    )
+                    .into_any_element()
+                } else {
+                    text_with_spacing(text, spacing)
+                }
+            };
             // Add children
             for child in &plan.children {
-                el = if spacing.is_some() && child.kind == crate::tree::GpuiElementKind::TextNode {
-                    el.child(text_with_spacing(child.text.clone().unwrap_or_default(), spacing))
+                el = if child.kind == crate::tree::GpuiElementKind::TextNode
+                    && (spacing.is_some() || cuts)
+                {
+                    el.child(own_text(child.text.clone().unwrap_or_default()))
                 } else {
                     el.child(render_plan_to_gpui(child))
                 };
@@ -1031,7 +1051,7 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
             // If the node has direct text content, add it as a child
             if let Some(ref text) = plan.text {
                 if !text.is_empty() {
-                    el = el.child(text_with_spacing(text.clone(), spacing));
+                    el = el.child(own_text(text.clone()));
                 }
             }
         }

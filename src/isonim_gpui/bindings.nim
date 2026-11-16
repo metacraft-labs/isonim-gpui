@@ -257,6 +257,19 @@ proc gpui_layout_bounds*(node: GpuiElement; outXywh: ptr array[4, float64]): uin
   ## an element no frame has laid out (or that did not opt in).
 proc gpui_layout_bounds_reset*() {.importc: "gpui_layout_bounds_reset".}
 
+# --- drawn text ---
+#
+# What an element that declares `text-overflow` drew in the latest frame:
+# its text whole, or cut with the ellipsis. The cut is made during layout,
+# so the plan cannot say it; see the shim's `cut_text` module (and
+# `data-ellipsis-trim`, the characters a cut drops before the ellipsis).
+
+proc gpui_drawn_text*(node: GpuiElement; buf: pointer; bufLen: uint64): uint64
+  {.importc: "gpui_drawn_text".}
+  ## The bytes the text needs (copied into `buf`, NUL-terminated, as far as
+  ## they fit), or 0 for an element no frame drew such a text for.
+proc gpui_drawn_text_reset*() {.importc: "gpui_drawn_text_reset".}
+
 # --- the element store, read back ---
 
 proc gpui_last_event_key*(node: GpuiElement; buf: pointer; bufLen: uint64): uint64

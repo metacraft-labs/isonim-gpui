@@ -505,6 +505,45 @@ them. Without the GPUI backend nothing is laid out and every read answers 0.
 The store is `layout_bounds.rs`, feature-less like `input` and
 `frame_stats`, so the exported symbol set does not depend on the features.
 
+### Cut Text and the Characters a Cut Drops
+
+`gpui-pre` 0.3.5 cuts a one-line text in its text element
+(`TextLayout::layout`, with `LineWrapper::truncate_line`): it keeps what fits
+before the ellipsis and drops whitespace and ASCII punctuation from the end
+of what it keeps. A separator outside ASCII stays, so `a · b` cut just past
+the `·` reads `a ·…`. An element that declares `text-overflow` therefore
+draws its text nodes (and its own text) with the shim's `CutText`
+(`cut_text.rs`), which lays the text out exactly as `gpui-pre`'s text element
+does and then, for a cut at the end, also drops the characters the element
+names in the attribute `data-ellipsis-trim` -- one character each, with the
+whitespace around them -- from the end of what the cut kept
+(`trim_before_affix`). Without the attribute the cut is `gpui-pre`'s own. A
+letter-spaced text is never cut (`SpacedText`), and a fused run
+(`data-inline-text-runs`) is drawn as before.
+
+`CutText` is a copy, not a wrapper, because `gpui-pre` gives no way in
+between its cut and its shaping: `TextLayout` is private to its text element,
+and `StyledText` cuts and shapes inside one measure callback, so a caller
+can neither see the cut text nor hand back a shorter one. The copy follows
+`gpui-pre` 0.3.5 step for step (its measured layout, the shaped-fits test
+that keeps a kerned text that fits from being cut, `truncate_line`, the
+whole-pixel width, `paint`), and changes nothing else; each step names the
+`gpui-pre` function it copies. `gpui-pre` is pinned exactly (`=0.3.5`), so
+the copy cannot drift silently: a pin bump must re-read
+`src/elements/text.rs` (`TextLayout::layout`, `TextLayout::paint`) and
+`LineWrapper::truncate_line` and carry their changes into `cut_text.rs`.
+`test_a_cut_drops_the_separator_before_its_ellipsis`
+(`tests/gpui_text_shaping.rs`) checks the cut against `gpui-pre`'s own at
+the same width.
+
+A cut is decided during layout, after the plan was handed over, so the plan
+cannot say what a text reads on screen. Every `CutText` records the text it
+drew in the frame, whole or cut, under the node id of the element that
+declared `text-overflow`; `gpui_drawn_text(node, buf, len)` (Nim:
+`renderer.drawnText`) reads it back, as `gpui_layout_bounds` reads back where
+an element was laid out, and `gpui_drawn_text_reset` forgets it. The store is
+feature-less, like `layout_bounds`.
+
 ### Inline-Run Fusion and Horizontal Insets
 
 A container that declares `data-inline-text-runs` has its text-only

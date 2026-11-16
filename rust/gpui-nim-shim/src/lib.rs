@@ -57,6 +57,10 @@ pub mod frame_stats;
 // back for a host comparing its layout with another renderer's. Feature-less
 // for `input`'s reason.
 pub mod layout_bounds;
+// The text an element that declares `text-overflow`
+// drew, and the characters its cut drops before the ellipsis. Feature-less
+// store for `input`'s reason; the element itself needs a GPUI feature.
+pub mod cut_text;
 pub mod render_sync;
 #[allow(dead_code)]
 pub mod tree;
