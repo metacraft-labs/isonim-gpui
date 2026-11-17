@@ -588,6 +588,21 @@ const EllipsisTrimAttribute* = "data-ellipsis-trim"
   ## before the ellipsis, besides whitespace (`"·—"`: `a · b` cut after the
   ## `·` reads `a…`, not `a ·…`). See the shim's `cut_text` module.
 
+const EllipsisAtAttribute* = "data-ellipsis-at"
+  ## The attribute an element that declares `text-overflow` names where its
+  ## cut falls with: `"middle"` keeps the text's start and end and drops its
+  ## middle; absent, the cut falls at the end. See the shim's `cut_text`
+  ## module.
+
+const EllipsisSegmentsAttribute* = "data-ellipsis-segments"
+  ## For a middle cut, the characters that separate the text's segments, one
+  ## character each (`"/"` for a path): the cut keeps the first segment and
+  ## the last whole, and as many of the segments before the last as fit
+  ## (`src/…/retry/client.py`, then `src/…/client.py`, then `…/client.py`),
+  ## and cuts at the end when even the last segment does not fit. Absent,
+  ## a middle cut is character by character. The characters named in
+  ## `EllipsisTrimAttribute` are dropped on both sides of the "…".
+
 proc drawnText*(node: GpuiElement): string =
   ## The text an element that declares `text-overflow` drew in the latest
   ## frame: whole, or cut and ended with the ellipsis. Empty for an element

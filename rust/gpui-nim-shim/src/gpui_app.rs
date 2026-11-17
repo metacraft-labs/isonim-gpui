@@ -1032,6 +1032,7 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
                         crate::cut_text::trim_chars_of(&plan.attributes),
                         plan.node_id,
                     )
+                    .at(crate::cut_text::cut_place_of(&plan.attributes))
                     .into_any_element()
                 } else {
                     text_with_spacing(text, spacing)

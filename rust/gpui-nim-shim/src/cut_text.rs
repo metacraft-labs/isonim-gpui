@@ -45,6 +45,91 @@ use crate::{handle_to_node_id, GpuiElement};
 /// the cut is `gpui-pre`'s own.
 pub const ELLIPSIS_TRIM_ATTRIBUTE: &str = "data-ellipsis-trim";
 
+/// The attribute an element that declares `text-overflow` names where its
+/// cut falls with: `middle` keeps the text's start and end and drops its
+/// middle (see [`ELLIPSIS_SEGMENTS_ATTRIBUTE`]); absent, or any other value,
+/// the cut falls at the end.
+pub const ELLIPSIS_AT_ATTRIBUTE: &str = "data-ellipsis-at";
+
+/// The attribute a middle cut ([`ELLIPSIS_AT_ATTRIBUTE`] `middle`) names the
+/// characters that separate the text's segments with, each character one
+/// separator (`data-ellipsis-segments="/"` for a path). Given, the cut keeps
+/// whole segments ([`middle_cut_candidates`]); absent or empty, the cut is
+/// `gpui-pre`'s own middle cut, character by character.
+pub const ELLIPSIS_SEGMENTS_ATTRIBUTE: &str = "data-ellipsis-segments";
+
+/// Where an element's cut falls, from its attributes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CutPlace {
+    /// The cut drops the text's middle rather than its end.
+    pub middle: bool,
+    /// For a middle cut, the characters between the segments it keeps whole.
+    pub segments: Vec<char>,
+}
+
+/// An element's [`CutPlace`], from its attributes.
+pub fn cut_place_of(attributes: &std::collections::BTreeMap<String, String>) -> CutPlace {
+    let middle = attributes
+        .get(ELLIPSIS_AT_ATTRIBUTE)
+        .is_some_and(|v| v.trim() == "middle");
+    let segments = if middle {
+        attributes
+            .get(ELLIPSIS_SEGMENTS_ATTRIBUTE)
+            .map(|v| v.chars().filter(|c| !c.is_whitespace()).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    CutPlace { middle, segments }
+}
+
+/// `head`, `affix` and `tail` joined, with whitespace and the characters of
+/// `trim` dropped from the end of `head` and from the start of `tail`: the
+/// same rule as [`trim_before_affix`], on both sides of a middle cut.
+pub fn join_middle_cut(head: &str, affix: &str, tail: &str, trim: &[char]) -> String {
+    let drop = |c: char| c.is_whitespace() || trim.contains(&c);
+    format!("{}{affix}{}", head.trim_end_matches(drop), tail.trim_start_matches(drop))
+}
+
+/// The middle cuts of a text whose segments `separators` divide, longest
+/// first: the text keeps its first segment and its last, and the segments
+/// between give way one at a time from the second (`a/b/c/d` gives
+/// `a/…/c/d`, then `a/…/d`); then only the last segment is kept (`…/d`).
+/// A separator at the very start belongs to the first segment. A text with
+/// no segment between its first and its last has only the last candidate,
+/// and a text of one segment has none. Each candidate is
+/// [`join_middle_cut`] of its two sides, so `trim` applies at the cut.
+pub fn middle_cut_candidates(
+    text: &str,
+    affix: &str,
+    separators: &[char],
+    trim: &[char],
+) -> Vec<String> {
+    let is_sep = |c: char| separators.contains(&c);
+    // Byte offsets of every separator, a leading one aside.
+    let start = text.chars().next().filter(|c| is_sep(*c)).map_or(0, char::len_utf8);
+    let seps: Vec<usize> = text
+        .char_indices()
+        .filter(|(i, c)| *i >= start && is_sep(*c))
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&last) = seps.last() else {
+        return Vec::new();
+    };
+    if last + text[last..].chars().next().map_or(0, char::len_utf8) >= text.len() {
+        return Vec::new();
+    }
+    let first = seps[0];
+    let head_end = first + text[first..].chars().next().map_or(0, char::len_utf8);
+    let head = &text[..head_end];
+    let mut out: Vec<String> = seps[1..]
+        .iter()
+        .map(|&k| join_middle_cut(head, affix, &text[k..], trim))
+        .collect();
+    out.push(join_middle_cut("", affix, &text[last..], trim));
+    out
+}
+
 /// The characters an element's cut drops, from its attributes.
 pub fn trim_chars_of(attributes: &std::collections::BTreeMap<String, String>) -> Vec<char> {
     attributes
@@ -134,7 +219,7 @@ pub extern "C" fn gpui_drawn_text_reset() {
 // ---------------------------------------------------------------------------
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
-pub use element::{cut_line_end, CutText};
+pub use element::{cut_line_end, cut_line_middle, CutText};
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 mod element {
@@ -155,6 +240,7 @@ mod element {
         text: SharedString,
         trim: Rc<[char]>,
         owner: u64,
+        place: Rc<super::CutPlace>,
     }
 
     impl CutText {
@@ -163,7 +249,15 @@ mod element {
                 text: text.into(),
                 trim: trim.into(),
                 owner,
+                place: Rc::new(super::CutPlace::default()),
             }
+        }
+
+        /// Where the cut falls (`data-ellipsis-at`, `data-ellipsis-segments`):
+        /// at the end unless `place` says the middle.
+        pub fn at(mut self, place: super::CutPlace) -> Self {
+            self.place = Rc::new(place);
+            self
         }
     }
 
@@ -213,6 +307,7 @@ mod element {
             let runs = vec![text_style.to_run(self.text.len())];
             let text = self.text.clone();
             let trim = self.trim.clone();
+            let place = self.place.clone();
             let measured = state.clone();
             let layout_id = window.request_measured_layout(
                 Default::default(),
@@ -286,6 +381,36 @@ mod element {
                             {
                                 // Shaped (kerned), the whole text fits: not cut.
                                 (text.clone(), Cow::Borrowed(&runs[..]))
+                            } else if truncate_from == TruncateFrom::End && place.middle {
+                                // A middle cut: each candidate is measured
+                                // shaped, by the same test as the whole text.
+                                let mut fits = |candidate: &str| {
+                                    window
+                                        .text_system()
+                                        .shape_text(
+                                            SharedString::from(candidate.to_string()),
+                                            font_size,
+                                            &[text_style.to_run(candidate.len())],
+                                            None,
+                                            None,
+                                        )
+                                        .map(|lines| {
+                                            lines.iter().all(|line| {
+                                                line.size(line_height).width <= truncate_width
+                                            })
+                                        })
+                                        .unwrap_or(false)
+                                };
+                                cut_line_middle(
+                                    &mut line_wrapper,
+                                    text.clone(),
+                                    truncate_width,
+                                    &affix,
+                                    &runs,
+                                    &trim,
+                                    &place.segments,
+                                    &mut fits,
+                                )
                             } else if truncate_from == TruncateFrom::End {
                                 cut_line_end(
                                     &mut line_wrapper,
@@ -408,6 +533,67 @@ mod element {
         (SharedString::from(trimmed), Cow::Owned(runs))
     }
 
+    /// A one-line text cut in its middle to `width` (an element whose
+    /// `data-ellipsis-at` is `middle`). Whole when it `fits`; with
+    /// `segments`, otherwise the first of
+    /// [`super::middle_cut_candidates`] that `fits` (measured as the window
+    /// shapes it), and when none does, the end cut ([`cut_line_end`]);
+    /// without, `gpui-pre`'s own middle cut (`LineWrapper::truncate_line`
+    /// with `TruncateFrom::Middle`, which keeps about two thirds of the room
+    /// before the affix), with the trim applied on both sides of the affix
+    /// ([`super::join_middle_cut`]). The text a `CutText` draws is in one
+    /// style, so a cut keeps one run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cut_line_middle<'a>(
+        wrapper: &mut gpui::LineWrapper,
+        text: SharedString,
+        width: Pixels,
+        affix: &str,
+        runs: &'a [gpui::TextRun],
+        trim: &[char],
+        segments: &[char],
+        fits: &mut dyn FnMut(&str) -> bool,
+    ) -> (SharedString, Cow<'a, [gpui::TextRun]>) {
+        if !segments.is_empty() {
+            if fits(&text) {
+                return (text, Cow::Borrowed(runs));
+            }
+            for candidate in super::middle_cut_candidates(&text, affix, segments, trim) {
+                if fits(&candidate) {
+                    let runs = one_run(runs, candidate.len());
+                    return (SharedString::from(candidate), Cow::Owned(runs));
+                }
+            }
+            return cut_line_end(wrapper, text, width, affix, runs, trim);
+        }
+        let (shown, shown_runs) =
+            wrapper.truncate_line(text.clone(), width, affix, runs, TruncateFrom::Middle);
+        if shown == text || trim.is_empty() || affix.is_empty() {
+            return (shown, shown_runs);
+        }
+        if let Some(at) = shown.find(affix) {
+            let joined =
+                super::join_middle_cut(&shown[..at], affix, &shown[at + affix.len()..], trim);
+            if joined.len() != shown.len() {
+                let runs = one_run(runs, joined.len());
+                return (SharedString::from(joined), Cow::Owned(runs));
+            }
+        }
+        (shown, shown_runs)
+    }
+
+    /// The first run of `runs`, `len` bytes long: the runs of a cut text
+    /// drawn in one style.
+    fn one_run(runs: &[gpui::TextRun], len: usize) -> Vec<gpui::TextRun> {
+        runs.first()
+            .map(|run| {
+                let mut run = run.clone();
+                run.len = len;
+                vec![run]
+            })
+            .unwrap_or_default()
+    }
+
     /// The runs of an end cut that keeps `kept` bytes of the text and adds
     /// an affix of `affix` bytes: `update_runs_after_truncation` in gpui-pre's
     /// `line_wrapper.rs` (private there), for the trimmed cut. The run the
@@ -466,6 +652,50 @@ mod tests {
         assert!(trim_chars_of(&attrs).is_empty());
         attrs.insert(ELLIPSIS_TRIM_ATTRIBUTE.to_string(), "\u{b7} \u{2014}".to_string());
         assert_eq!(trim_chars_of(&attrs), vec![DOT, DASH]);
+    }
+
+    #[test]
+    fn a_middle_cut_keeps_whole_segments_first_and_last() {
+        let e = "\u{2026}";
+        assert_eq!(
+            middle_cut_candidates("src/upload/retry/client.py", e, &['/'], &[]),
+            vec![
+                "src/\u{2026}/retry/client.py".to_string(),
+                "src/\u{2026}/client.py".to_string(),
+                "\u{2026}/client.py".to_string()
+            ]
+        );
+        // No segment between the first and the last: only the last kept.
+        assert_eq!(middle_cut_candidates("src/client.py", e, &['/'], &[]),
+                   vec!["\u{2026}/client.py".to_string()]);
+        // One segment, a leading separator, a trailing one: nothing to keep.
+        assert!(middle_cut_candidates("client.py", e, &['/'], &[]).is_empty());
+        assert!(middle_cut_candidates("/client.py", e, &['/'], &[]).is_empty());
+        assert!(middle_cut_candidates("src/lib/", e, &['/'], &[]).is_empty());
+        // A leading separator belongs to the first segment.
+        assert_eq!(middle_cut_candidates("/srv/a/b.py", e, &['/'], &[])[0],
+                   "/srv/\u{2026}/b.py");
+    }
+
+    #[test]
+    fn a_middle_cut_drops_what_would_dangle_on_either_side() {
+        let trim = ['\u{b7}', '\u{2014}'];
+        assert_eq!(join_middle_cut("a \u{b7} ", "\u{2026}", " \u{b7} b", &trim), "a\u{2026}b");
+        assert_eq!(join_middle_cut("a ", "\u{2026}", " b", &[]), "a\u{2026}b");
+        assert_eq!(join_middle_cut("src/", "\u{2026}", "/c.py", &trim), "src/\u{2026}/c.py");
+    }
+
+    #[test]
+    fn the_cut_place_is_read_from_the_attributes() {
+        let mut attrs = std::collections::BTreeMap::new();
+        assert_eq!(cut_place_of(&attrs), CutPlace::default());
+        attrs.insert(ELLIPSIS_SEGMENTS_ATTRIBUTE.to_string(), "/".to_string());
+        // Segments without a middle cut mean nothing.
+        assert_eq!(cut_place_of(&attrs), CutPlace::default());
+        attrs.insert(ELLIPSIS_AT_ATTRIBUTE.to_string(), "middle".to_string());
+        assert_eq!(cut_place_of(&attrs), CutPlace { middle: true, segments: vec!['/'] });
+        attrs.insert(ELLIPSIS_AT_ATTRIBUTE.to_string(), "end".to_string());
+        assert!(!cut_place_of(&attrs).middle);
     }
 
     #[test]

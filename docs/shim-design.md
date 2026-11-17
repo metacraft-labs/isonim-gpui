@@ -536,6 +536,26 @@ the copy cannot drift silently: a pin bump must re-read
 (`tests/gpui_text_shaping.rs`) checks the cut against `gpui-pre`'s own at
 the same width.
 
+An element may also say where its cut falls. With `data-ellipsis-at="middle"`
+the cut keeps the text's start and end and drops its middle
+(`cut_line_middle`). With `data-ellipsis-segments` it keeps whole segments.
+The attribute names the characters between segments, one character each
+(`"/"` for a path). The cut then keeps the first segment and the last. The
+segments between them give way one at a time from the second
+(`middle_cut_candidates`), so `src/upload/retry/client.py` becomes
+`src/…/retry/client.py`, then `src/…/client.py`, then `…/client.py`. Each
+candidate is measured as the window shapes it, by the same "the shaped text
+fits" test as the whole text. When none fits, the text is cut at its end.
+Without segments, the middle cut is `gpui-pre`'s own
+(`LineWrapper::truncate_line` with `TruncateFrom::Middle`, two thirds of the
+room before the ellipsis). Either way, the characters `data-ellipsis-trim`
+names are dropped, with whitespace, on both sides of the ellipsis
+(`join_middle_cut`). Without `data-ellipsis-at` the cut is at the end, as
+above. `test_a_middle_cut_keeps_the_first_and_last_segments`
+(`tests/gpui_text_shaping.rs`) checks each candidate at its width and one
+pixel under it, the fall back to the end cut, and the trim on both sides of
+`gpui-pre`'s own middle cut.
+
 A cut is decided during layout, after the plan was handed over, so the plan
 cannot say what a text reads on screen. Every `CutText` records the text it
 drew in the frame, whole or cut, under the node id of the element that
