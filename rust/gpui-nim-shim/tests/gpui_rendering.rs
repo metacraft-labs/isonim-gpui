@@ -203,6 +203,7 @@ fn test_render_plan_to_gpui_text_node() {
                 event_names: vec![],
                 attributes: Default::default(),
                 children: vec![],
+                ..Default::default()
             };
             let _element = render_plan_to_gpui(&plan);
             NimRootView::new()
@@ -241,7 +242,7 @@ fn test_render_plan_to_gpui_styled_div() {
                 has_input_handler: false,
                 event_names: vec![],
                 attributes: Default::default(),
-                children: vec![RenderNode {
+                children: vec![std::sync::Arc::new(RenderNode {
             image: None,
                     node_id: 101,
                     kind: GpuiElementKind::TextNode,
@@ -253,7 +254,9 @@ fn test_render_plan_to_gpui_styled_div() {
                     event_names: vec![],
                     attributes: Default::default(),
                     children: vec![],
-                }],
+                    ..Default::default()
+                })],
+                ..Default::default()
             };
             let _element = render_plan_to_gpui(&plan);
             NimRootView::new()
@@ -285,6 +288,7 @@ fn test_render_plan_to_gpui_img_placeholder() {
                 event_names: vec![],
                 attributes: Default::default(),
                 children: vec![],
+                ..Default::default()
             };
             let _element = render_plan_to_gpui(&plan);
             NimRootView::new()
@@ -316,6 +320,7 @@ fn test_render_plan_to_gpui_svg_placeholder() {
                 event_names: vec![],
                 attributes: Default::default(),
                 children: vec![],
+                ..Default::default()
             };
             let _element = render_plan_to_gpui(&plan);
             NimRootView::new()
@@ -350,6 +355,7 @@ fn test_render_plan_to_gpui_text_container() {
                 event_names: vec![],
                 attributes: Default::default(),
                 children: vec![],
+                ..Default::default()
             };
             let _element = render_plan_to_gpui(&plan);
             NimRootView::new()

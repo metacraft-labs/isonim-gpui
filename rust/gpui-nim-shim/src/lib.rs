@@ -74,6 +74,10 @@ pub mod window;
 // headless path too.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub mod gpui_app;
+// Cached GPUI views at measured subtree boundaries, invalidated by the
+// shadow tree's dirty marks (the module documentation has the policy).
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+pub mod cached_views;
 // macOS only, and it is the reason `gpui_launch` returns at all on that
 // platform: `MacPlatform::quit` is `-[NSApplication terminate:]`, which
 // does not unwind. Read this module's header before touching the shutdown
@@ -1760,7 +1764,7 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
                 .join(",")
         );
 
-        let children: Vec<String> = plan.children.iter().map(node_to_string).collect();
+        let children: Vec<String> = plan.children.iter().map(|c| node_to_string(c)).collect();
 
         format!(
             "{{\"kind\":\"{}\",\"tag\":\"{}\",\"text\":{},\"has_click_handler\":{},\"has_input_handler\":{},\"event_names\":[{}],\"styles\":{},\"attributes\":{},\"children\":[{}]}}",

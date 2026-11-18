@@ -108,6 +108,10 @@ pub struct NimRootView {
     /// FALLBACK_BAR_HEIGHT` while the application draws the decorations, is
     /// not fullscreen and declares no drag region of its own; 0 otherwise.
     title_bar: f32,
+
+    /// The cached subtree views the last frame drew directly below the root
+    /// (`cached_views`); each of them holds the ones below it.
+    boundaries: crate::cached_views::Boundaries,
 }
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
@@ -122,6 +126,7 @@ impl NimRootView {
             decorations_rerequested: false,
             launch_inflated: None,
             title_bar: 0.0,
+            boundaries: crate::cached_views::Boundaries::default(),
         }
     }
 
@@ -232,10 +237,17 @@ impl NimRootView {
         // the fallback bar and two spurious resizes at every grant (measured
         // with CodeTracer on sway: 1280x800 -> 1260x748 -> 1280x800).
         window::update_chrome_state(win_id, chrome);
+        // Read off the root's plan, which counts the drag regions of its
+        // subtree (`RenderNode::drag_regions`), rather than by a walk over
+        // the whole tree every frame. The plan built here is the frame's
+        // plan unless the callbacks below change the tree again.
         let has_drag_region = {
-            let tree = crate::lock_tree();
             let root = *crate::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
-            crate::regions::tree_declares_drag_region(&tree, root)
+            let mut tree = crate::lock_tree();
+            let mut work = crate::render_sync::PlanWork::default();
+            let plan = crate::render_sync::plan_incremental(&mut tree, root, &mut work);
+            crate::frame_stats::note_plan(work);
+            plan.map_or(false, |p| p.drag_regions > 0)
         };
         self.title_bar = if client && !window.is_fullscreen() && !has_drag_region {
             crate::regions::FALLBACK_BAR_HEIGHT
@@ -481,6 +493,7 @@ impl Render for NimRootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Check and clear the repaint flag (so we know the frame is current).
         let _ = window::take_repaint_request();
+        crate::frame_stats::begin_frame();
         drop_evicted_images(window);
 
         // Start a background polling timer that checks REPAINT_REQUESTED
@@ -537,7 +550,6 @@ impl Render for NimRootView {
 
         self.sync_window_registry(window, cx);
 
-        let tree = crate::lock_tree();
         let root_id = *crate::ROOT_NODE_ID
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -548,10 +560,21 @@ impl Render for NimRootView {
         }
 
         let started = std::time::Instant::now();
-        match crate::render_sync::build_render_plan(&tree, root_id) {
+        // The plan, rebuilt only where the tree's dirty marks say it changed
+        // (`render_sync::plan_incremental`). The lock is released before the
+        // elements are built.
+        let plan = {
+            let mut tree = crate::lock_tree();
+            let mut work = crate::render_sync::PlanWork::default();
+            let plan = crate::render_sync::plan_incremental(&mut tree, root_id, &mut work);
+            crate::frame_stats::note_plan(work);
+            plan
+        };
+        match plan {
             Some(plan) => {
-                drop(tree); // release lock before building GPUI elements
                 let cursor_override = window_cursor_override().into_any_element();
+                let mut boundaries = std::mem::take(&mut self.boundaries);
+                let mut bcx = crate::cached_views::BuildCx::new(cx, &mut boundaries);
                 let element = if self.frame.is_framed() || self.title_bar > 0.0 {
                     let title_bar = (self.title_bar > 0.0).then(|| {
                         let win_id = active_window_id();
@@ -569,22 +592,27 @@ impl Render for NimRootView {
                         }
                     });
                     frame_client_window(
-                        render_plan_to_gpui(&plan),
+                        render_plan_to_gpui_in(&plan, Some(&mut bcx), &crate::cached_views::LayoutBox::WINDOW),
                         &self.frame,
                         title_bar,
                         FrameColors::of(&plan, window.is_window_active()),
                         &handle,
                     )
                 } else {
-                    render_root_to_gpui(&plan, &handle)
+                    render_root_in(&plan, &handle, Some(&mut bcx))
                 };
+                self.boundaries = bcx.finish();
                 // PLAT-42: the render-path half of the frame budget. GPUI's
-                // layout and paint follow and are not in this number.
-                crate::frame_stats::complete_frame(started.elapsed().as_nanos() as u64);
+                // layout and paint follow and are not in this number; the
+                // cached subtree views GPUI renders during them add their own
+                // share, and the frame is recorded once they have run, by the
+                // marker drawn last (`frame_end_marker`).
+                crate::frame_stats::add_render_ns(started.elapsed().as_nanos() as u64);
                 div()
                     .size_full()
                     .child(element)
                     .child(cursor_override)
+                    .child(frame_end_marker())
                     .into_any_element()
             }
             None => with_keyboard(div().size_full().child("Empty shadow tree"), &handle)
@@ -702,19 +730,41 @@ pub fn render_root_to_gpui(
     plan: &crate::render_sync::RenderNode,
     handle: &gpui::FocusHandle,
 ) -> AnyElement {
+    render_root_in(plan, handle, None)
+}
+
+/// `render_root_to_gpui`, placing cached subtree views where `bcx` allows.
+fn render_root_in(
+    plan: &crate::render_sync::RenderNode,
+    handle: &gpui::FocusHandle,
+    bcx: Option<&mut crate::cached_views::BuildCx<'_>>,
+) -> AnyElement {
+    use crate::cached_views::LayoutBox;
     use crate::tree::GpuiElementKind;
     match plan.kind {
         GpuiElementKind::Div | GpuiElementKind::TextContainer => {
-            with_keyboard(build_plan_div(plan), handle).into_any_element()
+            with_keyboard(build_plan_div_in(plan, bcx, Some(&LayoutBox::WINDOW)), handle)
+                .into_any_element()
         }
         // An image, an SVG or a bare text node as the WHOLE root is not a
         // shape any product here produces; it is wrapped rather than
         // refused, and the wrapper is stated so a frame that gained a
         // container is explainable rather than surprising.
         _ => with_keyboard(div().size_full(), handle)
-            .child(render_plan_to_gpui(plan))
+            .child(render_plan_to_gpui_in(plan, bcx, &LayoutBox::WINDOW))
             .into_any_element(),
     }
+}
+
+/// Paints nothing; its prepaint, which runs after every other element of the
+/// frame has been laid out and prepainted (and so after GPUI rendered every
+/// cached subtree view that had to be drawn again), closes the frame's
+/// `frame_stats` record.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn frame_end_marker() -> impl IntoElement {
+    canvas(|_, _, _| crate::frame_stats::complete_frame(), |_, _, _, _| {})
+        .absolute()
+        .size_0()
 }
 
 // ---------------------------------------------------------------------------
@@ -872,8 +922,37 @@ fn window_cursor_override() -> impl IntoElement {
 }
 
 pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement {
+    render_plan_to_gpui_in(plan, None, &crate::cached_views::LayoutBox::WINDOW)
+}
+
+/// A child's element: behind a cached subtree view when it is a boundary
+/// (`cached_views::BuildCx::boundary`), built here otherwise.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn child_to_gpui(
+    plan: &crate::render_sync::RenderNode,
+    mut bcx: Option<&mut crate::cached_views::BuildCx<'_>>,
+    parent: &crate::cached_views::LayoutBox,
+) -> AnyElement {
+    if let Some(b) = bcx.as_deref_mut() {
+        if let Some(view) = b.boundary(plan, parent) {
+            return view;
+        }
+    }
+    render_plan_to_gpui_in(plan, bcx, parent)
+}
+
+/// `render_plan_to_gpui` for an element placed in `parent`, placing cached
+/// subtree views below it where `bcx` allows.
+pub fn render_plan_to_gpui_in(
+    plan: &crate::render_sync::RenderNode,
+    bcx: Option<&mut crate::cached_views::BuildCx<'_>>,
+    parent: &crate::cached_views::LayoutBox,
+) -> AnyElement {
     use crate::tree::GpuiElementKind;
 
+    if !matches!(plan.kind, GpuiElementKind::Div | GpuiElementKind::TextContainer) {
+        crate::frame_stats::note_element();
+    }
     match plan.kind {
         GpuiElementKind::TextNode => {
             let text = plan.text.clone().unwrap_or_default();
@@ -947,7 +1026,7 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
             el.child(label).into_any_element()
         }
         GpuiElementKind::Div | GpuiElementKind::TextContainer => {
-            build_plan_div(plan).into_any_element()
+            build_plan_div_in(plan, bcx, Some(parent)).into_any_element()
         }
     }
 }
@@ -960,8 +1039,32 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
 /// `render_root_to_gpui`. Nothing about the body changed.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
+    build_plan_div_in(plan, None, Some(&crate::cached_views::LayoutBox::WINDOW))
+}
+
+/// `build_plan_div`, placing cached subtree views below the element where
+/// `bcx` allows. `placed_in` is the box the element's parent lays it out in,
+/// or `None` for the root of a cached subtree view, which is laid out at its
+/// view's definite bounds.
+pub fn build_plan_div_in(
+    plan: &crate::render_sync::RenderNode,
+    mut bcx: Option<&mut crate::cached_views::BuildCx<'_>>,
+    placed_in: Option<&crate::cached_views::LayoutBox>,
+) -> Div {
+    use crate::cached_views::LayoutBox;
+    crate::frame_stats::note_element();
     let mut el = div();
     el = apply_styles_to_div(el, &plan.styles);
+    // The box this element gives its children, for the boundary policy.
+    // Computed only when boundaries can be placed at all.
+    let own_box = if bcx.is_some() {
+        match placed_in {
+            Some(parent) => LayoutBox::of(el.style(), parent),
+            None => LayoutBox::view_root(el.style()),
+        }
+    } else {
+        LayoutBox::WINDOW
+    };
 
     // A DECLARED INLINE FORMATTING CONTEXT IS ONE TEXT ELEMENT, NOT ONE PER
     // SPAN (`render_sync::INLINE_TEXT_RUNS_ATTRIBUTE`, which carries the full
@@ -972,14 +1075,14 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
     //
     // Everything below — events, pointer listeners, window regions — is
     // reached either way: only how the children are built changes.
-    match crate::render_sync::inline_chunks(plan) {
+    match plan.fused_chunks() {
         Some(chunks) => {
             // A declared row lays its chunks out IN CHILD ORDER: each fused
             // run becomes one text element, and every child that could not
             // fuse is rendered exactly as it would have been. A container
             // with its own text never reaches here (`inline_chunks`
             // declines it), so there is no trailing text to append.
-            for chunk in chunks {
+            for chunk in chunks.iter().cloned() {
                 el = match chunk {
                     // A run carrying a horizontal inset (a span's own
                     // padding, admitted only in a context that promised one
@@ -1003,12 +1106,14 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
                                 .iter()
                                 .skip(run.start)
                                 .take(run.runs.len())
-                                .fold(el, |el, child| el.child(render_plan_to_gpui(child)))
+                                .fold(el, |el, child| {
+                                    el.child(child_to_gpui(child, bcx.as_deref_mut(), &own_box))
+                                })
                         }
                     }
                     crate::render_sync::InlineChunk::Fused(run) => el.child(fused_run_text(&run)),
                     crate::render_sync::InlineChunk::Own(i) => {
-                        el.child(render_plan_to_gpui(&plan.children[i]))
+                        el.child(child_to_gpui(&plan.children[i], bcx.as_deref_mut(), &own_box))
                     }
                 };
             }
@@ -1045,7 +1150,7 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
                 {
                     el.child(own_text(child.text.clone().unwrap_or_default()))
                 } else {
-                    el.child(render_plan_to_gpui(child))
+                    el.child(child_to_gpui(child, bcx.as_deref_mut(), &own_box))
                 };
             }
 

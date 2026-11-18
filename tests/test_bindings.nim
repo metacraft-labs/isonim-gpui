@@ -203,6 +203,11 @@ static:
   assert compiles(gpui_key_latency_count())
   assert compiles(gpui_key_latency_ns(0.uint64))
   assert compiles(gpui_frame_stats_reset())
+  # Each frame's work (nodes visited, plans rebuilt, elements built, cached
+  # subtrees reused and rendered); its behaviour is the same unit test's and
+  # `tests/frame_work_probe.rs`'s.
+  var work: array[5, uint64]
+  assert compiles(gpui_frame_work(0.uint64, addr work))
 
   # --- Laid-out bounds, image pixels and the window-level cursor ---
   var xywh: array[4, float64]

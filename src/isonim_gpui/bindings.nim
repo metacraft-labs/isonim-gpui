@@ -233,9 +233,9 @@ proc gpui_dispatch_key_to_focus*(event: cstring;
 
 # --- frame timing (PLAT-42) ---
 #
-# Render-path time per frame and key-to-frame latency, in ns, recorded by the
-# shim's `frame_stats` module. The render-path time EXCLUDES GPUI's own layout
-# and paint, which run after `render` returns; see that module's docs.
+# Render-path time per frame and key-to-frame latency, in ns, and the work
+# each frame did, recorded by the shim's `frame_stats` module. The render-path
+# time EXCLUDES GPUI's own layout and paint; see that module's docs.
 
 proc gpui_frame_count*(): uint64 {.importc: "gpui_frame_count".}
 proc gpui_frame_ns*(index: uint64): uint64 {.importc: "gpui_frame_ns".}
@@ -243,6 +243,11 @@ proc gpui_key_latency_count*(): uint64 {.importc: "gpui_key_latency_count".}
 proc gpui_key_latency_ns*(index: uint64): uint64
   {.importc: "gpui_key_latency_ns".}
 proc gpui_frame_stats_reset*() {.importc: "gpui_frame_stats_reset".}
+proc gpui_frame_work*(index: uint64; outCounts: ptr array[5, uint64]): uint8
+  {.importc: "gpui_frame_work".}
+  ## The `index`-th frame's work: shadow nodes the plan build visited, plans
+  ## rebuilt, GPUI elements built, cached subtrees reused and cached subtrees
+  ## rendered, in that order. Answers 1 when it wrote them, 0 past the end.
 
 # --- laid-out bounds (CTF-P1b) ---
 #

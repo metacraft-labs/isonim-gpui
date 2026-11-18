@@ -197,7 +197,10 @@ pub fn deliver(node_id: NodeId, event: &str, payload: Option<(u32, String, u32, 
 
     let listeners: Vec<(crate::EventCallback, i32)> = {
         let mut tree = lock_tree();
-        let Some(n) = tree.get_mut(node_id) else {
+        // Untracked: the delivery record is not part of what the node
+        // renders, and a key that marked its target changed would rebuild
+        // that target's plan on every keystroke.
+        let Some(n) = tree.get_mut_untracked(node_id) else {
             return 0;
         };
         let ls: Vec<(crate::EventCallback, i32)> = n

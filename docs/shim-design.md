@@ -700,13 +700,19 @@ Application::run(|cx| {
 ### Update Cycle
 
 ```
-1. Nim modifies shadow tree (via RendererBackend procs)
+1. Nim modifies shadow tree (via RendererBackend procs); each change marks
+   its node and the path to the root dirty
 2. Shim calls cx.notify() on NimRootView
 3. GPUI schedules a re-render
 4. On next frame, GPUI calls NimRootView::render()
-5. render() runs render-sync, walking the shadow tree
-6. GPUI receives the element tree, runs layout (Taffy), paints (GPU)
+5. render() rebuilds the render plan only along the dirty paths, reusing
+   every clean node's cached plan
+6. Unchanged subtrees behind cached views are replayed; GPUI lays out and
+   paints only what was built again
 ```
+
+`docs/incremental-rendering.md` describes steps 1, 5 and 6, and the rule for
+where cached views are placed.
 
 ### Batching
 

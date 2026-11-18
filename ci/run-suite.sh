@@ -284,7 +284,18 @@ BENCHMARKS=(
 #     Rust case from each of `de9d6e4` (`render_sync`), `28f1113` (`lib.rs`,
 #     the +1 named above), `dd50286` (`lib.rs`) and `9833561`
 #     (`layout_bounds`). Every Nim subject is unchanged (165 cases).
-EXPECTED_CASES=403
+# 2026-11-17, written LAST and from a run (trap 4c), at `2db29d9` with the
+# incremental-rendering change uncommitted: 412.
+#   * THE LANE WAS ALREADY RED BY DRIFT at `2db29d9` unmodified: its
+#     default-build `cargo test --lib` passed 245 Rust cases (measured in a
+#     clean worktree), where the figure above counted 238, so the lane read
+#     410 against 403.
+#   * 410 -> 412 is this change: `render_sync`'s two incremental-plan cases
+#     (the plan equals the reference walk over random histories; a change
+#     rebuilds its path and nothing beside it). Its `cached_views` and probe
+#     cases are `gpui-backend` only, counted by the `--with-gpui` arm. Every
+#     Nim subject is unchanged (165 cases).
+EXPECTED_CASES=412
 
 total_cases=0
 failed_steps=()

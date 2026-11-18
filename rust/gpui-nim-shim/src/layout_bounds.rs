@@ -91,6 +91,8 @@ pub fn bounds_of(node_id: u64) -> Option<LaidOut> {
 pub fn reset() {
     let mut store = BOUNDS.lock().unwrap_or_else(|p| p.into_inner());
     *store = None;
+    // The next frame must prepaint every element again to fill the store.
+    crate::frame_stats::invalidate_cached_subtrees();
 }
 
 /// The bounds the window last laid `node` out at, written to `out[0..4]` as

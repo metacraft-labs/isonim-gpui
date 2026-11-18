@@ -180,6 +180,8 @@ pub fn drawn_text_of(node_id: u64) -> Option<String> {
 pub fn reset() {
     let mut store = DRAWN.lock().unwrap_or_else(|p| p.into_inner());
     *store = None;
+    // The next frame must prepaint every element again to fill the store.
+    crate::frame_stats::invalidate_cached_subtrees();
 }
 
 /// What the element `node` -- one that declares `text-overflow` -- drew in
