@@ -1,3 +1,12 @@
 [workspace]
 members = ["gpui-nim-shim", "gpui-kit-probe"]
 resolver = "2"
+
+# gpui-pre-linux 0.3.5 with one change: a press's click count is decided by
+# the press events' own times (X11 `ButtonPress.time`, Wayland
+# `wl_pointer.button` time) rather than by when the window handled them, so a
+# window busy between two presses of a double click still sees one
+# (`vendor/gpui-pre-linux/src/linux/platform.rs`, `is_next_click`). Drop this
+# when upstream counts clicks the same way.
+[patch.crates-io]
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
