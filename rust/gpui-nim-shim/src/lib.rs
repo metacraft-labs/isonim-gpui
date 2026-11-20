@@ -109,6 +109,27 @@ use std::os::raw::c_char;
 use std::sync::Mutex;
 
 use tree::{EventListener, Node, NodeId, Tree};
+
+/// The two-call sizing protocol every string-returning export of this shim
+/// shares: called with a null `buf` (or `buf_len == 0`) it writes nothing and
+/// answers the byte length of `s`; called with a buffer it writes as much of
+/// `s` as fits with room for a NUL terminator, NUL-terminates it, and answers
+/// the full length again, so a caller sees truncation by comparing the answer
+/// with the size it passed. One implementation, so the terminator rule and
+/// the truncation rule cannot differ between exports.
+pub(crate) fn write_str_out(s: &str, buf: *mut u8, buf_len: u64) -> u64 {
+    let bytes = s.as_bytes();
+    let needed = bytes.len() as u64;
+    if buf.is_null() || buf_len == 0 {
+        return needed;
+    }
+    let to_copy = std::cmp::min(bytes.len(), (buf_len - 1) as usize);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
+        *buf.add(to_copy) = 0;
+    }
+    needed
+}
 use window::{CloseCallback, FocusCallback, ResizeCallback};
 
 /// Global shadow tree protected by a mutex.
@@ -815,20 +836,7 @@ pub extern "C" fn gpui_get_text_content(node: *mut GpuiElement, buf: *mut u8, bu
         return 0;
     }
     let tree = lock_tree();
-    let text = tree.collect_text(node_id);
-    let bytes = text.as_bytes();
-    let needed = bytes.len() as u64;
-
-    if buf.is_null() || buf_len == 0 {
-        return needed;
-    }
-
-    let to_copy = std::cmp::min(bytes.len(), (buf_len - 1) as usize);
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
-        *buf.add(to_copy) = 0; // null terminator
-    }
-    needed
+    write_str_out(&tree.collect_text(node_id), buf, buf_len)
 }
 
 /// Get an attribute value from a node.
@@ -847,27 +855,10 @@ pub extern "C" fn gpui_get_attribute(
     }
     let name_str = unsafe { cstr_to_str(name) };
     let tree = lock_tree();
-    let value = match tree.get(node_id) {
-        Some(n) => match n.attributes.get(name_str) {
-            Some(v) => v.clone(),
-            None => return 0,
-        },
-        None => return 0,
-    };
-
-    let bytes = value.as_bytes();
-    let needed = bytes.len() as u64;
-
-    if buf.is_null() || buf_len == 0 {
-        return needed;
+    match tree.get(node_id).and_then(|n| n.attributes.get(name_str)) {
+        Some(value) => write_str_out(value, buf, buf_len),
+        None => 0,
     }
-
-    let to_copy = std::cmp::min(bytes.len(), (buf_len - 1) as usize);
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
-        *buf.add(to_copy) = 0;
-    }
-    needed
 }
 
 /// The whole subtree under `root`, in ONE call: every node in pre-order
@@ -978,27 +969,10 @@ pub extern "C" fn gpui_get_tag(node: *mut GpuiElement, buf: *mut u8, buf_len: u6
         return 0;
     }
     let tree = lock_tree();
-    let tag = match tree.get(node_id) {
-        Some(n) => match n.tag() {
-            Some(t) => t.to_string(),
-            None => return 0,
-        },
-        None => return 0,
-    };
-
-    let bytes = tag.as_bytes();
-    let needed = bytes.len() as u64;
-
-    if buf.is_null() || buf_len == 0 {
-        return needed;
+    match tree.get(node_id).and_then(|n| n.tag()) {
+        Some(tag) => write_str_out(tag, buf, buf_len),
+        None => 0,
     }
-
-    let to_copy = std::cmp::min(bytes.len(), (buf_len - 1) as usize);
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
-        *buf.add(to_copy) = 0;
-    }
-    needed
 }
 
 /// Get the GPUI element kind for a node.
@@ -2402,6 +2376,49 @@ mod tests {
         let result = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) };
         assert_eq!(result.to_str().unwrap(), "button");
 
+        gpui_destroy_element(node);
+    }
+
+    /// Every string-returning export shares `write_str_out`, so they agree on
+    /// the three cases a caller meets: the sizing call (null buffer) answers
+    /// the length and writes nothing, a buffer one byte short of the
+    /// terminator gets the string cut and NUL-terminated and still learns the
+    /// full length, and a buffer that fits gets the whole string. Asserted on
+    /// the exports, not on the helper alone, so an export that goes back to a
+    /// copy of its own with a different rule is caught here.
+    #[test]
+    #[serial]
+    fn test_string_out_exports_share_one_protocol() {
+        gpui_reset_tree();
+        let tag = c("button");
+        let name = c("title");
+        let value = c("button");
+        let node = gpui_create_element(tag.as_ptr());
+        gpui_set_attribute(node, name.as_ptr(), value.as_ptr());
+        let text = c("button");
+        let text_node = gpui_create_text_node(text.as_ptr());
+        gpui_append_child(node, text_node);
+        let clip = c("button");
+        crate::clipboard::gpui_write_clipboard(clip.as_ptr());
+
+        let exports: Vec<(&str, Box<dyn Fn(*mut u8, u64) -> u64>)> = vec![
+            ("gpui_get_tag", Box::new(move |b, n| gpui_get_tag(node, b, n))),
+            ("gpui_get_attribute", Box::new({
+                let name = c("title");
+                move |b, n| gpui_get_attribute(node, name.as_ptr(), b, n)
+            })),
+            ("gpui_get_text_content", Box::new(move |b, n| gpui_get_text_content(node, b, n))),
+            ("gpui_clipboard_text", Box::new(|b, n| crate::clipboard::gpui_clipboard_text(b, n))),
+        ];
+        for (what, call) in &exports {
+            assert_eq!(call(std::ptr::null_mut(), 0), 6, "{what}: the sizing call");
+            let mut short = vec![0xAAu8; 6];
+            assert_eq!(call(short.as_mut_ptr(), 6), 6, "{what}: a short buffer learns the length");
+            assert_eq!(&short[..], b"butto\0", "{what}: cut and NUL-terminated");
+            let mut fits = vec![0xAAu8; 7];
+            assert_eq!(call(fits.as_mut_ptr(), 7), 6, "{what}: a buffer that fits");
+            assert_eq!(&fits[..], b"button\0", "{what}: the whole string");
+        }
         gpui_destroy_element(node);
     }
 

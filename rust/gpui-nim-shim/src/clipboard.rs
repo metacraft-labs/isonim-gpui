@@ -51,18 +51,7 @@ pub extern "C" fn gpui_write_clipboard(text: *const c_char) {
 /// `buf` to ask), as `gpui_get_text_content` does.
 #[no_mangle]
 pub extern "C" fn gpui_clipboard_text(buf: *mut u8, buf_len: u64) -> u64 {
-    let text = last();
-    let bytes = text.as_bytes();
-    let needed = bytes.len() as u64;
-    if buf.is_null() || buf_len == 0 {
-        return needed;
-    }
-    let to_copy = std::cmp::min(bytes.len(), (buf_len - 1) as usize);
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
-        *buf.add(to_copy) = 0;
-    }
-    needed
+    crate::write_str_out(&last(), buf, buf_len)
 }
 
 #[cfg(test)]

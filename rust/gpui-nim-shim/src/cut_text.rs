@@ -199,15 +199,7 @@ pub extern "C" fn gpui_drawn_text(node: *mut GpuiElement, buf: *mut u8, buf_len:
     let Some(text) = drawn_text_of(id.0) else {
         return 0;
     };
-    let bytes = text.as_bytes();
-    if !buf.is_null() && buf_len > 0 {
-        let n = bytes.len().min(buf_len as usize - 1);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
-            *buf.add(n) = 0;
-        }
-    }
-    bytes.len() as u64
+    crate::write_str_out(&text, buf, buf_len)
 }
 
 /// Forget every drawn text `gpui_drawn_text` would answer.

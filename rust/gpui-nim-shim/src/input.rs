@@ -57,7 +57,7 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tree::{DeliveredEvent, NodeId};
-use crate::{cstr_to_str, handle_to_node_id, lock_tree, node_id_to_handle, GpuiElement};
+use crate::{cstr_to_str, handle_to_node_id, lock_tree, node_id_to_handle, write_str_out, GpuiElement};
 
 // ---------------------------------------------------------------------------
 // The payload
@@ -372,30 +372,6 @@ pub extern "C" fn gpui_dispatch_event_with(
 // ---------------------------------------------------------------------------
 // Reading the element store back
 // ---------------------------------------------------------------------------
-
-/// The two-call sizing protocol this shim already uses for
-/// `gpui_get_attribute`, `gpui_get_tag` and `gpui_get_text_content`: call
-/// with a null buffer to learn the byte count, then again with a buffer.
-///
-/// It exists as a function here rather than as a fourth hand-copy of the same
-/// eight lines (§30a — *"the worst instance was a whole re-derived module"*).
-/// The three existing copies are left alone on purpose: rewriting them is a
-/// change to functions this milestone does not otherwise touch, and would put
-/// PLAT-38's diff on top of code another milestone is editing in the same
-/// window. That is a residual, stated rather than closed.
-fn write_str_out(s: &str, buf: *mut u8, buf_len: u64) -> u64 {
-    let bytes = s.as_bytes();
-    let needed = bytes.len() as u64;
-    if buf.is_null() || buf_len == 0 {
-        return needed;
-    }
-    let to_copy = std::cmp::min(bytes.len(), (buf_len - 1) as usize);
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
-        *buf.add(to_copy) = 0;
-    }
-    needed
-}
 
 /// The base key name of the last event delivered to `node`, written into
 /// `buf`. Returns the byte count (0 for "no key" and for "nothing arrived" —
