@@ -2369,12 +2369,19 @@ pub fn apply_styles_to_div(
         el.text_style().text_align = Some(align);
     }
     // `text-decoration: underline`: a menu's access key, a link.
-    if styles
+    // `text-decoration: line-through`: a struck-out item, such as a context
+    // item an instruction no longer cites. The two may be combined, as in
+    // CSS (https://www.w3.org/TR/css-text-decor-3/#text-decoration-line-property).
+    let decorations: Vec<&str> = styles
         .text_decoration
         .as_deref()
-        .is_some_and(|d| d.split_whitespace().any(|w| w == "underline"))
-    {
+        .map(|d| d.split_whitespace().collect())
+        .unwrap_or_default();
+    if decorations.contains(&"underline") {
         el = el.underline();
+    }
+    if decorations.contains(&"line-through") {
+        el = el.line_through();
     }
 
     // `position: absolute` with its insets: an element drawn over its
@@ -3448,6 +3455,25 @@ mod tests {
         assert_eq!(parse_font_style("italics"), None);
         assert_eq!(parse_font_style("italic bold"), None);
         assert_eq!(parse_font_style(""), None);
+    }
+
+    /// `text-decoration` draws its lines: `underline`, `line-through`, or
+    /// both, in the element's text style; anything else draws neither.
+    #[test]
+    fn test_text_decoration_lines_are_applied_to_the_drawn_element() {
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.text_decoration = Some("line-through".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert!(el.text_style().strikethrough.is_some());
+        assert!(el.text_style().underline.is_none());
+        styles.text_decoration = Some("underline line-through".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert!(el.text_style().strikethrough.is_some());
+        assert!(el.text_style().underline.is_some());
+        styles.text_decoration = Some("overline".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert!(el.text_style().strikethrough.is_none());
+        assert!(el.text_style().underline.is_none());
     }
 
     /// The element builder APPLIES `font-style`: it is in the drawn
