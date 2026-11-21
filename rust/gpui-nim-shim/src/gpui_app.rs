@@ -759,10 +759,21 @@ fn render_root_in(
 /// Paints nothing; its prepaint, which runs after every other element of the
 /// frame has been laid out and prepainted (and so after GPUI rendered every
 /// cached subtree view that had to be drawn again), closes the frame's
-/// `frame_stats` record.
+/// `frame_stats` record. A host's drawn-frame callback (`gpui_on_frame_drawn`)
+/// is DEFERRED to after the frame (`App::defer`): it runs once per closed
+/// frame, outside the paint, where the host may read anything.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 fn frame_end_marker() -> impl IntoElement {
-    canvas(|_, _, _| crate::frame_stats::complete_frame(), |_, _, _, _| {})
+    canvas(
+        |_, _, cx| {
+            if crate::frame_stats::complete_frame() {
+                if let Some(callback) = crate::frame_stats::frame_drawn_callback() {
+                    cx.defer(move |_| callback());
+                }
+            }
+        },
+        |_, _, _, _| {},
+    )
         .absolute()
         .size_0()
 }

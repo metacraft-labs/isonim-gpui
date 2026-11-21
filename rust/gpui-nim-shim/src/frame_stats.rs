@@ -44,6 +44,17 @@ static LATENCIES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static WORK: Mutex<Vec<FrameWork>> = Mutex::new(Vec::new());
 static PENDING_KEY: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// Frames drawn since the process started: one per `complete_frame` that
+/// closed a frame. MONOTONIC, unlike `gpui_frame_count` (which
+/// `gpui_frame_stats_reset` clears and `CAP` bounds), so a host can tell "a
+/// frame was drawn after this moment" by comparing two reads.
+static FRAMES_DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A host's "a frame was drawn" callback (`gpui_on_frame_drawn`).
+pub type FrameDrawnCallback = extern "C" fn();
+
+static FRAME_DRAWN: Mutex<Option<FrameDrawnCallback>> = Mutex::new(None);
+
 /// The epoch cached subtree views are drawn in. A view drawn at an older
 /// epoch is drawn again rather than replayed: see `cached_views`.
 static CACHED_SUBTREE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -174,12 +185,14 @@ pub fn note_key() {
 }
 
 /// The frame opened by `begin_frame` is drawn: record its render-path time
-/// and its work. A call with no frame open (a fallback root that drew no
-/// plan) records nothing.
-pub fn complete_frame() {
+/// and its work, and count it (`gpui_frames_drawn`). A call with no frame open
+/// (a fallback root that drew no plan) records nothing. Answers whether a
+/// frame was closed, so the caller can tell the host (`gpui_on_frame_drawn`).
+pub fn complete_frame() -> bool {
     if !OPEN.with(|o| o.replace(false)) {
-        return;
+        return false;
     }
+    FRAMES_DRAWN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let render_ns = RENDER_NS.with(|r| r.get());
     push(&FRAMES, render_ns);
     push(&WORK, current_work());
@@ -190,6 +203,29 @@ pub fn complete_frame() {
     if let Some(t) = pending {
         push(&LATENCIES, t.elapsed().as_nanos() as u64);
     }
+    true
+}
+
+/// Frames drawn since the process started (`FRAMES_DRAWN`): monotonic, never
+/// reset.
+#[no_mangle]
+pub extern "C" fn gpui_frames_drawn() -> u64 {
+    FRAMES_DRAWN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Register (or, with `None`, remove) the host's callback for a drawn frame.
+/// The shim calls it once per drawn frame, on the main thread, AFTER that
+/// frame's paint (deferred from the frame's end marker, `gpui_app.rs`), so it
+/// may read the host's state and the shim's freely; it is never called while
+/// nothing is drawn. With none registered a frame costs one lock and a check.
+#[no_mangle]
+pub extern "C" fn gpui_on_frame_drawn(callback: Option<FrameDrawnCallback>) {
+    *FRAME_DRAWN.lock().unwrap_or_else(|p| p.into_inner()) = callback;
+}
+
+/// The registered drawn-frame callback, if any.
+pub fn frame_drawn_callback() -> Option<FrameDrawnCallback> {
+    *FRAME_DRAWN.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// The `index`-th frame's work, or `None` past the end.
@@ -315,13 +351,33 @@ mod tests {
         assert_eq!(gpui_frame_work(99, out.as_mut_ptr()), 0);
         assert_eq!(gpui_frame_work(0, std::ptr::null_mut()), 0);
 
+        // The monotonic count moves once per CLOSED frame, not for a
+        // completion with no frame open; a reset of the series (at the end)
+        // does not move it back.
+        let drawn = gpui_frames_drawn();
+        begin_frame();
+        assert!(complete_frame());
+        assert_eq!(gpui_frames_drawn(), drawn + 1);
+        assert!(!complete_frame());
+        assert_eq!(gpui_frames_drawn(), drawn + 1);
+
+        // The drawn-frame callback is registered, read back and removed.
+        extern "C" fn on_drawn() {}
+        assert!(frame_drawn_callback().is_none());
+        gpui_on_frame_drawn(Some(on_drawn));
+        assert!(frame_drawn_callback().map(|f| f as usize) == Some(on_drawn as usize));
+        gpui_on_frame_drawn(None);
+        assert!(frame_drawn_callback().is_none());
+
         // Past the end reads 0 rather than panicking across the ABI.
         assert_eq!(gpui_frame_ns(99), 0);
         assert_eq!(gpui_key_latency_ns(99), 0);
 
+        let before_reset = gpui_frames_drawn();
         gpui_frame_stats_reset();
         assert_eq!(gpui_frame_count(), 0);
         assert_eq!(gpui_key_latency_count(), 0);
         assert_eq!(gpui_frame_work(0, out.as_mut_ptr()), 0);
+        assert_eq!(gpui_frames_drawn(), before_reset);
     }
 }

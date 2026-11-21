@@ -243,6 +243,15 @@ proc gpui_key_latency_count*(): uint64 {.importc: "gpui_key_latency_count".}
 proc gpui_key_latency_ns*(index: uint64): uint64
   {.importc: "gpui_key_latency_ns".}
 proc gpui_frame_stats_reset*() {.importc: "gpui_frame_stats_reset".}
+proc gpui_frames_drawn*(): uint64 {.importc: "gpui_frames_drawn".}
+  ## Frames drawn since the process started: monotonic, never reset (unlike
+  ## `gpui_frame_count`, which `gpui_frame_stats_reset` clears).
+type FrameDrawnCallback* = proc() {.cdecl.}
+proc gpui_on_frame_drawn*(callback: FrameDrawnCallback)
+  {.importc: "gpui_on_frame_drawn".}
+  ## Register (nil: remove) a callback the shim calls once per drawn frame,
+  ## on the main thread, after that frame's paint; never while nothing is
+  ## drawn.
 proc gpui_frame_work*(index: uint64; outCounts: ptr array[5, uint64]): uint8
   {.importc: "gpui_frame_work".}
   ## The `index`-th frame's work: shadow nodes the plan build visited, plans
