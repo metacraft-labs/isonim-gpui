@@ -1,0 +1,17 @@
+<!doctype html>
+<!-- The browser reference of `tests/test_gui_conic.nim`: five 40px discs,
+     each a two-stop conic gradient (red sector from twelve o'clock clockwise
+     over blue) at 0, 16, 50, 99 and 100 %, in a row with a 10px gap, on
+     white. The windowed test draws the same elements through the shim's
+     styles. Regenerate the fixture with `tools/conic-reference/capture.sh`. -->
+<html><head><meta charset="utf-8"><style>
+html, body { margin: 0; padding: 0; background: #ffffff; }
+.row { display: flex; flex-direction: row; gap: 10px; }
+.disc { width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; }
+</style></head><body><div class="row">
+<div class="disc" style="background-image: conic-gradient(#ff0000 0 0%, #0000ff 0% 100%)"></div>
+<div class="disc" style="background-image: conic-gradient(#ff0000 0 16%, #0000ff 16% 100%)"></div>
+<div class="disc" style="background-image: conic-gradient(#ff0000 0 50%, #0000ff 50% 100%)"></div>
+<div class="disc" style="background-image: conic-gradient(#ff0000 0 99%, #0000ff 99% 100%)"></div>
+<div class="disc" style="background-image: conic-gradient(#ff0000 0 100%, #0000ff 100% 100%)"></div>
+</div></body></html>

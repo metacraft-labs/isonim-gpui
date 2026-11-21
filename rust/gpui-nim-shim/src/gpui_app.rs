@@ -2047,6 +2047,19 @@ pub fn apply_styles_to_div(
             None => el.bg(color),
         };
     }
+    // A `background-image` in the two-stop conic subset: the pie's sector
+    // over the rest of the element's disc, over the background colour and
+    // under the border and the children (`with_conic_sector`). Any other
+    // image, or a colour the shim cannot read, is left unpainted.
+    if let Some(conic) = styles
+        .background_image
+        .as_deref()
+        .and_then(crate::conic::parse_two_stop_conic)
+    {
+        if let (Some(first), Some(rest)) = (parse_color(&conic.first), parse_color(&conic.rest)) {
+            el = with_conic_sector(el, first, rest, conic.fraction, styles.rounded.clone());
+        }
+    }
 
     // Width
     if let Some(ref w) = styles.w {
@@ -2628,6 +2641,68 @@ fn with_border_stroke(el: Div, stroke: BorderStroke) -> Div {
         .left(px(-w))
         .right(px(-w))
         .bottom(px(-w)),
+    )
+}
+
+/// The element's two-stop conic gradient
+/// (`conic-gradient(<first> 0 <p>%, <rest> <p>% 100%)`, CSS Images Level 4
+/// §3.3, <https://www.w3.org/TR/css-images-4/#conic-gradients>): the disc
+/// inscribed in the box filled with `rest`, then the sector of `fraction` of
+/// the turn, from twelve o'clock clockwise, filled with `first`
+/// (`conic::conic_shape`), each one antialiased fill path. Drawn by an
+/// absolutely positioned child over the padding box, so it lies over the
+/// background colour and under the border and the children, as a browser
+/// paints a background image. Painted only when the element is round
+/// (`conic::is_round`: `border-radius: 50%`, or a radius of at least half
+/// its shorter side), the one case the subset is defined for.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn with_conic_sector(el: Div, first: Hsla, rest: Hsla, fraction: f32, rounded: Option<String>) -> Div {
+    el.child(
+        canvas(
+            |_bounds, _window, _cx| (),
+            move |bounds, (), window, _cx| {
+                let w = f32::from(bounds.size.width);
+                let h = f32::from(bounds.size.height);
+                if !crate::conic::is_round(w, h, rounded.as_deref()) {
+                    return;
+                }
+                let r = w.min(h) / 2.0;
+                let cx = f32::from(bounds.left()) + w / 2.0;
+                let cy = f32::from(bounds.top()) + h / 2.0;
+                let p = |x: f32, y: f32| gpui::point(px(x), px(y));
+                let radii = gpui::point(px(r), px(r));
+                let disc = |colour: Hsla, window: &mut gpui::Window| {
+                    // Two half-circle arcs: one arc cannot end where it starts.
+                    let mut path = gpui::PathBuilder::fill();
+                    path.move_to(p(cx, cy - r));
+                    path.arc_to(radii, px(0.0), false, true, p(cx, cy + r));
+                    path.arc_to(radii, px(0.0), false, true, p(cx, cy - r));
+                    path.close();
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, colour);
+                    }
+                };
+                match crate::conic::conic_shape(cx, cy, r, fraction) {
+                    crate::conic::ConicShape::Empty => disc(rest, window),
+                    crate::conic::ConicShape::Full => disc(first, window),
+                    crate::conic::ConicShape::Sector(s) => {
+                        disc(rest, window);
+                        let mut path = gpui::PathBuilder::fill();
+                        path.move_to(p(cx, cy));
+                        path.line_to(p(s.start.0, s.start.1));
+                        path.arc_to(radii, px(0.0), s.large_arc, s.sweep, p(s.end.0, s.end.1));
+                        path.close();
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, first);
+                        }
+                    }
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
     )
 }
 

@@ -114,6 +114,10 @@ pub struct GpuiStyles {
     /// painted through the SVG's alpha instead of over its whole box
     /// (`gpui_app::parse_mask_url`).
     pub mask_image: Option<String>,
+    /// `background-image`: painted only in the two-stop conic subset
+    /// (`conic::parse_two_stop_conic`, a pie's sector over the rest of the
+    /// element's disc); any other image is left unpainted.
+    pub background_image: Option<String>,
     pub line_height: Option<String>,
     pub cursor: Option<String>,
     pub display: Option<String>,
@@ -230,6 +234,7 @@ impl GpuiStyles {
             "text-decoration" | "text_decoration" => self.text_decoration = Some(v),
             "text-align" | "text_align" => self.text_align = Some(v),
             "mask-image" | "mask_image" | "-webkit-mask-image" => self.mask_image = Some(v),
+            "background-image" | "background_image" => self.background_image = Some(v),
             "line-height" | "line_height" => self.line_height = Some(v),
             "cursor" => self.cursor = Some(v),
             "display" => self.display = Some(v),

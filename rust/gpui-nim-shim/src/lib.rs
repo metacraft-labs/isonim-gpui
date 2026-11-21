@@ -61,6 +61,9 @@ pub mod layout_bounds;
 // drew, and the characters its cut drops before the ellipsis. Feature-less
 // store for `input`'s reason; the element itself needs a GPUI feature.
 pub mod cut_text;
+// The two-stop conic gradient (`background-image`): its parse and the
+// sector it paints, pure and feature-less; `gpui_app` paints with it.
+pub mod conic;
 pub mod render_sync;
 #[allow(dead_code)]
 pub mod tree;
@@ -1685,6 +1688,7 @@ fn render_plan_to_json(plan: &render_sync::RenderNode) -> String {
         push_style!(text_decoration, "text_decoration");
         push_style!(text_align, "text_align");
         push_style!(mask_image, "mask_image");
+        push_style!(background_image, "background_image");
         push_style!(line_height, "line_height");
         push_style!(cursor, "cursor");
         if let Some(ref name) = s.cursor {
