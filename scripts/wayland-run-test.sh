@@ -24,8 +24,9 @@
 # fully software path (`WLR_RENDERER=pixman` with lavapipe via
 # `VK_ICD_FILENAMES`). It advertises `wl_seat` and
 # `zwlr_screencopy_manager_v1`, the latter being what lets `grim` read
-# the output back for `scripts/wayland-capture-frame.sh`. Xwayland hosted
-# by sway works too.
+# the output back for `scripts/wayland-capture-frame.sh`. Its Xwayland is
+# DISABLED (`nix/sway-headless.conf`): an X display number it held let
+# another job's X11 client map into the compositor under test.
 #
 # WESTON — REMOVED, and it used to be the DEFAULT, which is the part that
 # mattered. `weston --backend=headless-backend.so` advertises no
