@@ -2,11 +2,18 @@
 members = ["gpui-nim-shim", "gpui-kit-probe"]
 resolver = "2"
 
-# gpui-pre-linux 0.3.5 with one change: a press's click count is decided by
+# gpui-pre-linux 0.3.5 with two changes. First, a press's click count is decided by
 # the press events' own times (X11 `ButtonPress.time`, Wayland
 # `wl_pointer.button` time) rather than by when the window handled them, so a
 # window busy between two presses of a double click still sees one
 # (`vendor/gpui-pre-linux/src/linux/platform.rs`, `is_next_click`). Drop this
 # when upstream counts clicks the same way.
+#
+# And a second: a Wayland keyboard announced with NO keymap (`no_keymap`) no
+# longer aborts the window. Upstream ignores such a keymap and then unwraps the
+# keymap it does not have on the next `modifiers` or `key` event
+# (`vendor/gpui-pre-linux/src/linux/wayland/client.rs`); here the keyboard's
+# modifiers and keys are ignored until a keymap arrives
+# (`tests/test_gui_keyboard_no_keymap.nim`).
 [patch.crates-io]
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }

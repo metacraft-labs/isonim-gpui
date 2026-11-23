@@ -383,6 +383,7 @@ test-gui-x11:
 # Internal: actual GUI test commands (run inside headless display)
 _run-gui-tests:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui -d:gpuiBackend --path:../isonim/src tests/test_gui.nim
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui_keyboard_no_keymap -d:gpuiBackend --path:../isonim/src tests/test_gui_keyboard_no_keymap.nim
 
 # The window draws the borders, the weight and the absolute placement the
 # render plan carries, and a real compositor pointer reaches an element with

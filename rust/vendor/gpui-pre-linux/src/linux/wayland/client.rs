@@ -1856,7 +1856,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 ..
             } => {
                 if format != wl_keyboard::KeymapFormat::XkbV1 {
+                    // A keyboard with NO keymap (`no_keymap`, e.g. a virtual
+                    // keyboard that never uploaded one): there is nothing to
+                    // read its keycodes with, so the previous keyboard's keymap
+                    // must not be used for them. Its modifiers and keys are
+                    // ignored below until a keymap arrives.
                     log::error!("Received keymap format {:?}, expected XkbV1", format);
+                    state.keymap_state = None;
                     return;
                 }
                 let xkb_context = match new_xkb_context() {
@@ -1920,6 +1926,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             } => {
                 let focused_window = state.keyboard_focused_window.clone();
 
+                // `no_keymap` (above): no keymap to apply the masks to.
+                if state.keymap_state.is_none() {
+                    return;
+                }
                 let keymap_state = state.keymap_state.as_mut().unwrap();
                 let old_layout =
                     keymap_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE);
@@ -1957,7 +1967,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     return;
                 };
 
-                let keymap_state = state.keymap_state.as_ref().unwrap();
+                // `no_keymap` (above): a raw keycode nothing can name.
+                let Some(keymap_state) = state.keymap_state.as_ref() else {
+                    return;
+                };
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
 
