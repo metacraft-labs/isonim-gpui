@@ -238,6 +238,14 @@ static:
   assert compiles(gpui_last_event_kind(e))
   assert compiles(gpui_last_event_repeat(e))
   assert compiles(gpui_last_event_seq(e))
+
+  # --- The frame counter and its per-frame callback (9c36775) ---
+  #
+  # Their signatures, as above; the drawn-frame behaviour is the window
+  # lanes'. Declared without a call here, they failed this suite's
+  # every-binding-exercised check on their own.
+  assert compiles(gpui_frames_drawn())
+  assert compiles(gpui_on_frame_drawn(nil))
   assert compiles(gpui_event_delivery_count(e))
   assert compiles(gpui_set_focusable(e, 1.uint8))
   assert compiles(gpui_is_focusable(e))
