@@ -334,6 +334,11 @@ type
     key*: string
     modifiers*: GpuiModifiers
     repeat*: bool
+    timeMs*: uint32
+      ## When the platform says the event happened, on the display server's
+      ## millisecond clock (`GpuiEventPayload.timeMs`); 0 when unknown. A
+      ## consumer timing a chord of quick keys compares these, because a busy
+      ## window handles the same keys seconds apart.
 
   GpuiEventHandler* = proc(ev: GpuiEvent)
 
@@ -424,7 +429,8 @@ proc readPayload*(p: ptr GpuiEventPayload): GpuiEvent =
     kind: toEventKind(p.kind),
     key: (if p.key == nil: "" else: $p.key),
     modifiers: toModifiers(p.modifiers),
-    repeat: p.repeat != 0)
+    repeat: p.repeat != 0,
+    timeMs: p.timeMs)
 
 var callbackTable*: Table[int32, GpuiEventHandler]
 var nextCallbackId*: int32 = 1
@@ -746,7 +752,8 @@ template withPayload(ev: GpuiEvent; body: untyped): untyped =
       kind: fromEventKind(ev.kind),
       modifiers: fromModifiers(ev.modifiers),
       key: (if ev.key.len == 0: nil else: keyBuf),
-      repeat: (if ev.repeat: 1'u8 else: 0'u8))
+      repeat: (if ev.repeat: 1'u8 else: 0'u8),
+      timeMs: ev.timeMs)
     let payloadPtr {.inject.} = addr payload
     body
 

@@ -918,6 +918,43 @@ pub(super) fn is_next_click(previous_ms: Option<u32>, time_ms: u32) -> bool {
     }
 }
 
+/// The display server's time of the key event being dispatched, in milliseconds
+/// on the server's clock (Wayland `wl_keyboard.key` time, X11 `KeyPress.time`),
+/// wrapping at `u32::MAX`; 0 before any key.
+///
+/// isonim-gpui patch: GPUI's `KeyDownEvent` carries no time, so a consumer can
+/// only tell when its window HANDLED a key, and a window busy between quick keys
+/// handles them seconds apart. The client notes each key's own time here just
+/// before it dispatches the key, synchronously, to the window's handler, which
+/// reads it with `key_event_time_ms` (the embedding shim does, for CodeTracer's
+/// three-Escape recovery chord).
+static KEY_EVENT_TIME_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(super) fn note_key_event_time(time_ms: u32) {
+    KEY_EVENT_TIME_MS.store(time_ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The display server's time of the key event being dispatched right now
+/// (`note_key_event_time`); 0 before any key.
+pub fn key_event_time_ms() -> u32 {
+    KEY_EVENT_TIME_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(all(test, any(feature = "wayland", feature = "x11")))]
+mod key_event_time_tests {
+    use super::{key_event_time_ms, note_key_event_time};
+
+    #[test]
+    fn the_handler_reads_the_time_of_the_key_being_dispatched() {
+        note_key_event_time(123_456);
+        assert_eq!(key_event_time_ms(), 123_456);
+        // The server clock wraps: its last value is a time like any other.
+        note_key_event_time(u32::MAX);
+        assert_eq!(key_event_time_ms(), u32::MAX);
+    }
+}
+
 #[cfg(all(test, any(feature = "wayland", feature = "x11")))]
 mod click_count_tests {
     use super::is_next_click;

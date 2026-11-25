@@ -59,7 +59,12 @@ type
     modifiers*: uint32     ## `GpuiMod*` bits
     key*: cstring          ## base key name, or nil when the event has no key
     repeat*: uint8         ## 1 for an auto-repeat
-    reserved*: array[7, uint8]
+    reserved*: array[3, uint8]
+    timeMs*: uint32
+      ## When the platform says the event HAPPENED, in milliseconds on the
+      ## display server's clock (Wayland `wl_keyboard.key` time, X11
+      ## `KeyPress.time`), wrapping at `high(uint32)`; 0 when unknown. The
+      ## key's arrival, not when the window got to it.
 
 const
   GpuiEventOther* = 0'u32

@@ -2371,6 +2371,7 @@ dependencies = [
  "core-foundation 0.10.0",
  "core-foundation-sys",
  "gpui-pre",
+ "gpui-pre-linux",
  "gpui-pre-platform",
  "image",
  "libc",

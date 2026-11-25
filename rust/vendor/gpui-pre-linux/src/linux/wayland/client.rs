@@ -1954,6 +1954,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             }
             wl_keyboard::Event::Key {
                 serial,
+                time,
                 key,
                 state: WEnum::Value(key_state),
                 ..
@@ -1961,6 +1962,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 if key_state == wl_keyboard::KeyState::Pressed {
                     state.serial_tracker.update(SerialKind::KeyPress, serial);
                 }
+                // isonim-gpui patch: the key's own time, for the handler this
+                // dispatch reaches (`platform::note_key_event_time`).
+                crate::linux::platform::note_key_event_time(time);
 
                 let focused_window = state.keyboard_focused_window.clone();
                 let Some(focused_window) = focused_window else {

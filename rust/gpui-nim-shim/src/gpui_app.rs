@@ -655,6 +655,11 @@ fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
                     ),
                     crate::input::modifier_bits(&ks.modifiers),
                     event.is_held,
+                    // When the key HAPPENED on the display server's clock,
+                    // taken from the platform event the vendored
+                    // gpui-pre-linux dispatched synchronously into this
+                    // handler (GPUI's own KeyDownEvent carries no time).
+                    crate::input::platform_key_time_ms(),
                 )),
             );
         })
@@ -668,6 +673,7 @@ fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
                     String::new(),
                     crate::input::modifier_bits(&event.modifiers),
                     false,
+                    0,
                 )),
             );
         })

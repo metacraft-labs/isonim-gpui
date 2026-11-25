@@ -259,6 +259,9 @@ pub struct DeliveredEvent {
     pub modifiers: u32,
     /// Whether the platform reported this as an auto-repeat.
     pub repeat: bool,
+    /// When the platform says the event happened, in milliseconds on the
+    /// display server's clock (`GpuiEventPayload::time_ms`); 0 when unknown.
+    pub time_ms: u32,
     /// Process-wide monotonic delivery sequence number, starting at 1.
     /// A node that has never received anything answers 0, which is how
     /// "nothing arrived" is distinguished from "an identical thing arrived

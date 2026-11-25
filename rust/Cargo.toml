@@ -2,7 +2,7 @@
 members = ["gpui-nim-shim", "gpui-kit-probe"]
 resolver = "2"
 
-# gpui-pre-linux 0.3.5 with two changes. First, a press's click count is decided by
+# gpui-pre-linux 0.3.5 with three changes. First, a press's click count is decided by
 # the press events' own times (X11 `ButtonPress.time`, Wayland
 # `wl_pointer.button` time) rather than by when the window handled them, so a
 # window busy between two presses of a double click still sees one
@@ -15,5 +15,11 @@ resolver = "2"
 # (`vendor/gpui-pre-linux/src/linux/wayland/client.rs`); here the keyboard's
 # modifiers and keys are ignored until a keymap arrives
 # (`tests/test_gui_keyboard_no_keymap.nim`).
+#
+# And a third: the time of the key event being dispatched (X11 `KeyPress.time`,
+# Wayland `wl_keyboard.key` time) is kept for the window's key handler to read
+# (`vendor/gpui-pre-linux/src/linux/platform.rs`, `key_event_time_ms`), because
+# GPUI's KeyDownEvent carries none and a window busy between quick keys handles
+# them seconds apart. The shim passes it to its consumer with each key.
 [patch.crates-io]
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }

@@ -28,12 +28,12 @@
 ## No mocks. `GpuiRenderer` is the real renderer and the tree is the real
 ## Rust shim's.
 
-import std/[strutils, unittest]
+import std/[os, strutils, unittest]
 
 import isonim_gpui/bindings
 import isonim_gpui/renderer
 
-const ExpectedAssertions = 208
+const ExpectedAssertions = 216
   ## Asserted against the runtime tally below and printed as `CHECKS:`.
 
 var checkCount = 0
@@ -66,6 +66,7 @@ suite "PLAT-38 — the payload ABI":
     ck int(gpui_event_payload_layout(3)) == offsetOf(GpuiEventPayload, modifiers)
     ck int(gpui_event_payload_layout(4)) == offsetOf(GpuiEventPayload, key)
     ck int(gpui_event_payload_layout(5)) == offsetOf(GpuiEventPayload, repeat)
+    ck int(gpui_event_payload_layout(6)) == offsetOf(GpuiEventPayload, timeMs)
     # And the reader is two-sided about its own input: a layout query the
     # shim does not understand must be unmistakable, or "0" would read as a
     # legitimate offset.
@@ -139,6 +140,29 @@ suite "PLAT-38 — the payload ABI":
     ck got[0].kind == gekModifiers and got[0].modifiers == {gmAlt}
     ck got[0].key == ""
     ck got[1].kind == gekModifiers and got[1].modifiers == {}
+
+  test "a key's own time reaches its listener: when it happened, not when it was handled":
+    # The platform's time of each key (`timeMs`, the display server's clock)
+    # crosses the boundary with the key and is what the listener reads, so a
+    # consumer can time a chord of quick keys that a busy window handled
+    # seconds apart. Dispatched here 300 ms apart in handling, 20 ms apart in
+    # their own times.
+    let el = r.createElement("div")
+    var got: seq[GpuiEvent] = @[]
+    r.addEventListener(el, "keydown", proc(ev: GpuiEvent) = got.add ev)
+    for t in [1_000'u32, 1_020'u32]:
+      var payload = GpuiEventPayload(kind: GpuiEventKeyDown, modifiers: 0,
+                                     key: "Escape".cstring, repeat: 0,
+                                     timeMs: t)
+      ck gpui_dispatch_event_with(el, "keydown".cstring, addr payload) == 1
+      os.sleep(300)
+    ck got.len == 2
+    ck got[0].timeMs == 1_000'u32 and got[1].timeMs == 1_020'u32
+    ck got[0].key == "Escape"
+    # A payload that carries no time (an older sender's zeros) reads as 0.
+    var none = GpuiEventPayload(kind: GpuiEventKeyDown, key: "a".cstring)
+    ck gpui_dispatch_event_with(el, "keydown".cstring, addr none) == 1
+    ck got[^1].timeMs == 0'u32
 
   test "a nil payload decodes to an event that carries nothing":
     let ev = readPayload(nil)

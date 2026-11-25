@@ -2,6 +2,7 @@ mod dispatcher;
 mod headless;
 mod keyboard;
 mod platform;
+pub use platform::key_event_time_ms;
 mod system_notifications;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 mod text_system;

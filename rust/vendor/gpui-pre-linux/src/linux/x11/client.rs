@@ -1075,6 +1075,9 @@ impl X11Client {
             }
             Event::KeyPress(event) => {
                 let window = self.get_window(event.event)?;
+                // isonim-gpui patch: the key's own time, for the handler this
+                // dispatch reaches (`platform::note_key_event_time`).
+                crate::linux::platform::note_key_event_time(event.time);
                 let mut state = self.0.borrow_mut();
 
                 let modifiers = modifiers_from_state(event.state);
