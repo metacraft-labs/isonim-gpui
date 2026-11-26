@@ -295,7 +295,21 @@ BENCHMARKS=(
 #     rebuilds its path and nothing beside it). Its `cached_views` and probe
 #     cases are `gpui-backend` only, counted by the `--with-gpui` arm. Every
 #     Nim subject is unchanged (165 cases).
-EXPECTED_CASES=412
+# 2026-11-26, written LAST and from a run (trap 4c), at `29c6c6a` (the
+# `agents-to-dev-2026-11-26` cut) with its stabilisation fixes uncommitted:
+# 419.
+#   * THE LANE WAS RED BY DRIFT at `29c6c6a`: three commits added cases
+#     without moving this figure, and `29c6c6a` itself left
+#     `cargo test` uncompilable (its `input.rs` test still destructured the
+#     four-field payload), so the lane read 0 Rust cases there. With that
+#     test repaired, rust 247 -> 253 and input-focus 28 -> 29, every other
+#     subject unchanged:
+#       `1489587` +1 (`lib.rs`: the string-out exports share one protocol)
+#       `691815d` +5 (`conic`: the gradient's parse and its sector)
+#       `29c6c6a` +1 (`test_input_focus`: a key event's platform time)
+#     `936f27d`'s text-decoration case is in `gpui_app.rs`, which the default
+#     build does not compile; it is counted by the `--with-gpui` arms.
+EXPECTED_CASES=419
 
 total_cases=0
 failed_steps=()
