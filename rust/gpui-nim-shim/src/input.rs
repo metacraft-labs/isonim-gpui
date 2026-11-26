@@ -856,7 +856,7 @@ mod tests {
 
     extern "C" fn record_mods(p: *const GpuiEventPayload) {
         let mods = unsafe { GpuiEventPayload::read(p) }
-            .map(|(_, _, m, _)| m)
+            .map(|(_, _, m, _, _)| m)
             .unwrap_or(0xDEAD_BEEF);
         SEEN_MODS.store(mods, TestOrdering::SeqCst);
     }
