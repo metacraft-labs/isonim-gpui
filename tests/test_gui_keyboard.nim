@@ -64,7 +64,25 @@ when not defined(gpuiBackend):
            "PLAT-38's gate says this file must not be.".}
 
 const
-  ExpectedAssertions = 184
+  FixedAssertions = 17
+    ## The checks that run ONCE per run: the typist's exit, the seven
+    ## per-class counts, the three modifier sightings, the five store
+    ## read-backs and the backstop.
+  PerArrivalAssertions = 3
+    ## The checks that run once per ARRIVAL (its kind, its key, its seq).
+    ##
+    ## THE EXPECTED TOTAL IS DERIVED FROM THE REALISED POPULATION, NOT
+    ## DECLARED AS ONE NUMBER. It used to be the constant 184, which is
+    ## 17 + 3 * 42 + 41: right only for a run in which the held `Down`
+    ## auto-repeated exactly 37 times. How many repeats a held key produces
+    ## is a function of sway's `repeat_rate` and of scheduling — the reason
+    ## the class check above is a floor (`repeats >= 1`) and not an equality
+    ## (§28) — so the constant was an exact figure over that same noisy
+    ## quantity. Measured 2026-11-26 at `29c6c6a` under headless sway: one
+    ## run delivered 41 arrivals and counted 180 checks, the next 42 and
+    ## 184, with every other assertion green in both. The guard still does
+    ## its job: a check that stopped running, or ran a different number of
+    ## times than the population says it must, moves the total.
 
   LaunchAutoQuitMs = 12_000'u32
     ## The backstop. Long enough for the window to open on the software
@@ -314,5 +332,11 @@ suite "PLAT-38 — a real key through wl_seat":
     ck elapsedMs < int(LaunchAutoQuitMs)
 
   test "the assertion count matches the declared constant":
-    echo "CHECKS: ", checkCount
-    check checkCount == ExpectedAssertions
+    # One check per arrival per per-arrival assertion, plus one ordering
+    # check per consecutive pair of arrivals.
+    let expectedAssertions = FixedAssertions +
+      PerArrivalAssertions * arrivals.len + max(arrivals.len - 1, 0)
+    echo "CHECKS: ", checkCount, " (expected ", expectedAssertions, " for ",
+         arrivals.len, " arrivals)"
+    check arrivals.len > 0
+    check checkCount == expectedAssertions
