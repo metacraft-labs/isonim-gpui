@@ -33,6 +33,9 @@ gpui-backend = [
     # platform-independently, so naming a target-gated optional dependency
     # here is legal and simply activates nothing off macOS. See
     # `src/mac_event_loop.rs` for why the shim needs AppKit directly.
+    # Linux: the key events' own times (`input::platform_key_time_ms`), which
+    # only the vendored platform crate sees. Inert on every other target.
+    "dep:gpui_linux",
     "dep:objc2",
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
@@ -106,6 +109,13 @@ gpui-headless = [
 gpui = { package = "gpui-pre", version = "=0.3.5", optional = true }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.5", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+# Linux: the platform crate itself, for the time of the key event it is
+# dispatching (`gpui_linux::key_event_time_ms`, an isonim-gpui patch of the
+# vendored copy). Already in the graph through `gpui-pre-platform`; this adds
+# an edge, not a crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_linux = { package = "gpui-pre-linux", version = "=0.3.5", optional = true }
 
 # macOS: AppKit, for the one thing GPUI does not give an embedder — a way
 # OUT of `-[NSApplication run]` that is not `terminate:`. The versions are

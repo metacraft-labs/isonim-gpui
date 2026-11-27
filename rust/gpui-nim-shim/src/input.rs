@@ -57,7 +57,7 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tree::{DeliveredEvent, NodeId};
-use crate::{cstr_to_str, handle_to_node_id, lock_tree, node_id_to_handle, GpuiElement};
+use crate::{cstr_to_str, handle_to_node_id, lock_tree, node_id_to_handle, write_str_out, GpuiElement};
 
 // ---------------------------------------------------------------------------
 // The payload
@@ -116,9 +116,16 @@ pub struct GpuiEventPayload {
     pub key: *const c_char,
     /// 1 when the platform reported an auto-repeat.
     pub repeat: u8,
-    /// Explicit tail padding, so the struct's layout is the same thing on
-    /// both sides of the boundary rather than whatever each compiler chose.
-    pub _reserved: [u8; 7],
+    /// Explicit padding, so the struct's layout is the same thing on both
+    /// sides of the boundary rather than whatever each compiler chose.
+    pub _reserved: [u8; 3],
+    /// When the platform says the key event HAPPENED, in milliseconds on the
+    /// display server's clock (Wayland `wl_keyboard.key` time, X11
+    /// `KeyPress.time`), wrapping at `u32::MAX`; 0 when unknown. It is the
+    /// key's arrival, not when the window got to it: a consumer timing a
+    /// chord of quick keys (CodeTracer's three-Escape recovery) compares these,
+    /// because a busy window handles the same keys seconds apart.
+    pub time_ms: u32,
 }
 
 impl GpuiEventPayload {
@@ -129,7 +136,7 @@ impl GpuiEventPayload {
     /// # Safety
     /// `p` must be null or point at a live `GpuiEventPayload` whose `key` is
     /// null or a NUL-terminated string.
-    pub unsafe fn read(p: *const GpuiEventPayload) -> Option<(u32, String, u32, bool)> {
+    pub unsafe fn read(p: *const GpuiEventPayload) -> Option<KeyPayload> {
         if p.is_null() {
             return None;
         }
@@ -139,7 +146,28 @@ impl GpuiEventPayload {
         } else {
             cstr_to_str(v.key).to_string()
         };
-        Some((v.kind, key, v.modifiers, v.repeat != 0))
+        Some((v.kind, key, v.modifiers, v.repeat != 0, v.time_ms))
+    }
+}
+
+/// What a delivered event carries: its kind, key, modifier bits, whether it
+/// auto-repeated, and when the platform says it happened (`time_ms`, 0 when
+/// unknown).
+pub type KeyPayload = (u32, String, u32, bool, u32);
+
+/// When the key event being dispatched right now HAPPENED, in milliseconds on
+/// the display server's clock; 0 when the platform cannot say (any window that
+/// is not a Linux one, and the headless renderer). Read inside `on_key_down`,
+/// which the vendored gpui-pre-linux reaches synchronously from the event, so
+/// the time is that key's.
+pub fn platform_key_time_ms() -> u32 {
+    #[cfg(all(feature = "gpui-backend", target_os = "linux"))]
+    {
+        gpui_linux::key_event_time_ms()
+    }
+    #[cfg(not(all(feature = "gpui-backend", target_os = "linux")))]
+    {
+        0
     }
 }
 
@@ -152,8 +180,8 @@ impl GpuiEventPayload {
 /// compares Nim's own `sizeof` / `offsetof` against these numbers rather than
 /// against a literal both sides could be wrong about together.
 ///
-/// `field`: 0 = size, 1 = align, 2..5 = offset of `kind`, `modifiers`, `key`,
-/// `repeat`. Anything else answers `u64::MAX`, so a caller that asked a
+/// `field`: 0 = size, 1 = align, 2..6 = offset of `kind`, `modifiers`, `key`,
+/// `repeat`, `time_ms`. Anything else answers `u64::MAX`, so a caller that asked a
 /// question this function does not understand gets an answer it cannot
 /// mistake for a byte count.
 #[no_mangle]
@@ -165,6 +193,7 @@ pub extern "C" fn gpui_event_payload_layout(field: u32) -> u64 {
         3 => std::mem::offset_of!(GpuiEventPayload, modifiers) as u64,
         4 => std::mem::offset_of!(GpuiEventPayload, key) as u64,
         5 => std::mem::offset_of!(GpuiEventPayload, repeat) as u64,
+        6 => std::mem::offset_of!(GpuiEventPayload, time_ms) as u64,
         _ => u64::MAX,
     }
 }
@@ -185,19 +214,22 @@ static DELIVERY_SEQ: AtomicU64 = AtomicU64::new(0);
 /// is held**; the callbacks run after it is released, because a callback that
 /// mutates the tree through the FFI would otherwise deadlock (the property
 /// `render_sync::test_dispatch_shadow_event_lock_release` already pins).
-pub fn deliver(node_id: NodeId, event: &str, payload: Option<(u32, String, u32, bool)>) -> u32 {
+pub fn deliver(node_id: NodeId, event: &str, payload: Option<KeyPayload>) -> u32 {
     if node_id.is_null() {
         return 0;
     }
     let seq = DELIVERY_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    let (kind, key, modifiers, repeat) = match payload {
-        Some((k, key, m, r)) => (k, key, m, r),
-        None => (GPUI_EVENT_OTHER, String::new(), 0, false),
+    let (kind, key, modifiers, repeat, time_ms) = match payload {
+        Some((k, key, m, r, t)) => (k, key, m, r, t),
+        None => (GPUI_EVENT_OTHER, String::new(), 0, false, 0),
     };
 
     let listeners: Vec<(crate::EventCallback, i32)> = {
         let mut tree = lock_tree();
-        let Some(n) = tree.get_mut(node_id) else {
+        // Untracked: the delivery record is not part of what the node
+        // renders, and a key that marked its target changed would rebuild
+        // that target's plan on every keystroke.
+        let Some(n) = tree.get_mut_untracked(node_id) else {
             return 0;
         };
         let ls: Vec<(crate::EventCallback, i32)> = n
@@ -215,6 +247,7 @@ pub fn deliver(node_id: NodeId, event: &str, payload: Option<(u32, String, u32, 
             key,
             modifiers,
             repeat,
+            time_ms,
             seq,
         });
         n.delivery_count += ls.len() as u64;
@@ -233,7 +266,7 @@ pub fn deliver(node_id: NodeId, event: &str, payload: Option<(u32, String, u32, 
     // store kept are the same bytes by construction. A handler comparing the
     // two would otherwise be comparing two independent copies and could not
     // see one of them going wrong.
-    let (kind, key_c, modifiers, repeat) = {
+    let (kind, key_c, modifiers, repeat, time_ms) = {
         let tree = lock_tree();
         match tree.get(node_id).and_then(|n| n.last_event.as_ref()) {
             Some(rec) => (
@@ -241,12 +274,14 @@ pub fn deliver(node_id: NodeId, event: &str, payload: Option<(u32, String, u32, 
                 std::ffi::CString::new(rec.key.as_str()).unwrap_or_default(),
                 rec.modifiers,
                 rec.repeat,
+                rec.time_ms,
             ),
             None => (
                 GPUI_EVENT_OTHER,
                 std::ffi::CString::default(),
                 0u32,
                 false,
+                0u32,
             ),
         }
     };
@@ -261,7 +296,8 @@ pub fn deliver(node_id: NodeId, event: &str, payload: Option<(u32, String, u32, 
             key_c.as_ptr()
         },
         repeat: u8::from(repeat),
-        _reserved: [0; 7],
+        _reserved: [0; 3],
+        time_ms,
     };
     let pay_ptr: *const GpuiEventPayload = if has_payload {
         &pay as *const GpuiEventPayload
@@ -314,7 +350,7 @@ pub fn deliver_pointer(
         Some((dx, dy)) => format!("{:.1},{:.1},{:.1},{:.1}", x, y, dx, dy),
         None => format!("{:.1},{:.1}", x, y),
     };
-    let reached = deliver(node_id, event, Some((kind, key.clone(), modifiers, false)));
+    let reached = deliver(node_id, event, Some((kind, key.clone(), modifiers, false, 0)));
     // `ISONIM_GPUI_TRACE_POINTER=1`: one line per pointer event and how many
     // listeners it reached — for diagnosing a window lane's pointer path.
     if std::env::var_os("ISONIM_GPUI_TRACE_POINTER").is_some() {
@@ -337,7 +373,7 @@ pub fn deliver_press(
 ) -> u32 {
     let (ox, oy) = crate::window::content_origin();
     let key = format!("{:.1},{:.1},{}", x - ox, y - oy, click_count);
-    let reached = deliver(node_id, event, Some((kind, key.clone(), modifiers, false)));
+    let reached = deliver(node_id, event, Some((kind, key.clone(), modifiers, false, 0)));
     if std::env::var_os("ISONIM_GPUI_TRACE_POINTER").is_some() {
         eprintln!("pointer {} {} node {} reached {}", event, key, node_id.0, reached);
     }
@@ -369,30 +405,6 @@ pub extern "C" fn gpui_dispatch_event_with(
 // ---------------------------------------------------------------------------
 // Reading the element store back
 // ---------------------------------------------------------------------------
-
-/// The two-call sizing protocol this shim already uses for
-/// `gpui_get_attribute`, `gpui_get_tag` and `gpui_get_text_content`: call
-/// with a null buffer to learn the byte count, then again with a buffer.
-///
-/// It exists as a function here rather than as a fourth hand-copy of the same
-/// eight lines (§30a — *"the worst instance was a whole re-derived module"*).
-/// The three existing copies are left alone on purpose: rewriting them is a
-/// change to functions this milestone does not otherwise touch, and would put
-/// PLAT-38's diff on top of code another milestone is editing in the same
-/// window. That is a residual, stated rather than closed.
-fn write_str_out(s: &str, buf: *mut u8, buf_len: u64) -> u64 {
-    let bytes = s.as_bytes();
-    let needed = bytes.len() as u64;
-    if buf.is_null() || buf_len == 0 {
-        return needed;
-    }
-    let to_copy = std::cmp::min(bytes.len(), (buf_len - 1) as usize);
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
-        *buf.add(to_copy) = 0;
-    }
-    needed
-}
 
 /// The base key name of the last event delivered to `node`, written into
 /// `buf`. Returns the byte count (0 for "no key" and for "nothing arrived" —
@@ -713,7 +725,7 @@ pub extern "C" fn gpui_dispatch_key_to_focus(
 /// point calls it too.** A second routing routine for the compositor path
 /// would be §30 in the exact place PLAT-38's gate reads — the suite would be
 /// grading the C path while the window ran a different one.
-pub fn deliver_key_to_focus(event: &str, payload: Option<(u32, String, u32, bool)>) -> u32 {
+pub fn deliver_key_to_focus(event: &str, payload: Option<KeyPayload>) -> u32 {
     if !crate::window::any_window_focused() {
         return 0;
     }
@@ -844,7 +856,7 @@ mod tests {
 
     extern "C" fn record_mods(p: *const GpuiEventPayload) {
         let mods = unsafe { GpuiEventPayload::read(p) }
-            .map(|(_, _, m, _)| m)
+            .map(|(_, _, m, _, _)| m)
             .unwrap_or(0xDEAD_BEEF);
         SEEN_MODS.store(mods, TestOrdering::SeqCst);
     }
@@ -870,7 +882,8 @@ mod tests {
                 modifiers: GPUI_MOD_SHIFT | GPUI_MOD_CONTROL,
                 key: key.as_ptr(),
                 repeat: 1,
-                _reserved: [0; 7],
+                _reserved: [0; 3],
+                time_ms: 0,
             };
             let reached = gpui_dispatch_event_with(el, c("keydown").as_ptr(), &pay);
             assert_eq!(reached, 1);
@@ -905,7 +918,8 @@ mod tests {
                 modifiers: 0,
                 key: key.as_ptr(),
                 repeat: 0,
-                _reserved: [0; 7],
+                _reserved: [0; 3],
+                time_ms: 0,
             };
             assert_eq!(gpui_dispatch_event_with(el, c("keydown").as_ptr(), &pay), 0);
             assert_eq!(gpui_event_delivery_count(el), 0);

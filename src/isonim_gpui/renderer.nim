@@ -334,6 +334,11 @@ type
     key*: string
     modifiers*: GpuiModifiers
     repeat*: bool
+    timeMs*: uint32
+      ## When the platform says the event happened, on the display server's
+      ## millisecond clock (`GpuiEventPayload.timeMs`); 0 when unknown. A
+      ## consumer timing a chord of quick keys compares these, because a busy
+      ## window handles the same keys seconds apart.
 
   GpuiEventHandler* = proc(ev: GpuiEvent)
 
@@ -424,7 +429,8 @@ proc readPayload*(p: ptr GpuiEventPayload): GpuiEvent =
     kind: toEventKind(p.kind),
     key: (if p.key == nil: "" else: $p.key),
     modifiers: toModifiers(p.modifiers),
-    repeat: p.repeat != 0)
+    repeat: p.repeat != 0,
+    timeMs: p.timeMs)
 
 var callbackTable*: Table[int32, GpuiEventHandler]
 var nextCallbackId*: int32 = 1
@@ -582,6 +588,40 @@ proc layoutBounds*(node: GpuiElement;
   h = xywh[3]
   true
 
+const EllipsisTrimAttribute* = "data-ellipsis-trim"
+  ## The attribute an element that declares `text-overflow` names, one
+  ## character each, what its cut drops from the end of what it keeps
+  ## before the ellipsis, besides whitespace (`"·—"`: `a · b` cut after the
+  ## `·` reads `a…`, not `a ·…`). See the shim's `cut_text` module.
+
+const EllipsisAtAttribute* = "data-ellipsis-at"
+  ## The attribute an element that declares `text-overflow` names where its
+  ## cut falls with: `"middle"` keeps the text's start and end and drops its
+  ## middle; absent, the cut falls at the end. See the shim's `cut_text`
+  ## module.
+
+const EllipsisSegmentsAttribute* = "data-ellipsis-segments"
+  ## For a middle cut, the characters that separate the text's segments, one
+  ## character each (`"/"` for a path): the cut keeps the first segment and
+  ## the last whole, and as many of the segments before the last as fit
+  ## (`src/…/retry/client.py`, then `src/…/client.py`, then `…/client.py`),
+  ## and cuts at the end when even the last segment does not fit. Absent,
+  ## a middle cut is character by character. The characters named in
+  ## `EllipsisTrimAttribute` are dropped on both sides of the "…".
+
+proc drawnText*(node: GpuiElement): string =
+  ## The text an element that declares `text-overflow` drew in the latest
+  ## frame: whole, or cut and ended with the ellipsis. Empty for an element
+  ## no frame has drawn such a text for, or in a build without the GPUI
+  ## backend. See the shim's `cut_text` module.
+  if node == nil: return ""
+  let needed = gpui_drawn_text(node, nil, 0)
+  if needed == 0: return ""
+  var buf = newString(int(needed) + 1)
+  discard gpui_drawn_text(node, addr buf[0], uint64(buf.len))
+  buf.setLen(int(needed))
+  buf
+
 proc textContent*(node: GpuiElement): string =
   let needed = gpui_get_text_content(node, nil, 0)
   if needed == 0:
@@ -712,7 +752,8 @@ template withPayload(ev: GpuiEvent; body: untyped): untyped =
       kind: fromEventKind(ev.kind),
       modifiers: fromModifiers(ev.modifiers),
       key: (if ev.key.len == 0: nil else: keyBuf),
-      repeat: (if ev.repeat: 1'u8 else: 0'u8))
+      repeat: (if ev.repeat: 1'u8 else: 0'u8),
+      timeMs: ev.timeMs)
     let payloadPtr {.inject.} = addr payload
     body
 

@@ -108,6 +108,10 @@ pub struct NimRootView {
     /// FALLBACK_BAR_HEIGHT` while the application draws the decorations, is
     /// not fullscreen and declares no drag region of its own; 0 otherwise.
     title_bar: f32,
+
+    /// The cached subtree views the last frame drew directly below the root
+    /// (`cached_views`); each of them holds the ones below it.
+    boundaries: crate::cached_views::Boundaries,
 }
 
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
@@ -122,6 +126,7 @@ impl NimRootView {
             decorations_rerequested: false,
             launch_inflated: None,
             title_bar: 0.0,
+            boundaries: crate::cached_views::Boundaries::default(),
         }
     }
 
@@ -232,10 +237,17 @@ impl NimRootView {
         // the fallback bar and two spurious resizes at every grant (measured
         // with CodeTracer on sway: 1280x800 -> 1260x748 -> 1280x800).
         window::update_chrome_state(win_id, chrome);
+        // Read off the root's plan, which counts the drag regions of its
+        // subtree (`RenderNode::drag_regions`), rather than by a walk over
+        // the whole tree every frame. The plan built here is the frame's
+        // plan unless the callbacks below change the tree again.
         let has_drag_region = {
-            let tree = crate::lock_tree();
             let root = *crate::ROOT_NODE_ID.lock().unwrap_or_else(|p| p.into_inner());
-            crate::regions::tree_declares_drag_region(&tree, root)
+            let mut tree = crate::lock_tree();
+            let mut work = crate::render_sync::PlanWork::default();
+            let plan = crate::render_sync::plan_incremental(&mut tree, root, &mut work);
+            crate::frame_stats::note_plan(work);
+            plan.map_or(false, |p| p.drag_regions > 0)
         };
         self.title_bar = if client && !window.is_fullscreen() && !has_drag_region {
             crate::regions::FALLBACK_BAR_HEIGHT
@@ -481,6 +493,7 @@ impl Render for NimRootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Check and clear the repaint flag (so we know the frame is current).
         let _ = window::take_repaint_request();
+        crate::frame_stats::begin_frame();
         drop_evicted_images(window);
 
         // Start a background polling timer that checks REPAINT_REQUESTED
@@ -537,7 +550,6 @@ impl Render for NimRootView {
 
         self.sync_window_registry(window, cx);
 
-        let tree = crate::lock_tree();
         let root_id = *crate::ROOT_NODE_ID
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -548,10 +560,21 @@ impl Render for NimRootView {
         }
 
         let started = std::time::Instant::now();
-        match crate::render_sync::build_render_plan(&tree, root_id) {
+        // The plan, rebuilt only where the tree's dirty marks say it changed
+        // (`render_sync::plan_incremental`). The lock is released before the
+        // elements are built.
+        let plan = {
+            let mut tree = crate::lock_tree();
+            let mut work = crate::render_sync::PlanWork::default();
+            let plan = crate::render_sync::plan_incremental(&mut tree, root_id, &mut work);
+            crate::frame_stats::note_plan(work);
+            plan
+        };
+        match plan {
             Some(plan) => {
-                drop(tree); // release lock before building GPUI elements
                 let cursor_override = window_cursor_override().into_any_element();
+                let mut boundaries = std::mem::take(&mut self.boundaries);
+                let mut bcx = crate::cached_views::BuildCx::new(cx, &mut boundaries);
                 let element = if self.frame.is_framed() || self.title_bar > 0.0 {
                     let title_bar = (self.title_bar > 0.0).then(|| {
                         let win_id = active_window_id();
@@ -569,22 +592,27 @@ impl Render for NimRootView {
                         }
                     });
                     frame_client_window(
-                        render_plan_to_gpui(&plan),
+                        render_plan_to_gpui_in(&plan, Some(&mut bcx), &crate::cached_views::LayoutBox::WINDOW),
                         &self.frame,
                         title_bar,
                         FrameColors::of(&plan, window.is_window_active()),
                         &handle,
                     )
                 } else {
-                    render_root_to_gpui(&plan, &handle)
+                    render_root_in(&plan, &handle, Some(&mut bcx))
                 };
+                self.boundaries = bcx.finish();
                 // PLAT-42: the render-path half of the frame budget. GPUI's
-                // layout and paint follow and are not in this number.
-                crate::frame_stats::complete_frame(started.elapsed().as_nanos() as u64);
+                // layout and paint follow and are not in this number; the
+                // cached subtree views GPUI renders during them add their own
+                // share, and the frame is recorded once they have run, by the
+                // marker drawn last (`frame_end_marker`).
+                crate::frame_stats::add_render_ns(started.elapsed().as_nanos() as u64);
                 div()
                     .size_full()
                     .child(element)
                     .child(cursor_override)
+                    .child(frame_end_marker())
                     .into_any_element()
             }
             None => with_keyboard(div().size_full().child("Empty shadow tree"), &handle)
@@ -627,6 +655,11 @@ fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
                     ),
                     crate::input::modifier_bits(&ks.modifiers),
                     event.is_held,
+                    // When the key HAPPENED on the display server's clock,
+                    // taken from the platform event the vendored
+                    // gpui-pre-linux dispatched synchronously into this
+                    // handler (GPUI's own KeyDownEvent carries no time).
+                    crate::input::platform_key_time_ms(),
                 )),
             );
         })
@@ -640,6 +673,7 @@ fn with_keyboard(el: Div, handle: &gpui::FocusHandle) -> Div {
                     String::new(),
                     crate::input::modifier_bits(&event.modifiers),
                     false,
+                    0,
                 )),
             );
         })
@@ -702,19 +736,52 @@ pub fn render_root_to_gpui(
     plan: &crate::render_sync::RenderNode,
     handle: &gpui::FocusHandle,
 ) -> AnyElement {
+    render_root_in(plan, handle, None)
+}
+
+/// `render_root_to_gpui`, placing cached subtree views where `bcx` allows.
+fn render_root_in(
+    plan: &crate::render_sync::RenderNode,
+    handle: &gpui::FocusHandle,
+    bcx: Option<&mut crate::cached_views::BuildCx<'_>>,
+) -> AnyElement {
+    use crate::cached_views::LayoutBox;
     use crate::tree::GpuiElementKind;
     match plan.kind {
         GpuiElementKind::Div | GpuiElementKind::TextContainer => {
-            with_keyboard(build_plan_div(plan), handle).into_any_element()
+            with_keyboard(build_plan_div_in(plan, bcx, Some(&LayoutBox::WINDOW)), handle)
+                .into_any_element()
         }
         // An image, an SVG or a bare text node as the WHOLE root is not a
         // shape any product here produces; it is wrapped rather than
         // refused, and the wrapper is stated so a frame that gained a
         // container is explainable rather than surprising.
         _ => with_keyboard(div().size_full(), handle)
-            .child(render_plan_to_gpui(plan))
+            .child(render_plan_to_gpui_in(plan, bcx, &LayoutBox::WINDOW))
             .into_any_element(),
     }
+}
+
+/// Paints nothing; its prepaint, which runs after every other element of the
+/// frame has been laid out and prepainted (and so after GPUI rendered every
+/// cached subtree view that had to be drawn again), closes the frame's
+/// `frame_stats` record. A host's drawn-frame callback (`gpui_on_frame_drawn`)
+/// is DEFERRED to after the frame (`App::defer`): it runs once per closed
+/// frame, outside the paint, where the host may read anything.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn frame_end_marker() -> impl IntoElement {
+    canvas(
+        |_, _, cx| {
+            if crate::frame_stats::complete_frame() {
+                if let Some(callback) = crate::frame_stats::frame_drawn_callback() {
+                    cx.defer(move |_| callback());
+                }
+            }
+        },
+        |_, _, _, _| {},
+    )
+        .absolute()
+        .size_0()
 }
 
 // ---------------------------------------------------------------------------
@@ -872,8 +939,37 @@ fn window_cursor_override() -> impl IntoElement {
 }
 
 pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement {
+    render_plan_to_gpui_in(plan, None, &crate::cached_views::LayoutBox::WINDOW)
+}
+
+/// A child's element: behind a cached subtree view when it is a boundary
+/// (`cached_views::BuildCx::boundary`), built here otherwise.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn child_to_gpui(
+    plan: &crate::render_sync::RenderNode,
+    mut bcx: Option<&mut crate::cached_views::BuildCx<'_>>,
+    parent: &crate::cached_views::LayoutBox,
+) -> AnyElement {
+    if let Some(b) = bcx.as_deref_mut() {
+        if let Some(view) = b.boundary(plan, parent) {
+            return view;
+        }
+    }
+    render_plan_to_gpui_in(plan, bcx, parent)
+}
+
+/// `render_plan_to_gpui` for an element placed in `parent`, placing cached
+/// subtree views below it where `bcx` allows.
+pub fn render_plan_to_gpui_in(
+    plan: &crate::render_sync::RenderNode,
+    bcx: Option<&mut crate::cached_views::BuildCx<'_>>,
+    parent: &crate::cached_views::LayoutBox,
+) -> AnyElement {
     use crate::tree::GpuiElementKind;
 
+    if !matches!(plan.kind, GpuiElementKind::Div | GpuiElementKind::TextContainer) {
+        crate::frame_stats::note_element();
+    }
     match plan.kind {
         GpuiElementKind::TextNode => {
             let text = plan.text.clone().unwrap_or_default();
@@ -947,7 +1043,7 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
             el.child(label).into_any_element()
         }
         GpuiElementKind::Div | GpuiElementKind::TextContainer => {
-            build_plan_div(plan).into_any_element()
+            build_plan_div_in(plan, bcx, Some(parent)).into_any_element()
         }
     }
 }
@@ -960,8 +1056,32 @@ pub fn render_plan_to_gpui(plan: &crate::render_sync::RenderNode) -> AnyElement 
 /// `render_root_to_gpui`. Nothing about the body changed.
 #[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
 pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
+    build_plan_div_in(plan, None, Some(&crate::cached_views::LayoutBox::WINDOW))
+}
+
+/// `build_plan_div`, placing cached subtree views below the element where
+/// `bcx` allows. `placed_in` is the box the element's parent lays it out in,
+/// or `None` for the root of a cached subtree view, which is laid out at its
+/// view's definite bounds.
+pub fn build_plan_div_in(
+    plan: &crate::render_sync::RenderNode,
+    mut bcx: Option<&mut crate::cached_views::BuildCx<'_>>,
+    placed_in: Option<&crate::cached_views::LayoutBox>,
+) -> Div {
+    use crate::cached_views::LayoutBox;
+    crate::frame_stats::note_element();
     let mut el = div();
     el = apply_styles_to_div(el, &plan.styles);
+    // The box this element gives its children, for the boundary policy.
+    // Computed only when boundaries can be placed at all.
+    let own_box = if bcx.is_some() {
+        match placed_in {
+            Some(parent) => LayoutBox::of(el.style(), parent),
+            None => LayoutBox::view_root(el.style()),
+        }
+    } else {
+        LayoutBox::WINDOW
+    };
 
     // A DECLARED INLINE FORMATTING CONTEXT IS ONE TEXT ELEMENT, NOT ONE PER
     // SPAN (`render_sync::INLINE_TEXT_RUNS_ATTRIBUTE`, which carries the full
@@ -972,14 +1092,14 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
     //
     // Everything below — events, pointer listeners, window regions — is
     // reached either way: only how the children are built changes.
-    match crate::render_sync::inline_chunks(plan) {
+    match plan.fused_chunks() {
         Some(chunks) => {
             // A declared row lays its chunks out IN CHILD ORDER: each fused
             // run becomes one text element, and every child that could not
             // fuse is rendered exactly as it would have been. A container
             // with its own text never reaches here (`inline_chunks`
             // declines it), so there is no trailing text to append.
-            for chunk in chunks {
+            for chunk in chunks.iter().cloned() {
                 el = match chunk {
                     // A run carrying a horizontal inset (a span's own
                     // padding, admitted only in a context that promised one
@@ -1003,12 +1123,14 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
                                 .iter()
                                 .skip(run.start)
                                 .take(run.runs.len())
-                                .fold(el, |el, child| el.child(render_plan_to_gpui(child)))
+                                .fold(el, |el, child| {
+                                    el.child(child_to_gpui(child, bcx.as_deref_mut(), &own_box))
+                                })
                         }
                     }
                     crate::render_sync::InlineChunk::Fused(run) => el.child(fused_run_text(&run)),
                     crate::render_sync::InlineChunk::Own(i) => {
-                        el.child(render_plan_to_gpui(&plan.children[i]))
+                        el.child(child_to_gpui(&plan.children[i], bcx.as_deref_mut(), &own_box))
                     }
                 };
             }
@@ -1019,19 +1141,40 @@ pub fn build_plan_div(plan: &crate::render_sync::RenderNode) -> Div {
             // glyph by glyph; an element child sets its own, as it is not
             // passed down (GPUI's inherited text style has no such field).
             let spacing = plan.styles.letter_spacing.as_deref().and_then(parse_letter_spacing);
+            // A text this element cuts (`text-overflow`) is drawn by
+            // `CutText`, which drops the characters the element names in
+            // `data-ellipsis-trim` before the ellipsis and records what it
+            // drew (`cut_text.rs`). A letter-spaced text is never cut
+            // (`SpacedText`), so spacing keeps its own element.
+            let cuts = plan.styles.text_overflow.is_some() && spacing.is_none();
+            let own_text = |text: String| -> AnyElement {
+                if cuts {
+                    crate::cut_text::CutText::new(
+                        text,
+                        crate::cut_text::trim_chars_of(&plan.attributes),
+                        plan.node_id,
+                    )
+                    .at(crate::cut_text::cut_place_of(&plan.attributes))
+                    .into_any_element()
+                } else {
+                    text_with_spacing(text, spacing)
+                }
+            };
             // Add children
             for child in &plan.children {
-                el = if spacing.is_some() && child.kind == crate::tree::GpuiElementKind::TextNode {
-                    el.child(text_with_spacing(child.text.clone().unwrap_or_default(), spacing))
+                el = if child.kind == crate::tree::GpuiElementKind::TextNode
+                    && (spacing.is_some() || cuts)
+                {
+                    el.child(own_text(child.text.clone().unwrap_or_default()))
                 } else {
-                    el.child(render_plan_to_gpui(child))
+                    el.child(child_to_gpui(child, bcx.as_deref_mut(), &own_box))
                 };
             }
 
             // If the node has direct text content, add it as a child
             if let Some(ref text) = plan.text {
                 if !text.is_empty() {
-                    el = el.child(text_with_spacing(text.clone(), spacing));
+                    el = el.child(own_text(text.clone()));
                 }
             }
         }
@@ -1921,6 +2064,19 @@ pub fn apply_styles_to_div(
             None => el.bg(color),
         };
     }
+    // A `background-image` in the two-stop conic subset: the pie's sector
+    // over the rest of the element's disc, over the background colour and
+    // under the border and the children (`with_conic_sector`). Any other
+    // image, or a colour the shim cannot read, is left unpainted.
+    if let Some(conic) = styles
+        .background_image
+        .as_deref()
+        .and_then(crate::conic::parse_two_stop_conic)
+    {
+        if let (Some(first), Some(rest)) = (parse_color(&conic.first), parse_color(&conic.rest)) {
+            el = with_conic_sector(el, first, rest, conic.fraction, styles.rounded.clone());
+        }
+    }
 
     // Width
     if let Some(ref w) = styles.w {
@@ -2243,12 +2399,19 @@ pub fn apply_styles_to_div(
         el.text_style().text_align = Some(align);
     }
     // `text-decoration: underline`: a menu's access key, a link.
-    if styles
+    // `text-decoration: line-through`: a struck-out item, such as a context
+    // item an instruction no longer cites. The two may be combined, as in
+    // CSS (https://www.w3.org/TR/css-text-decor-3/#text-decoration-line-property).
+    let decorations: Vec<&str> = styles
         .text_decoration
         .as_deref()
-        .is_some_and(|d| d.split_whitespace().any(|w| w == "underline"))
-    {
+        .map(|d| d.split_whitespace().collect())
+        .unwrap_or_default();
+    if decorations.contains(&"underline") {
         el = el.underline();
+    }
+    if decorations.contains(&"line-through") {
+        el = el.line_through();
     }
 
     // `position: absolute` with its insets: an element drawn over its
@@ -2495,6 +2658,68 @@ fn with_border_stroke(el: Div, stroke: BorderStroke) -> Div {
         .left(px(-w))
         .right(px(-w))
         .bottom(px(-w)),
+    )
+}
+
+/// The element's two-stop conic gradient
+/// (`conic-gradient(<first> 0 <p>%, <rest> <p>% 100%)`, CSS Images Level 4
+/// §3.3, <https://www.w3.org/TR/css-images-4/#conic-gradients>): the disc
+/// inscribed in the box filled with `rest`, then the sector of `fraction` of
+/// the turn, from twelve o'clock clockwise, filled with `first`
+/// (`conic::conic_shape`), each one antialiased fill path. Drawn by an
+/// absolutely positioned child over the padding box, so it lies over the
+/// background colour and under the border and the children, as a browser
+/// paints a background image. Painted only when the element is round
+/// (`conic::is_round`: `border-radius: 50%`, or a radius of at least half
+/// its shorter side), the one case the subset is defined for.
+#[cfg(any(feature = "gpui-backend", feature = "gpui-headless"))]
+fn with_conic_sector(el: Div, first: Hsla, rest: Hsla, fraction: f32, rounded: Option<String>) -> Div {
+    el.child(
+        canvas(
+            |_bounds, _window, _cx| (),
+            move |bounds, (), window, _cx| {
+                let w = f32::from(bounds.size.width);
+                let h = f32::from(bounds.size.height);
+                if !crate::conic::is_round(w, h, rounded.as_deref()) {
+                    return;
+                }
+                let r = w.min(h) / 2.0;
+                let cx = f32::from(bounds.left()) + w / 2.0;
+                let cy = f32::from(bounds.top()) + h / 2.0;
+                let p = |x: f32, y: f32| gpui::point(px(x), px(y));
+                let radii = gpui::point(px(r), px(r));
+                let disc = |colour: Hsla, window: &mut gpui::Window| {
+                    // Two half-circle arcs: one arc cannot end where it starts.
+                    let mut path = gpui::PathBuilder::fill();
+                    path.move_to(p(cx, cy - r));
+                    path.arc_to(radii, px(0.0), false, true, p(cx, cy + r));
+                    path.arc_to(radii, px(0.0), false, true, p(cx, cy - r));
+                    path.close();
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, colour);
+                    }
+                };
+                match crate::conic::conic_shape(cx, cy, r, fraction) {
+                    crate::conic::ConicShape::Empty => disc(rest, window),
+                    crate::conic::ConicShape::Full => disc(first, window),
+                    crate::conic::ConicShape::Sector(s) => {
+                        disc(rest, window);
+                        let mut path = gpui::PathBuilder::fill();
+                        path.move_to(p(cx, cy));
+                        path.line_to(p(s.start.0, s.start.1));
+                        path.arc_to(radii, px(0.0), s.large_arc, s.sweep, p(s.end.0, s.end.1));
+                        path.close();
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, first);
+                        }
+                    }
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
     )
 }
 
@@ -3322,6 +3547,25 @@ mod tests {
         assert_eq!(parse_font_style("italics"), None);
         assert_eq!(parse_font_style("italic bold"), None);
         assert_eq!(parse_font_style(""), None);
+    }
+
+    /// `text-decoration` draws its lines: `underline`, `line-through`, or
+    /// both, in the element's text style; anything else draws neither.
+    #[test]
+    fn test_text_decoration_lines_are_applied_to_the_drawn_element() {
+        let mut styles = crate::render_sync::GpuiStyles::default();
+        styles.text_decoration = Some("line-through".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert!(el.text_style().strikethrough.is_some());
+        assert!(el.text_style().underline.is_none());
+        styles.text_decoration = Some("underline line-through".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert!(el.text_style().strikethrough.is_some());
+        assert!(el.text_style().underline.is_some());
+        styles.text_decoration = Some("overline".into());
+        let mut el = apply_styles_to_div(gpui::div(), &styles);
+        assert!(el.text_style().strikethrough.is_none());
+        assert!(el.text_style().underline.is_none());
     }
 
     /// The element builder APPLIES `font-style`: it is in the drawn

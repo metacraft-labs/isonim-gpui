@@ -91,14 +91,66 @@ while IFS= read -r m; do manifests+=("$m"); done < <(
 # The dependency KEYS are `gpui` / `gpui_platform`; the PACKAGES are
 # `gpui-pre` / `gpui-pre-platform`. Anchor on the package, because that is
 # what decides type identity and what the lock records.
-dep_lines="$(grep -hE 'package[[:space:]]*=[[:space:]]*"gpui-pre' "${manifests[@]}" || true)"
-dep_count="$(printf '%s\n' "$dep_lines" | grep -c . || true)"
+#
+# A dependency is written in one of TWO TOML shapes, and both are read:
+#
+#   * an inline table on one line —
+#       gpui = { package = "gpui-pre", version = "=0.3.5" }
+#   * a dependency TABLE, one key per line —
+#       [target.'cfg(…)'.dependencies.gpui]
+#       version = "=0.3.5"
+#       package = "gpui-pre"
+#     (a table with no `package` key is the package its header names).
+#
+# The table shape is what cargo writes when it normalizes a manifest for
+# crates.io, so it is what `rust/vendor/gpui-pre-linux/Cargo.toml` (the
+# patched republication `rust/Cargo.toml` substitutes for the registry crate)
+# uses. A line-based scan counted that file's five `package = "gpui-pre…"`
+# lines as dependencies and never saw the `version` lines below them, so it
+# reported 10 dependencies with 5 exact versions over a tree in which all 10
+# were pinned `=0.3.5`. Reading each table whole keeps every one of those
+# dependencies in the check — the vendored crate is linked into the windowed
+# shim, so its requirements are as much the pin as ours — rather than
+# dropping the file from the scan.
+#
+# One record per gpui-pre dependency: its version requirement, or `-` when it
+# names none (which then fails the exactness check below, as it should).
+dep_records="$(awk '
+	function unquote(s) { sub(/^[^"]*"/, "", s); sub(/".*$/, "", s); return s }
+	function flush() {
+		if (in_tbl && pkg ~ /^gpui-pre/) print (ver == "" ? "-" : ver)
+		in_tbl = 0; pkg = ""; ver = ""
+	}
+	FNR == 1 { flush() }
+	/^[[:space:]]*\[/ {
+		flush()
+		# `[…dependencies.<key>]`: a dependency table. Its key is the package
+		# unless a `package =` line inside it says otherwise.
+		if (match($0, /dependencies\.[^]]+\][[:space:]]*$/)) {
+			in_tbl = 1
+			key = substr($0, RSTART + length("dependencies."))
+			sub(/\][[:space:]]*$/, "", key)
+			gsub(/["'"'"']/, "", key)
+			pkg = key
+		}
+		next
+	}
+	in_tbl && /^[[:space:]]*package[[:space:]]*=/ { pkg = unquote($0); next }
+	in_tbl && /^[[:space:]]*version[[:space:]]*=/ { ver = unquote($0); next }
+	!in_tbl && /package[[:space:]]*=[[:space:]]*"gpui-pre/ {
+		v = "-"
+		if (match($0, /version[[:space:]]*=[[:space:]]*"[^"]*"/)) v = unquote(substr($0, RSTART, RLENGTH))
+		print v
+	}
+	END { flush() }
+' "${manifests[@]}")"
+dep_count="$(printf '%s\n' "$dep_records" | grep -c . || true)"
 if [ "$dep_count" -lt "$MIN_MANIFEST_PINS" ]; then
 	refuse "found $dep_count gpui-pre dependencies in rust/**/Cargo.toml, floor is $MIN_MANIFEST_PINS"
 fi
 
-manifest_revs="$(printf '%s\n' "$dep_lines" |
-	grep -oE 'version[[:space:]]*=[[:space:]]*"=[0-9]+\.[0-9]+\.[0-9]+"' |
+manifest_revs="$(printf '%s\n' "$dep_records" |
+	grep -E '^=[0-9]+\.[0-9]+\.[0-9]+$' |
 	grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort)"
 manifest_count="$(printf '%s\n' "$manifest_revs" | grep -c . || true)"
 # Equality, not a floor: every gpui-pre dependency must carry an EXACT

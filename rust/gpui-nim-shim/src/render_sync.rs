@@ -33,6 +33,7 @@
 //! - `gap` -> `.gap()`
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 use crate::tree::{GpuiElementKind, Node, NodeId, NodeKind, Tree};
 
@@ -113,6 +114,10 @@ pub struct GpuiStyles {
     /// painted through the SVG's alpha instead of over its whole box
     /// (`gpui_app::parse_mask_url`).
     pub mask_image: Option<String>,
+    /// `background-image`: painted only in the two-stop conic subset
+    /// (`conic::parse_two_stop_conic`, a pie's sector over the rest of the
+    /// element's disc); any other image is left unpainted.
+    pub background_image: Option<String>,
     pub line_height: Option<String>,
     pub cursor: Option<String>,
     pub display: Option<String>,
@@ -229,6 +234,7 @@ impl GpuiStyles {
             "text-decoration" | "text_decoration" => self.text_decoration = Some(v),
             "text-align" | "text_align" => self.text_align = Some(v),
             "mask-image" | "mask_image" | "-webkit-mask-image" => self.mask_image = Some(v),
+            "background-image" | "background_image" => self.background_image = Some(v),
             "line-height" | "line_height" => self.line_height = Some(v),
             "cursor" => self.cursor = Some(v),
             "display" => self.display = Some(v),
@@ -338,12 +344,60 @@ pub struct RenderNode {
     /// or two plans of one tree serialise differently and every digest and
     /// byte-identity check built on the plan becomes a coin flip.
     pub attributes: BTreeMap<String, String>,
-    /// Children render nodes (recursive).
-    pub children: Vec<RenderNode>,
+    /// Children render nodes (recursive), SHARED with the shadow tree's
+    /// per-node plan cache: a plan rebuilt for one changed node reuses every
+    /// unchanged child's plan as it is (`plan_incremental`).
+    pub children: Vec<Arc<RenderNode>>,
     /// The pixels of an `img` element (`gpui_set_image_rgba`), shared with
     /// the shadow node; `None` for every other element and for an image
     /// nobody set.
     pub image: Option<crate::tree::NodeImage>,
+    /// The shadow tree's change stamp for this subtree when the plan was
+    /// built (`tree::ChangeMarks::subtree_stamp`): two plans of one node
+    /// with the same stamp describe the same subtree. A renderer that keeps
+    /// anything per subtree (the cached GPUI views) compares it.
+    pub stamp: u64,
+    /// How many plan nodes this subtree holds, itself included.
+    pub subtree_nodes: usize,
+    /// How many nodes of this subtree declare a window drag region
+    /// (`regions::REGION_ATTRIBUTE` = `drag`). A count rather than a flag so
+    /// that it can be kept up to date by difference when one child changes.
+    pub drag_regions: usize,
+    /// This node's inline formatting context (`inline_chunks`), computed the
+    /// first time the element is built and kept for as long as the plan
+    /// node is: a plan node is replaced, never edited, when it or a child
+    /// changes, so the cache cannot outlive what it was computed from.
+    pub fused: OnceLock<Option<Vec<InlineChunk>>>,
+}
+
+impl Default for RenderNode {
+    fn default() -> Self {
+        RenderNode {
+            node_id: 0,
+            kind: GpuiElementKind::Div,
+            tag: String::new(),
+            styles: GpuiStyles::default(),
+            text: None,
+            has_click_handler: false,
+            has_input_handler: false,
+            event_names: Vec::new(),
+            attributes: BTreeMap::new(),
+            children: Vec::new(),
+            image: None,
+            stamp: 0,
+            subtree_nodes: 1,
+            drag_regions: 0,
+            fused: OnceLock::new(),
+        }
+    }
+}
+
+impl RenderNode {
+    /// This node's inline formatting context, from the cache when it has
+    /// been computed for this plan node (`inline_chunks` holds the rule).
+    pub fn fused_chunks(&self) -> Option<&Vec<InlineChunk>> {
+        self.fused.get_or_init(|| inline_chunks(self)).as_ref()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -856,8 +910,27 @@ pub fn inline_text_runs(plan: &RenderNode) -> Option<(String, Vec<InlineTextRun>
 /// This walks the tree recursively and produces a `RenderNode` hierarchy
 /// that describes what GPUI elements to create. This intermediate
 /// representation can be tested without GPUI dependencies.
+///
+/// This is the REFERENCE walk: it reads every node below `root_id` and
+/// builds every plan node afresh, and it neither reads nor writes the plan
+/// cache. The renderer builds its plan with [`plan_incremental`], which must
+/// produce a plan equal to this one for any tree and any history of changes;
+/// the introspection exports (`gpui_render_plan_json` and friends) and the
+/// tests that check that equality use this one.
 pub fn build_render_plan(tree: &Tree, root_id: NodeId) -> Option<RenderNode> {
     let node = tree.get(root_id)?;
+    let children: Vec<Arc<RenderNode>> = node
+        .children
+        .iter()
+        .filter_map(|&child_id| build_render_plan(tree, child_id).map(Arc::new))
+        .collect();
+    Some(own_plan(node, children))
+}
+
+/// The plan of `node` itself, over the given plans of its children: the
+/// style translation, text and attributes this module derives per node, and
+/// the subtree aggregates summed over the children.
+fn own_plan(node: &Node, children: Vec<Arc<RenderNode>>) -> RenderNode {
     let kind = classify_node(node);
     let styles = GpuiStyles::from_node(node);
 
@@ -881,15 +954,13 @@ pub fn build_render_plan(tree: &Tree, root_id: NodeId) -> Option<RenderNode> {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    let children: Vec<RenderNode> = node
-        .children
-        .iter()
-        .filter_map(|&child_id| build_render_plan(tree, child_id))
-        .collect();
+    let own_drag = usize::from(declares_drag(&attributes));
+    let subtree_nodes = 1 + children.iter().map(|c| c.subtree_nodes).sum::<usize>();
+    let drag_regions = own_drag + children.iter().map(|c| c.drag_regions).sum::<usize>();
 
-    Some(RenderNode {
+    RenderNode {
         image: node.image.clone(),
-        node_id: root_id.0,
+        node_id: node.id.0,
         kind,
         tag,
         styles,
@@ -899,7 +970,142 @@ pub fn build_render_plan(tree: &Tree, root_id: NodeId) -> Option<RenderNode> {
         event_names,
         attributes,
         children,
-    })
+        stamp: node.marks.subtree_stamp,
+        subtree_nodes,
+        drag_regions,
+        fused: OnceLock::new(),
+    }
+}
+
+/// Whether these attributes declare a window drag region, by the same
+/// predicate `regions::tree_declares_drag_region` applies to the tree.
+fn declares_drag(attributes: &BTreeMap<String, String>) -> bool {
+    attributes
+        .get(crate::regions::REGION_ATTRIBUTE)
+        .and_then(|v| crate::regions::parse_region(v))
+        == Some(crate::regions::Region::Drag)
+}
+
+/// What one [`plan_incremental`] call did, for `frame_stats`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlanWork {
+    /// Shadow nodes the call descended into: read from the tree because
+    /// they, or something below them, changed. An unchanged child of a
+    /// changed node is not visited; its cached plan is reused as it is.
+    pub nodes_visited: u64,
+    /// Plan nodes built again: a changed node's own plan, and each ancestor
+    /// it was spliced into.
+    pub plans_rebuilt: u64,
+}
+
+impl PlanWork {
+    pub fn add(&mut self, other: PlanWork) {
+        self.nodes_visited += other.nodes_visited;
+        self.plans_rebuilt += other.plans_rebuilt;
+    }
+}
+
+/// The render plan of `root_id`, built from the plan cache the shadow tree
+/// keeps per node, rebuilding only what the tree's dirty marks say changed.
+///
+/// A node whose marks are clean answers its cached plan without being read:
+/// a frame with no change does no plan work at all, and a frame after one
+/// label changed visits the label and its ancestors, nothing else. A node
+/// that itself changed (`plan_stale`: its fields or its list of children)
+/// has its own part rebuilt over its children's plans, each of which is
+/// again answered from the cache unless marked. A node only BELOW which
+/// something changed keeps its own part and has the changed children's new
+/// plans spliced in, so its unchanged siblings are not touched.
+///
+/// The result is equal to [`build_render_plan`]'s for the same tree; the
+/// equality is tested over random histories of the renderer ops.
+pub fn plan_incremental(
+    tree: &mut Tree,
+    root_id: NodeId,
+    work: &mut PlanWork,
+) -> Option<Arc<RenderNode>> {
+    let marks = &tree.get(root_id)?.marks;
+    if !marks.plan_stale && marks.stale_children.is_empty() {
+        if let Some(plan) = &marks.plan {
+            return Some(plan.clone());
+        }
+    }
+    let rebuild = marks.plan_stale || marks.plan.is_none();
+    work.nodes_visited += 1;
+    let plan = if rebuild {
+        rebuild_own(tree, root_id, work)
+    } else {
+        splice_children(tree, root_id, work)
+    };
+    work.plans_rebuilt += 1;
+    let node = tree.get_mut_untracked(root_id)?;
+    node.marks.plan = Some(plan.clone());
+    Some(plan)
+}
+
+/// `root_id`'s own plan rebuilt over its children's (cached) plans.
+fn rebuild_own(tree: &mut Tree, id: NodeId, work: &mut PlanWork) -> Arc<RenderNode> {
+    let child_ids = {
+        let node = tree.get_mut_untracked(id).expect("caller checked the node");
+        node.marks.plan_stale = false;
+        node.marks.stale_children.clear();
+        node.children.clone()
+    };
+    let mut children = Vec::with_capacity(child_ids.len());
+    for c in child_ids {
+        if let Some(n) = tree.get_mut_untracked(c) {
+            n.marks.queued_in_parent = false;
+        }
+        if let Some(plan) = plan_incremental(tree, c, work) {
+            children.push(plan);
+        }
+    }
+    let node = tree.get(id).expect("caller checked the node");
+    Arc::new(own_plan(node, children))
+}
+
+/// `id`'s cached plan with the plans of its changed children replaced.
+fn splice_children(tree: &mut Tree, id: NodeId, work: &mut PlanWork) -> Arc<RenderNode> {
+    let (stale, mut plan, subtree_stamp) = {
+        let node = tree.get_mut_untracked(id).expect("caller checked the node");
+        (
+            std::mem::take(&mut node.marks.stale_children),
+            node.marks.plan.take().expect("caller checked the plan"),
+            node.marks.subtree_stamp,
+        )
+    };
+    {
+        // `make_mut` copies the node only if a renderer still holds the
+        // previous frame's plan; the children are `Arc`s, so the copy is
+        // shallow either way.
+        let p = Arc::make_mut(&mut plan);
+        for c in stale {
+            let still_child = match tree.get_mut_untracked(c) {
+                Some(n) if n.parent == id => {
+                    n.marks.queued_in_parent = false;
+                    true
+                }
+                _ => false,
+            };
+            // A child that moved away or left the store changed this node's
+            // list of children, which marked this node `plan_stale` and
+            // took the other branch; here it can only be skipped.
+            if !still_child {
+                continue;
+            }
+            let Some(new_child) = plan_incremental(tree, c, work) else {
+                continue;
+            };
+            if let Some(slot) = p.children.iter_mut().find(|k| k.node_id == c.0) {
+                p.subtree_nodes = p.subtree_nodes + new_child.subtree_nodes - slot.subtree_nodes;
+                p.drag_regions = p.drag_regions + new_child.drag_regions - slot.drag_regions;
+                *slot = new_child;
+            }
+        }
+        p.stamp = subtree_stamp;
+        p.fused = OnceLock::new();
+    }
+    plan
 }
 
 /// Count total render nodes in a plan (for testing).
@@ -907,7 +1113,7 @@ pub fn count_render_nodes(plan: &RenderNode) -> usize {
     1 + plan
         .children
         .iter()
-        .map(count_render_nodes)
+        .map(|c| count_render_nodes(c))
         .sum::<usize>()
 }
 
@@ -971,6 +1177,241 @@ pub fn is_known_cursor(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::tree::{EventListener, Node, NodeId, Tree};
+
+    // -----------------------------------------------------------------
+    // The incremental plan equals the reference walk
+    // -----------------------------------------------------------------
+
+    /// Two plans describe the same thing, field by field and child by child.
+    /// `fused` is a cache and is compared by what it computes.
+    fn assert_same_plan(a: &RenderNode, b: &RenderNode, path: &str) {
+        assert_eq!(a.node_id, b.node_id, "{path}: node id");
+        assert_eq!(a.kind, b.kind, "{path}: kind");
+        assert_eq!(a.tag, b.tag, "{path}: tag");
+        assert_eq!(a.styles, b.styles, "{path}: styles");
+        assert_eq!(a.text, b.text, "{path}: text");
+        assert_eq!(a.has_click_handler, b.has_click_handler, "{path}: click");
+        assert_eq!(a.has_input_handler, b.has_input_handler, "{path}: input");
+        let (mut ea, mut eb) = (a.event_names.clone(), b.event_names.clone());
+        ea.sort();
+        eb.sort();
+        assert_eq!(ea, eb, "{path}: event names");
+        assert_eq!(a.attributes, b.attributes, "{path}: attributes");
+        assert_eq!(
+            a.image.as_ref().map(|i| i.generation),
+            b.image.as_ref().map(|i| i.generation),
+            "{path}: image"
+        );
+        assert_eq!(a.stamp, b.stamp, "{path}: stamp");
+        assert_eq!(a.subtree_nodes, b.subtree_nodes, "{path}: subtree nodes");
+        assert_eq!(a.drag_regions, b.drag_regions, "{path}: drag regions");
+        assert_eq!(a.fused_chunks(), b.fused_chunks(), "{path}: inline chunks");
+        assert_eq!(a.children.len(), b.children.len(), "{path}: child count");
+        for (i, (ca, cb)) in a.children.iter().zip(&b.children).enumerate() {
+            assert_same_plan(ca, cb, &format!("{path}/{i}"));
+        }
+    }
+
+    /// A small deterministic generator, so a failure names its seed.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    extern "C" fn noop_listener(_p: *const crate::input::GpuiEventPayload) {}
+
+    /// One random change, through the same `Tree` methods the C ABI uses.
+    fn random_change(tree: &mut Tree, nodes: &mut Vec<NodeId>, root: NodeId, rng: &mut Lcg) {
+        let pick = |rng: &mut Lcg, nodes: &Vec<NodeId>| nodes[rng.below(nodes.len())];
+        match rng.below(13) {
+            0 => {
+                let tag = ["div", "span", "p", "img"][rng.below(4)];
+                let id = tree.insert(Node::new_element(tag));
+                nodes.push(id);
+                let parent = pick(rng, nodes);
+                if parent != id && !tree.is_within(parent, id) {
+                    tree.append_child(parent, id);
+                }
+            }
+            1 => {
+                let id = tree.insert(Node::new_text(&format!("t{}", rng.next() % 100)));
+                nodes.push(id);
+                let parent = pick(rng, nodes);
+                if parent != id {
+                    tree.append_child(parent, id);
+                }
+            }
+            2 => {
+                // Move a node: under another parent, or before a sibling.
+                let child = pick(rng, nodes);
+                let parent = pick(rng, nodes);
+                if child != root && child != parent && !tree.is_within(parent, child) {
+                    let reference = tree.first_child(parent);
+                    if rng.below(2) == 0 {
+                        tree.insert_before(parent, child, reference);
+                    } else {
+                        tree.append_child(parent, child);
+                    }
+                }
+            }
+            3 => {
+                let child = pick(rng, nodes);
+                let parent = tree.parent_node(child);
+                if !parent.is_null() {
+                    tree.remove_child(parent, child);
+                }
+            }
+            4 | 5 => {
+                let id = pick(rng, nodes);
+                let (k, v) = [
+                    ("width", "40px"),
+                    ("height", "20px"),
+                    ("color", "#ff0000"),
+                    ("display", "flex"),
+                    ("flex-direction", "row"),
+                    ("padding-left", "3px"),
+                    ("white-space", "nowrap"),
+                ][rng.below(7)];
+                if let Some(n) = tree.get_mut(id) {
+                    n.styles.insert(k.to_string(), v.to_string());
+                }
+            }
+            6 | 7 => {
+                let id = pick(rng, nodes);
+                let (k, v) = [
+                    ("data-row", "1"),
+                    (INLINE_TEXT_RUNS_ATTRIBUTE, ""),
+                    (crate::regions::REGION_ATTRIBUTE, "drag"),
+                    ("data-ct-mark", "x"),
+                ][rng.below(4)];
+                if let Some(n) = tree.get_mut(id) {
+                    if rng.below(3) == 0 {
+                        n.attributes.remove(k);
+                    } else {
+                        n.attributes.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+            8 | 9 => {
+                let id = pick(rng, nodes);
+                if let Some(n) = tree.get_mut(id) {
+                    n.set_text_content(&format!("x{}", rng.next() % 50));
+                }
+            }
+            10 => {
+                let id = pick(rng, nodes);
+                if let Some(n) = tree.get_mut(id) {
+                    n.event_listeners
+                        .entry(["click", "input", "mousedown"][rng.below(3)].to_string())
+                        .or_default()
+                        .push(EventListener { callback: noop_listener, callback_id: 0 });
+                }
+            }
+            11 => {
+                // Leave the store without leaving the parent's list, as
+                // `gpui_destroy_tree` does.
+                let id = pick(rng, nodes);
+                if id != root {
+                    tree.remove(id);
+                    nodes.retain(|n| *n != id);
+                }
+            }
+            _ => {
+                // A write that changes nothing the plan reads.
+                let id = pick(rng, nodes);
+                if let Some(n) = tree.get_mut_untracked(id) {
+                    n.delivery_count += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_incremental_plan_equals_the_reference_walk_over_random_histories() {
+        for seed in 1..=40u64 {
+            let mut rng = Lcg(seed);
+            let mut tree = Tree::new();
+            let root = tree.insert(Node::new_element("root"));
+            let mut nodes = vec![root];
+            for _ in 0..30 {
+                random_change(&mut tree, &mut nodes, root, &mut rng);
+            }
+            for round in 0..25 {
+                // Several changes between two plans, as between two frames.
+                for _ in 0..rng.below(5) {
+                    random_change(&mut tree, &mut nodes, root, &mut rng);
+                }
+                let mut work = PlanWork::default();
+                let incremental = plan_incremental(&mut tree, root, &mut work).expect("root");
+                let reference = build_render_plan(&tree, root).expect("root");
+                assert_same_plan(&incremental, &reference, &format!("seed {seed} round {round}"));
+                // Asking again with nothing changed does no work and answers
+                // the same plan.
+                let mut again = PlanWork::default();
+                let second = plan_incremental(&mut tree, root, &mut again).expect("root");
+                assert_eq!(again, PlanWork::default(), "seed {seed} round {round}: idle work");
+                assert!(Arc::ptr_eq(&incremental, &second));
+            }
+        }
+    }
+
+    #[test]
+    fn a_change_rebuilds_its_path_and_nothing_beside_it() {
+        // root > list > 50 × (row > label > text)
+        let mut tree = Tree::new();
+        let root = tree.insert(Node::new_element("root"));
+        let list = tree.insert(Node::new_element("div"));
+        tree.append_child(root, list);
+        let mut texts = Vec::new();
+        for i in 0..50 {
+            let row = tree.insert(Node::new_element("div"));
+            let label = tree.insert(Node::new_element("span"));
+            let text = tree.insert(Node::new_text(&format!("row {i}")));
+            tree.append_child(label, text);
+            tree.append_child(row, label);
+            tree.append_child(list, row);
+            texts.push(text);
+        }
+        let mut work = PlanWork::default();
+        let first = plan_incremental(&mut tree, root, &mut work).unwrap();
+        assert_eq!(work.plans_rebuilt, 2 + 50 * 3, "the first plan builds everything");
+
+        // One label: its text node, label, row, list and root.
+        if let Some(n) = tree.get_mut(texts[20]) {
+            n.set_text_content("changed");
+        }
+        let mut work = PlanWork::default();
+        let second = plan_incremental(&mut tree, root, &mut work).unwrap();
+        assert_eq!(work, PlanWork { nodes_visited: 5, plans_rebuilt: 5 });
+        // Every other row's plan is the very same plan as before.
+        for i in (0..50).filter(|i| *i != 20) {
+            assert!(Arc::ptr_eq(&first.children[0].children[i], &second.children[0].children[i]));
+        }
+        assert_eq!(
+            second.children[0].children[20].children[0].children[0].text.as_deref(),
+            Some("changed")
+        );
+        // The previous frame's plan is untouched: it is still what it drew.
+        assert_eq!(
+            first.children[0].children[20].children[0].children[0].text.as_deref(),
+            Some("row 20")
+        );
+
+        // A new row: the list's own plan, over the 50 unchanged rows' plans.
+        let row = tree.insert(Node::new_element("div"));
+        tree.append_child(list, row);
+        let mut work = PlanWork::default();
+        let third = plan_incremental(&mut tree, root, &mut work).unwrap();
+        assert_eq!(work, PlanWork { nodes_visited: 3, plans_rebuilt: 3 });
+        assert_eq!(third.children[0].children.len(), 51);
+        assert_eq!(third.subtree_nodes, 2 + 50 * 3 + 1);
+    }
 
     /// A syntax-highlighted code row as `leaves.nim` builds it: a container
     /// holding one span per coloured piece, each span holding one text node.
@@ -1532,8 +1973,8 @@ mod tests {
         // so the `own@2` above is caused by the listeners and not by the
         // row's shape or by `data-call-arg` itself.
         let mut unwired = plan.clone();
-        unwired.children[2].event_names.clear();
-        unwired.children[2].has_click_handler = false;
+        Arc::make_mut(&mut unwired.children[2]).event_names.clear();
+        Arc::make_mut(&mut unwired.children[2]).has_click_handler = false;
         assert_eq!(shape(&unwired), vec!["fused@0:f(arg) => 1"]);
     }
 
@@ -1725,10 +2166,10 @@ mod tests {
     #[test]
     fn inline_chunks_keep_an_inset_run_that_holds_a_line_break() {
         let mut plan = chip(Some("nowrap"), None, false, &[("padding-left", "7px")]);
-        plan.children[0].children[0].text = Some("a\nb".into());
+        Arc::make_mut(&mut Arc::make_mut(&mut plan.children[0]).children[0]).text = Some("a\nb".into());
         assert_eq!(inline_chunks(&plan), None);
         let mut control = chip(Some("nowrap"), None, false, &[]);
-        control.children[0].children[0].text = Some("a\nb".into());
+        Arc::make_mut(&mut Arc::make_mut(&mut control.children[0]).children[0]).text = Some("a\nb".into());
         assert_eq!(shape(&control), vec!["fused@0:a\nb1"]);
     }
 
@@ -1742,7 +2183,7 @@ mod tests {
         let plan = padded_row(Some("pre"));
         assert_eq!(shape(&plan), vec!["fused@0:a(bc"]);
         let mut plan = padded_row(Some("pre"));
-        plan.children[2].children[0].text = Some("b\nx".into());
+        Arc::make_mut(&mut Arc::make_mut(&mut plan.children[2]).children[0]).text = Some("b\nx".into());
         assert_eq!(shape(&plan), vec!["own@0", "own@1", "fused@2:b\nxc"]);
         let Some(chunks) = inline_chunks(&plan) else {
             panic!("the plain spans still fuse");
@@ -2336,7 +2777,7 @@ mod tests {
             event_names: vec![],
                 attributes: BTreeMap::new(),
             children: vec![
-                RenderNode {
+                Arc::new(RenderNode {
             image: None,
                     node_id: 2,
                     kind: GpuiElementKind::TextContainer,
@@ -2348,8 +2789,9 @@ mod tests {
                     event_names: vec![],
                 attributes: BTreeMap::new(),
                     children: vec![],
-                },
-                RenderNode {
+                    ..Default::default()
+                }),
+                Arc::new(RenderNode {
             image: None,
                     node_id: 3,
                     kind: GpuiElementKind::Div,
@@ -2360,7 +2802,7 @@ mod tests {
                     has_input_handler: false,
                     event_names: vec![],
                 attributes: BTreeMap::new(),
-                    children: vec![RenderNode {
+                    children: vec![Arc::new(RenderNode {
             image: None,
                         node_id: 4,
                         kind: GpuiElementKind::TextNode,
@@ -2372,9 +2814,12 @@ mod tests {
                         event_names: vec![],
                 attributes: BTreeMap::new(),
                         children: vec![],
-                    }],
-                },
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                }),
             ],
+            ..Default::default()
         };
         assert_eq!(count_render_nodes(&plan), 4);
     }

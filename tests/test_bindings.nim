@@ -203,11 +203,18 @@ static:
   assert compiles(gpui_key_latency_count())
   assert compiles(gpui_key_latency_ns(0.uint64))
   assert compiles(gpui_frame_stats_reset())
+  # Each frame's work (nodes visited, plans rebuilt, elements built, cached
+  # subtrees reused and rendered); its behaviour is the same unit test's and
+  # `tests/frame_work_probe.rs`'s.
+  var work: array[5, uint64]
+  assert compiles(gpui_frame_work(0.uint64, addr work))
 
   # --- Laid-out bounds, image pixels and the window-level cursor ---
   var xywh: array[4, float64]
   assert compiles(gpui_layout_bounds(nil, addr xywh))
   assert compiles(gpui_layout_bounds_reset())
+  assert compiles(gpui_drawn_text(nil, nil, 0'u64))
+  assert compiles(gpui_drawn_text_reset())
   assert compiles(gpui_set_image_rgba(nil, nil, 0.csize_t, 0'u32, 0'u32))
   assert compiles(gpui_set_window_cursor(cstring""))
   assert compiles(gpui_window_cursor())
@@ -231,6 +238,14 @@ static:
   assert compiles(gpui_last_event_kind(e))
   assert compiles(gpui_last_event_repeat(e))
   assert compiles(gpui_last_event_seq(e))
+
+  # --- The frame counter and its per-frame callback (9c36775) ---
+  #
+  # Their signatures, as above; the drawn-frame behaviour is the window
+  # lanes'. Declared without a call here, they failed this suite's
+  # every-binding-exercised check on their own.
+  assert compiles(gpui_frames_drawn())
+  assert compiles(gpui_on_frame_drawn(nil))
   assert compiles(gpui_event_delivery_count(e))
   assert compiles(gpui_set_focusable(e, 1.uint8))
   assert compiles(gpui_is_focusable(e))

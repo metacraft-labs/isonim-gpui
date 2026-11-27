@@ -179,6 +179,133 @@ fn test_letter_spaced_glyphs_move_by_the_spacing_of_the_characters_before_them()
     );
 }
 
+/// A CUT THAT DROPS ITS SEPARATOR, through `gpui-pre`'s own line wrapper
+/// with the platform's text system and the fixture face (see
+/// `digit_advances` for why both). `gpui-pre` keeps what fits before the
+/// ellipsis and drops only whitespace and ASCII punctuation from its end,
+/// so at some width it cuts `alpha · beta gamma` to `alpha ·…`; with `·`
+/// named to trim (`data-ellipsis-trim`), `cut_line_end` cuts it to
+/// `alpha…` there, and its runs cover exactly the text it returns.
+///
+/// THE CONTROL is `gpui-pre`'s cut at the same width without the trim: it
+/// must end `·…`, which proves the width really leaves the separator last.
+fn test_a_cut_drops_the_separator_before_its_ellipsis() {
+    use gpui::{Refineable, Styled};
+    use gpui_nim_shim::cut_text::cut_line_end;
+    const FIXTURE: &[u8] = include_bytes!("fixtures/fonts/SpaceGrotesk-Regular.otf");
+    let platform = gpui_platform::current_platform(true);
+    let text_system = std::sync::Arc::new(gpui::TextSystem::new(platform.text_system()));
+    text_system
+        .add_fonts(vec![std::borrow::Cow::Borrowed(FIXTURE)])
+        .expect("the fixture face loads");
+    let mut styles = GpuiStyles::default();
+    styles.font_family = Some("Space Grotesk".into());
+    let mut el = apply_styles_to_div(div(), &styles);
+    let mut style = gpui::TextStyle::default();
+    style.refine(el.text_style());
+    let text: gpui::SharedString = "alpha \u{b7} beta gamma".into();
+    let ellipsis = "\u{2026}";
+    let runs = vec![style.to_run(text.len())];
+    let mut wrapper = text_system.line_wrapper(style.font(), gpui::px(16.0));
+    let mut found = None;
+    for w in 20..200 {
+        let width = gpui::px(w as f32);
+        let (plain, _) = cut_line_end(&mut wrapper, text.clone(), width, ellipsis, &runs, &[]);
+        if plain.ends_with("\u{b7}\u{2026}") {
+            found = Some(width);
+            break;
+        }
+    }
+    let width = found.expect("control: some width leaves gpui-pre's cut ending in '\u{b7}\u{2026}'");
+    let (cut, cut_runs) =
+        cut_line_end(&mut wrapper, text.clone(), width, ellipsis, &runs, &['\u{b7}', '\u{2014}']);
+    assert_eq!(&*cut, "alpha\u{2026}", "the separator and its space dropped at {width:?}");
+    assert_eq!(
+        cut_runs.iter().map(|r| r.len).sum::<usize>(),
+        cut.len(),
+        "the runs cover the cut text"
+    );
+    // A text that fits is not cut, trim or no trim.
+    let (whole, _) =
+        cut_line_end(&mut wrapper, text.clone(), gpui::px(1000.0), ellipsis, &runs, &['\u{b7}']);
+    assert_eq!(whole, text);
+}
+
+/// A middle cut (`data-ellipsis-at="middle"`) with segments keeps the first
+/// segment and the last whole and drops the segments between, longest first,
+/// measured as the window shapes each candidate; with no candidate that fits
+/// it falls back to the end cut, and without segments it is gpui-pre's own
+/// middle cut with the trim applied on both sides of the ellipsis.
+fn test_a_middle_cut_keeps_the_first_and_last_segments() {
+    use gpui::{Refineable, Styled};
+    use gpui_nim_shim::cut_text::{cut_line_end, cut_line_middle};
+    const FIXTURE: &[u8] = include_bytes!("fixtures/fonts/SpaceGrotesk-Regular.otf");
+    let platform = gpui_platform::current_platform(true);
+    let text_system = std::sync::Arc::new(gpui::TextSystem::new(platform.text_system()));
+    text_system
+        .add_fonts(vec![std::borrow::Cow::Borrowed(FIXTURE)])
+        .expect("the fixture face loads");
+    let mut styles = GpuiStyles::default();
+    styles.font_family = Some("Space Grotesk".into());
+    let mut el = apply_styles_to_div(div(), &styles);
+    let mut style = gpui::TextStyle::default();
+    style.refine(el.text_style());
+    let size = gpui::px(16.0);
+    let ellipsis = "\u{2026}";
+    // The test's own measure: each character's advance in the face (the
+    // element measures each candidate shaped, in its window).
+    let font_id = text_system.resolve_font(&style.font());
+    let measure = |s: &str| -> gpui::Pixels {
+        s.chars().fold(gpui::px(0.0), |w, c| w + text_system.layout_width(font_id, size, c))
+    };
+    let text: gpui::SharedString = "src/upload/retry/client.py".into();
+    let runs = vec![style.to_run(text.len())];
+    let mut wrapper = text_system.line_wrapper(style.font(), size);
+    let middle = |wrapper: &mut gpui::LineWrapper, width: gpui::Pixels, segments: &[char]| {
+        let mut fits = |c: &str| measure(c) <= width;
+        cut_line_middle(wrapper, text.clone(), width, ellipsis, &runs, &['\u{b7}'], segments, &mut fits)
+    };
+    // Each candidate is drawn exactly at its own width, and not one pixel
+    // narrower.
+    for want in ["src/\u{2026}/retry/client.py", "src/\u{2026}/client.py", "\u{2026}/client.py"] {
+        let width = measure(want).ceil();
+        let (cut, cut_runs) = middle(&mut wrapper, width, &['/']);
+        assert_eq!(&*cut, want, "at {width:?}");
+        assert_eq!(cut_runs.iter().map(|r| r.len).sum::<usize>(), cut.len());
+        let (narrower, _) = middle(&mut wrapper, width - gpui::px(1.0), &['/']);
+        assert_ne!(&*narrower, want, "{want} drawn in less than its width");
+    }
+    // Narrower than the last segment: the end cut.
+    let tiny = measure("\u{2026}/client.py") - gpui::px(2.0);
+    let (fallback, _) = middle(&mut wrapper, tiny, &['/']);
+    let (end, _) = cut_line_end(&mut wrapper, text.clone(), tiny, ellipsis, &runs, &['\u{b7}']);
+    assert_eq!(fallback, end);
+    // Whole when it fits.
+    let (whole, _) = middle(&mut wrapper, measure(&text) + gpui::px(1.0), &['/']);
+    assert_eq!(whole, text);
+    // Without segments: gpui-pre's middle cut, trimmed on both sides.
+    let spaced: gpui::SharedString = "alpha \u{b7} beta \u{b7} gamma \u{b7} delta".into();
+    let spaced_runs = vec![style.to_run(spaced.len())];
+    let mut trimmed_somewhere = false;
+    for w in 30..300 {
+        let width = gpui::px(w as f32);
+        let mut fits = |c: &str| measure(c) <= width;
+        let (plain, _) = cut_line_middle(&mut wrapper, spaced.clone(), width, ellipsis,
+                                         &spaced_runs, &[], &[], &mut fits);
+        let mut fits2 = |c: &str| measure(c) <= width;
+        let (cut, _) = cut_line_middle(&mut wrapper, spaced.clone(), width, ellipsis,
+                                       &spaced_runs, &['\u{b7}'], &[], &mut fits2);
+        if let Some(at) = cut.find(ellipsis) {
+            let before = cut[..at].chars().last();
+            let after = cut[at + ellipsis.len()..].chars().next();
+            assert!(!matches!(before, Some(' ') | Some('\u{b7}')), "{cut:?} dangles before");
+            assert!(!matches!(after, Some(' ') | Some('\u{b7}')), "{cut:?} dangles after");
+            if plain != cut { trimmed_somewhere = true; }
+        }
+    }
+    assert!(trimmed_somewhere, "control: some width leaves gpui-pre's middle cut dangling");
+}
+
 /// The cases, in the order they run.
 const CASES: &[main_thread_harness::Case] = &[
     (
@@ -188,6 +315,14 @@ const CASES: &[main_thread_harness::Case] = &[
     (
         "test_letter_spaced_glyphs_move_by_the_spacing_of_the_characters_before_them",
         test_letter_spaced_glyphs_move_by_the_spacing_of_the_characters_before_them,
+    ),
+    (
+        "test_a_cut_drops_the_separator_before_its_ellipsis",
+        test_a_cut_drops_the_separator_before_its_ellipsis,
+    ),
+    (
+        "test_a_middle_cut_keeps_the_first_and_last_segments",
+        test_a_middle_cut_keeps_the_first_and_last_segments,
     ),
 ];
 

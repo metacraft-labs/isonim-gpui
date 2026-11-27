@@ -383,6 +383,7 @@ test-gui-x11:
 # Internal: actual GUI test commands (run inside headless display)
 _run-gui-tests:
     LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui -d:gpuiBackend --path:../isonim/src tests/test_gui.nim
+    LD_LIBRARY_PATH=rust/target/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui_keyboard_no_keymap -d:gpuiBackend --path:../isonim/src tests/test_gui_keyboard_no_keymap.nim
 
 # The window draws the borders, the weight and the absolute placement the
 # render plan carries, and a real compositor pointer reaches an element with
@@ -399,6 +400,23 @@ test-gui-borders *ARGS:
 
 _run-gui-borders:
     LD_LIBRARY_PATH=rust/target/windowed/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui_borders -d:gpuiBackend -d:gpuiShimPath=rust/target/windowed/debug/libgpui_nim_shim.so --path:../isonim/src tests/test_gui_borders.nim
+
+# The window paints a two-stop conic gradient (`background-image:
+# conic-gradient(<c1> 0 <p>%, <c2> <p>% 100%)`, `rust/gpui-nim-shim/src/
+# conic.rs`) as Chromium does: five discs at 0, 16, 50, 99 and 100 %, read
+# back from a REAL window on headless sway and compared with the browser
+# fixture `tests/fixtures/conic/browser-strip.ppm` (`tests/test_gui_conic.nim`;
+# the fixture's generator is `tools/conic-reference/`). Built into the
+# windowed target directory, as `test-gui-borders` is, so the shared
+# `target/debug` shim is never swapped.
+test-gui-conic *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    (cd rust && CARGO_TARGET_DIR=target/windowed cargo build --features gpui-backend) || exit $?
+    ./scripts/wayland-run-test.sh {{ARGS}} just _run-gui-conic
+
+_run-gui-conic:
+    LD_LIBRARY_PATH=rust/target/windowed/debug:${LD_LIBRARY_PATH:-} nim c -r --nimcache:nimcache/test_gui_conic -d:gpuiBackend -d:gpuiShimPath=rust/target/windowed/debug/libgpui_nim_shim.so --path:../isonim/src tests/test_gui_conic.nim
 
 # PLAT-38 — A REAL KEY, through the compositor's own `wl_seat`, into a
 # focused GPUI window, read back from the Rust-side element store.

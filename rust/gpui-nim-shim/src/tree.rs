@@ -12,6 +12,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::render_sync::RenderNode;
 
 /// Globally unique node identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -166,6 +169,72 @@ pub struct Node {
     /// The pixels an `img` element shows, when the application set any
     /// (`gpui_set_image_rgba`); `None` draws the element's placeholder.
     pub image: Option<NodeImage>,
+
+    /// What has changed since the render plan was last built, and the plan
+    /// itself. See [`ChangeMarks`].
+    pub(crate) marks: ChangeMarks,
+}
+
+/// A node's change bookkeeping: the dirty marks the renderer ops leave, and
+/// the render plan they invalidate.
+///
+/// IsoNim's effects mutate one node at a time, and every one of those
+/// mutations reaches the tree through a [`Tree`] method (the 13 renderer ops
+/// and the attribute, style, text, class and listener setters in `lib.rs`),
+/// so the tree knows exactly which nodes changed. A change marks its node
+/// (`plan_stale`), and walks to the root leaving a "something below changed"
+/// mark on every ancestor: the child is queued in its parent's
+/// `stale_children`, and every ancestor's `subtree_stamp` takes the change's
+/// stamp. Building the plan then descends only through queued children, so a
+/// one-label change rebuilds the label's own plan and splices the result
+/// into each ancestor's: work proportional to the depth of the change, not
+/// to the size of the window.
+///
+/// The stamps are what a renderer that caches anything BELOW the plan (the
+/// GPUI views of `gpui_app`) compares: a subtree whose `subtree_stamp` is the
+/// one it last drew is unchanged. Stamps rather than flags, because several
+/// views may draw one tree (a window and a headless capture) and each needs
+/// its own answer to "changed since I last looked"; a flag one of them
+/// cleared would hide the change from the other.
+#[derive(Debug)]
+pub(crate) struct ChangeMarks {
+    /// The stamp of the latest change to this node itself.
+    pub(crate) stamp: u64,
+    /// The stamp of the latest change to this node or anything below it.
+    pub(crate) subtree_stamp: u64,
+    /// This node's own part of the plan must be rebuilt (it is new, or one
+    /// of its own fields, or its list of children, changed).
+    pub(crate) plan_stale: bool,
+    /// Children whose subtree changed since this node's plan was built, in
+    /// the order the changes arrived; each at most once.
+    pub(crate) stale_children: Vec<NodeId>,
+    /// Whether this node is queued in its parent's `stale_children`.
+    pub(crate) queued_in_parent: bool,
+    /// The plan built for this node, current unless one of the marks above
+    /// says otherwise.
+    pub(crate) plan: Option<Arc<RenderNode>>,
+}
+
+/// The source of change stamps, process-wide so that stamps from different
+/// trees never compare equal by accident. Starts at 1: 0 is "never".
+static CHANGE_STAMP: AtomicU64 = AtomicU64::new(1);
+
+fn next_stamp() -> u64 {
+    CHANGE_STAMP.fetch_add(1, Ordering::Relaxed)
+}
+
+impl ChangeMarks {
+    fn new() -> Self {
+        let s = next_stamp();
+        ChangeMarks {
+            stamp: s,
+            subtree_stamp: s,
+            plan_stale: true,
+            stale_children: Vec::new(),
+            queued_in_parent: false,
+            plan: None,
+        }
+    }
 }
 
 /// One event, as the element store recorded it arriving.
@@ -190,6 +259,9 @@ pub struct DeliveredEvent {
     pub modifiers: u32,
     /// Whether the platform reported this as an auto-repeat.
     pub repeat: bool,
+    /// When the platform says the event happened, in milliseconds on the
+    /// display server's clock (`GpuiEventPayload::time_ms`); 0 when unknown.
+    pub time_ms: u32,
     /// Process-wide monotonic delivery sequence number, starting at 1.
     /// A node that has never received anything answers 0, which is how
     /// "nothing arrived" is distinguished from "an identical thing arrived
@@ -231,6 +303,7 @@ impl Node {
             last_event: None,
             delivery_count: 0,
             image: None,
+            marks: ChangeMarks::new(),
         }
     }
 
@@ -251,6 +324,7 @@ impl Node {
             last_event: None,
             delivery_count: 0,
             image: None,
+            marks: ChangeMarks::new(),
         }
     }
 
@@ -302,7 +376,14 @@ impl Tree {
     /// Insert a node into the tree. Returns its NodeId.
     pub fn insert(&mut self, node: Node) -> NodeId {
         let id = node.id;
+        let attached = !node.parent.is_null();
         self.nodes.insert(id.0, node);
+        // A node inserted already attached (its `parent` set by hand, as
+        // some tests build trees) tells its ancestors, as `append_child`
+        // would have.
+        if attached {
+            self.touch(id);
+        }
         id
     }
 
@@ -311,14 +392,97 @@ impl Tree {
         self.nodes.get(&id.0)
     }
 
-    /// Get a mutable reference to a node by id.
+    /// Get a mutable reference to a node by id, MARKING IT CHANGED.
+    ///
+    /// Any mutable access is taken to be a change to what the node renders,
+    /// so a caller cannot change a node and forget to say so. State that the
+    /// render plan does not read (the delivery record of `input.rs`) is
+    /// written through [`Tree::get_mut_untracked`] instead.
     pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.touch(id);
+        self.nodes.get_mut(&id.0)
+    }
+
+    /// Get a mutable reference to a node WITHOUT marking it changed. Only
+    /// for fields the render plan never reads: a write through here to
+    /// anything the plan is built from would leave a stale plan on screen.
+    pub fn get_mut_untracked(&mut self, id: NodeId) -> Option<&mut Node> {
         self.nodes.get_mut(&id.0)
     }
 
     /// Remove a node from the store (does NOT detach from parent/children).
+    /// A parent that still lists it renders without it, so the parent is
+    /// marked changed.
     pub fn remove(&mut self, id: NodeId) -> Option<Node> {
-        self.nodes.remove(&id.0)
+        let parent = self.parent_node(id);
+        let removed = self.nodes.remove(&id.0);
+        if removed.is_some() && !parent.is_null() {
+            self.touch(parent);
+        }
+        removed
+    }
+
+    /// Mark `id` changed: its own plan is rebuilt, and every ancestor learns
+    /// that something below it changed (see [`ChangeMarks`]). A node that is
+    /// not in the store is ignored.
+    pub fn touch(&mut self, id: NodeId) {
+        let stamp = next_stamp();
+        let Some(n) = self.nodes.get_mut(&id.0) else {
+            return;
+        };
+        n.marks.stamp = stamp;
+        n.marks.subtree_stamp = stamp;
+        n.marks.plan_stale = true;
+        self.propagate(id, stamp);
+    }
+
+    /// Walk from `from` to its root, queueing each node in its parent's
+    /// `stale_children` and giving every ancestor the change's stamp.
+    ///
+    /// The walk always reaches the root, because the stamps must: a view
+    /// that compares an ancestor's `subtree_stamp` has to see every change
+    /// below it. It is bounded by the store's size, so a parent cycle
+    /// introduced by a future bug cannot hang the caller.
+    fn propagate(&mut self, from: NodeId, stamp: u64) {
+        let mut child = from;
+        for _ in 0..=self.nodes.len() {
+            let (parent, queued) = match self.nodes.get(&child.0) {
+                Some(n) => (n.parent, n.marks.queued_in_parent),
+                None => return,
+            };
+            if parent.is_null() {
+                return;
+            }
+            let Some(p) = self.nodes.get_mut(&parent.0) else {
+                return;
+            };
+            p.marks.subtree_stamp = stamp;
+            if !queued {
+                p.marks.stale_children.push(child);
+                if let Some(c) = self.nodes.get_mut(&child.0) {
+                    c.marks.queued_in_parent = true;
+                }
+            }
+            child = parent;
+        }
+    }
+
+    /// The stamp of the latest change at or below `id`; 0 for a node that
+    /// is not in the store.
+    pub fn subtree_stamp(&self, id: NodeId) -> u64 {
+        self.nodes.get(&id.0).map_or(0, |n| n.marks.subtree_stamp)
+    }
+
+    /// The plan last built for `id`, whether or not it is still current.
+    pub fn cached_plan(&self, id: NodeId) -> Option<Arc<RenderNode>> {
+        self.nodes.get(&id.0).and_then(|n| n.marks.plan.clone())
+    }
+
+    /// Whether anything at or below `id` changed since its plan was built.
+    pub fn plan_is_current(&self, id: NodeId) -> bool {
+        self.nodes.get(&id.0).map_or(false, |n| {
+            !n.marks.plan_stale && n.marks.stale_children.is_empty() && n.marks.plan.is_some()
+        })
     }
 
     /// Append `child_id` as the last child of `parent_id`.
@@ -330,12 +494,14 @@ impl Tree {
         // Set new parent
         if let Some(child) = self.nodes.get_mut(&child_id.0) {
             child.parent = parent_id;
+            child.marks.queued_in_parent = false;
         }
 
         // Add to parent's children
         if let Some(parent) = self.nodes.get_mut(&parent_id.0) {
             parent.children.push(child_id);
         }
+        self.touch(parent_id);
     }
 
     /// Insert `child_id` before `ref_id` within `parent_id`.
@@ -352,6 +518,7 @@ impl Tree {
         // Set new parent
         if let Some(child) = self.nodes.get_mut(&child_id.0) {
             child.parent = parent_id;
+            child.marks.queued_in_parent = false;
         }
 
         // Insert before reference in parent's children
@@ -363,6 +530,7 @@ impl Tree {
                 parent.children.push(child_id);
             }
         }
+        self.touch(parent_id);
     }
 
     /// Remove `child_id` from `parent_id`'s children list and clear parent ref.
@@ -372,7 +540,9 @@ impl Tree {
         }
         if let Some(child) = self.nodes.get_mut(&child_id.0) {
             child.parent = NodeId::NULL;
+            child.marks.queued_in_parent = false;
         }
+        self.touch(parent_id);
     }
 
     /// Detach a node from its current parent (internal helper).
@@ -386,6 +556,11 @@ impl Tree {
             if let Some(parent) = self.nodes.get_mut(&old_parent.0) {
                 parent.children.retain(|&c| c != child_id);
             }
+            if let Some(child) = self.nodes.get_mut(&child_id.0) {
+                child.parent = NodeId::NULL;
+                child.marks.queued_in_parent = false;
+            }
+            self.touch(old_parent);
         }
     }
 

@@ -59,7 +59,12 @@ type
     modifiers*: uint32     ## `GpuiMod*` bits
     key*: cstring          ## base key name, or nil when the event has no key
     repeat*: uint8         ## 1 for an auto-repeat
-    reserved*: array[7, uint8]
+    reserved*: array[3, uint8]
+    timeMs*: uint32
+      ## When the platform says the event HAPPENED, in milliseconds on the
+      ## display server's clock (Wayland `wl_keyboard.key` time, X11
+      ## `KeyPress.time`), wrapping at `high(uint32)`; 0 when unknown. The
+      ## key's arrival, not when the window got to it.
 
 const
   GpuiEventOther* = 0'u32
@@ -233,9 +238,9 @@ proc gpui_dispatch_key_to_focus*(event: cstring;
 
 # --- frame timing (PLAT-42) ---
 #
-# Render-path time per frame and key-to-frame latency, in ns, recorded by the
-# shim's `frame_stats` module. The render-path time EXCLUDES GPUI's own layout
-# and paint, which run after `render` returns; see that module's docs.
+# Render-path time per frame and key-to-frame latency, in ns, and the work
+# each frame did, recorded by the shim's `frame_stats` module. The render-path
+# time EXCLUDES GPUI's own layout and paint; see that module's docs.
 
 proc gpui_frame_count*(): uint64 {.importc: "gpui_frame_count".}
 proc gpui_frame_ns*(index: uint64): uint64 {.importc: "gpui_frame_ns".}
@@ -243,6 +248,20 @@ proc gpui_key_latency_count*(): uint64 {.importc: "gpui_key_latency_count".}
 proc gpui_key_latency_ns*(index: uint64): uint64
   {.importc: "gpui_key_latency_ns".}
 proc gpui_frame_stats_reset*() {.importc: "gpui_frame_stats_reset".}
+proc gpui_frames_drawn*(): uint64 {.importc: "gpui_frames_drawn".}
+  ## Frames drawn since the process started: monotonic, never reset (unlike
+  ## `gpui_frame_count`, which `gpui_frame_stats_reset` clears).
+type FrameDrawnCallback* = proc() {.cdecl.}
+proc gpui_on_frame_drawn*(callback: FrameDrawnCallback)
+  {.importc: "gpui_on_frame_drawn".}
+  ## Register (nil: remove) a callback the shim calls once per drawn frame,
+  ## on the main thread, after that frame's paint; never while nothing is
+  ## drawn.
+proc gpui_frame_work*(index: uint64; outCounts: ptr array[5, uint64]): uint8
+  {.importc: "gpui_frame_work".}
+  ## The `index`-th frame's work: shadow nodes the plan build visited, plans
+  ## rebuilt, GPUI elements built, cached subtrees reused and cached subtrees
+  ## rendered, in that order. Answers 1 when it wrote them, 0 past the end.
 
 # --- laid-out bounds (CTF-P1b) ---
 #
@@ -256,6 +275,19 @@ proc gpui_layout_bounds*(node: GpuiElement; outXywh: ptr array[4, float64]): uin
   ## Writes x, y, width, height to `outXywh` and answers 1, or answers 0 for
   ## an element no frame has laid out (or that did not opt in).
 proc gpui_layout_bounds_reset*() {.importc: "gpui_layout_bounds_reset".}
+
+# --- drawn text ---
+#
+# What an element that declares `text-overflow` drew in the latest frame:
+# its text whole, or cut with the ellipsis. The cut is made during layout,
+# so the plan cannot say it; see the shim's `cut_text` module (and
+# `data-ellipsis-trim`, the characters a cut drops before the ellipsis).
+
+proc gpui_drawn_text*(node: GpuiElement; buf: pointer; bufLen: uint64): uint64
+  {.importc: "gpui_drawn_text".}
+  ## The bytes the text needs (copied into `buf`, NUL-terminated, as far as
+  ## they fit), or 0 for an element no frame drew such a text for.
+proc gpui_drawn_text_reset*() {.importc: "gpui_drawn_text_reset".}
 
 # --- the element store, read back ---
 
